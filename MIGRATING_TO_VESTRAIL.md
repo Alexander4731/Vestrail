@@ -1,6 +1,6 @@
 # 从 ARTEX-God 迁移到 Vestrail
 
-仓库与项目名改为 `Vestrail`，Go 模块为 `github.com/Alexander4731/Vestrail`，命令入口为 `./cmd/vestrail`。此批只提交 `main`，不发布版本或标签。
+仓库与项目名改为 `Vestrail`，Go 模块为 `github.com/Alexander4731/Vestrail`，命令入口为 `./cmd/vestrail`。首个使用新名称的正式版本为 `0.3.25`，发布包由 GitHub Actions 从对应标签构建。
 
 ## 兼容行为
 
@@ -21,7 +21,7 @@
 ## 已有部署的首次切换
 
 1. 停止旧程序及其守护脚本，备份一致的数据库、`config.json`、`jwt.key`、`data/`、自定义 `skills/` 与程序。数据库备份和文件备份必须对应同一停机时间点。
-2. 从本仓库源码构建 Vestrail，或在后续正式发布后下载新包。目前历史 Release 附件仍是原名称；本次改名不会重新打包历史版本。
+2. 下载 `0.3.25` 或更新版本的 Vestrail 包，按 Release 的 `SHA256SUMS` 验证。历史 ARTEX Release 附件保留原名称，不会重新打包历史版本。
 3. 将新程序和 `start.sh` / `start.bat` 放在原部署目录，保留配置与数据。Windows 便携部署还需更新 `vestrail-launcher.exe`、`start-engine.bat`，按新包提供的版本更新运行库；不要用示例配置覆盖原 `config.json`，也不要另建空 `data/` 后误当作原库。
 4. 修改自定义 systemd、Docker Compose 或其他进程管理配置中的程序路径。新守护脚本优先启动 `vestrail`，缺少时仍可启动 `artex`。只使用一个守护入口，防止旧进程同时运行。
 5. 启动并检查 `/api/health` 的 `service` 为 `vestrail`，确认原密码可用、任务与审计记录仍在，再切换监控中的服务标识。保留备份直到验收完成。

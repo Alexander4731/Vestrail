@@ -1,10 +1,12 @@
-## 待发布 — Vestrail
+## 0.3.25 — Vestrail
 
-项目原名 ARTEX-God，仓库与新构建产物统一使用 Vestrail。此次提交不创建 Release；下列版本记录为历史发布记录。
+项目原名 ARTEX-God，仓库与新构建产物统一使用 Vestrail。本版由 GitHub Actions 构建，提供 Windows 便携包及 Linux/macOS 压缩包，附件校验值见 `SHA256SUMS`。
 
 新账号显示为 `Vestrail`，旧账号 `ARTEX` 与有效会话继续可用。运行环境支持 `VESTRAIL_` 前缀并兼容旧名。保留已有数据库、配置、密码、签名密钥与任务数据。首次切换需要同时更新程序和启动脚本，详见 [迁移说明](MIGRATING_TO_VESTRAIL.md)。
 
 材料完整性、执行回执、目标判定、复测人工接受及覆盖账本进入可审阅范围；v5 归档兼容边界与未完成能力见 [集成记录](INTEGRATION_STATUS.md)。
+
+已有 Windows 部署应保留原目录、`config.json`、`jwt.key`、`data/` 与自定义 `skills/`，先完成一致备份，再更新 `vestrail.exe`、`vestrail-launcher.exe`、`start.bat` 和 `start-engine.bat`。不要将旧数据放入新建的空数据库；本版仍读取原数据库名和登录密码。
 
 ---
 

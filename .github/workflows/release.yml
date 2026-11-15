@@ -98,6 +98,8 @@ jobs:
           ./packaging/windows/smoke.ps1 -PackageDirectory (Join-Path $destination $name) -OutputDirectory "$env:RUNNER_TEMP/portable-smoke"
           $result = Get-Content -LiteralPath "$env:RUNNER_TEMP/portable-smoke/result.json" -Raw | ConvertFrom-Json
           if ($result.health.version -ne $env:VESTRAIL_BUILD_VERSION.TrimStart('v')) { throw 'The package contains the wrong application version.' }
+          if ($result.health.service -ne 'vestrail') { throw 'The package contains the wrong application.' }
+          if ($result.browser.title -notlike 'Vestrail*') { throw 'The package contains an outdated frontend.' }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
