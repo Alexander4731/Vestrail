@@ -14,7 +14,7 @@ $output = (Resolve-Path -LiteralPath $OutputDirectory).Path
 # This immutable, previously smoke-tested package supplies ONLY third-party
 # runtimes. build.ps1 compiles both application executables from this checkout,
 # copies this checkout's skills, and installs their locked browser dependencies.
-$runtimeURL = 'https://github.com/Alexander4731/ARTEX-God/releases/download/0.3.17/artex-0.3.17-windows-amd64.zip'
+$runtimeURL = 'https://github.com/Alexander4731/Vestrail/releases/download/0.3.17/artex-0.3.17-windows-amd64.zip'
 $runtimeSHA256 = 'b0955839a03b0315e8496b69351bffa8c09b4db65d5ac8af9d14a5c60a7daaf6'
 $archive = Join-Path $work 'runtime-source.zip'
 Invoke-WebRequest -Uri $runtimeURL -OutFile $archive
@@ -35,7 +35,7 @@ Compress-Archive -Path (Join-Path $runtime 'python/*') -DestinationPath $pythonA
     -VCRuntimeDirectory (Join-Path $runtime 'node') `
     -OutputDirectory $output
 
-$package = Join-Path $output "artex-$($Version.TrimStart('v'))-windows-amd64"
+$package = Join-Path $output "vestrail-$($Version.TrimStart('v'))-windows-amd64"
 # Package before smoke testing: no generated passwords, config or databases can
 # enter the archive. The workflow tests a separate extraction of this exact zip.
 foreach ($name in @('config.json', 'data', 'jwt.key')) {

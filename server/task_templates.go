@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 )
 
 const maxTaskTemplateRequestBytes = 512 << 10

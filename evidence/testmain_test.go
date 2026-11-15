@@ -6,19 +6,19 @@ import (
 	"os"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 )
 
 // Take the shared suite lock before any schema initialization, which otherwise
 // races with db, agent and server tests. Hold it on one pinned connection.
 func TestMain(m *testing.M) {
-	if os.Getenv("ARTEX_PG_DSN") == "" {
+	if os.Getenv("VESTRAIL_PG_DSN") == "" {
 		os.Exit(m.Run())
 	}
 	os.Exit(runEvidenceSuite(m))
 }
 func runEvidenceSuite(m *testing.M) int {
-	pg, err := sql.Open("pgx", os.Getenv("ARTEX_PG_DSN"))
+	pg, err := sql.Open("pgx", os.Getenv("VESTRAIL_PG_DSN"))
 	if err != nil {
 		panic(err)
 	}
@@ -32,7 +32,7 @@ func runEvidenceSuite(m *testing.M) int {
 		panic(err)
 	}
 	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(7337741002)`)
-	initialized, err := db.Open(os.Getenv("ARTEX_PG_DSN"))
+	initialized, err := db.Open(os.Getenv("VESTRAIL_PG_DSN"))
 	if err != nil {
 		panic(err)
 	}

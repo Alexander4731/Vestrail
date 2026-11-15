@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/intercept"
 	"github.com/Autumn-27/norma/harness"
 	actool "github.com/Autumn-27/norma/tool"
 )

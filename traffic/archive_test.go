@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/internal/testutil"
+	"github.com/Alexander4731/Vestrail/internal/testutil"
 )
 
 func TestTrafficArchiveRoundTripAndCurrentRowWins(t *testing.T) {

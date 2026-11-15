@@ -1,4 +1,4 @@
-// ARTEX domain model — types used across the UI.
+// Vestrail domain model — types used across the UI.
 // Derived from the functional spec (section 7: 关键数据形状).
 
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
@@ -455,6 +455,19 @@ export interface ExplorationNodeQuery {
 
 // 目标管理卡片用的目标(后端已把 payload 拆成 text/vulnclass)。
 export interface TaskGoal {
+  assessment?: {
+    id: string;
+    goal_revision: number;
+    evidence_id: string;
+    evidence_revision: number;
+    evidence_sha256: string;
+    method: "model_assessed" | "human_accepted" | "machine_checked";
+    actor: string;
+    reason: string;
+    missing_reason: boolean;
+    stale: boolean;
+    created_at: string;
+  };
   id: string;
   text: string;
   vulnclass?: string;
@@ -496,6 +509,7 @@ export interface FindingAsset {
 }
 
 export interface Finding {
+  verification?: FindingVerification;
   traffic_count?: number;
   evidence_version?: number;
   report_evidence_version?: number;
@@ -517,6 +531,63 @@ export interface Finding {
   inherited?: boolean;
   assets?: FindingAsset[];
   ts: string;
+}
+
+export interface FindingVerification {
+  state: "legacy_unverified" | "candidate" | "running" | "verified" | "not_reproduced" | "inconclusive";
+  assurance: "none" | "evidence_bound" | "semantic_verified";
+  evidence_version: number;
+  attempt_id?: string;
+  stale: boolean;
+}
+
+export interface CoverageCheckSpec {
+  target_ref: string;
+  principal_ref: string;
+  category: string;
+  test_id: string;
+  precondition_version: number;
+  prerequisites: string;
+}
+
+export interface CoverageCheck extends CoverageCheckSpec {
+  id: string;
+  state: "not_run" | "running" | "observed_no_issue" | "finding" | "blocked" | "not_applicable" | "needs_review";
+  authority?: string;
+  reported_outcome?: string;
+  reason?: string;
+  evidence_node_id?: string;
+  evidence_stale: boolean;
+}
+
+export interface CoverageLedger {
+  availability: "available" | "unavailable";
+  plan?: { id: string; task_id: string; revision: number; scope_revision: string; actor: string; created_at: string };
+  scope_stale: boolean;
+  total: number;
+  excluded: number;
+  applicable: number;
+  completed: number;
+  reported: number;
+  gaps: number;
+  pct: number | null;
+  items: CoverageCheck[];
+  next_after?: string;
+}
+
+export interface VerificationAttempt {
+  id: string;
+  finding_id: string;
+  verifier: string;
+  verifier_version: number;
+  state: "running" | "completed" | "interrupted";
+  outcome: "supported" | "not_supported" | "inconclusive";
+  assurance: FindingVerification["assurance"];
+  reason: string;
+  evidence_version: number;
+  limitations: string[];
+  actor: string;
+  created_at: string;
 }
 
 // FindingsPage 是发现列表的服务端分页响应。
@@ -728,6 +799,12 @@ export interface ActiveFindingRetest {
 }
 
 export interface FindingRetest {
+  assessment_method?: "legacy" | "model_assessed";
+  baseline_version?: number;
+  status_revision?: number;
+  application_state?: "not_applied" | "awaiting_review" | "applied";
+  applied_by?: string;
+  application_reason?: string;
   id: number;
   finding_id: number;
   conversation_id: number | null;
@@ -1603,7 +1680,7 @@ export interface UpdateCheck {
   os: string;
   arch: string;
   repo: string;
-  /** 是否存在可回滚的上一版本（artex.old）。 */
+  /** 是否存在可回滚的上一版本（vestrail.old）。 */
   has_backup: boolean;
   /** 本次启动时自更新自举的结论（换装失败 / 已回滚等），无事发生时为空。 */
   boot_notice?: string;

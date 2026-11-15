@@ -2,7 +2,7 @@ package server
 
 import (
 	"encoding/json"
-	pgdb "github.com/Autumn-27/artex/db"
+	pgdb "github.com/Alexander4731/Vestrail/db"
 	"os"
 	"path/filepath"
 	"testing"

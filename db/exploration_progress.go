@@ -1,17 +1,26 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 )
 
-func lockTaskGraphWrite(tx *sql.Tx, expID int64) error {
+func lockTaskGraphWrite(ctx context.Context, tx *sql.Tx, expID int64) error {
+	var taskID int64
 	var status string
-	err := tx.QueryRow(`SELECT status FROM tasks WHERE exploration_id=$1 FOR UPDATE`, expID).Scan(&status)
+	var deleted sql.NullTime
+	err := tx.QueryRowContext(ctx, `SELECT id,status,deleted_at FROM tasks WHERE exploration_id=$1 FOR UPDATE`, expID).Scan(&taskID, &status, &deleted)
 	if err == sql.ErrNoRows {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if deleted.Valid {
+		return ErrTaskArchiveState
+	}
+	if err = checkTaskArchiveWriteTx(ctx, tx, taskID); err != nil {
 		return err
 	}
 	if IsTerminal(status) {
@@ -34,36 +43,6 @@ func (s *ExplorationStore) GraphProgress() (string, error) {
 (SELECT COUNT(*) FROM exploration_edges WHERE exploration_id=$1)
 FROM exploration_nodes WHERE exploration_id=$1`, s.expID).Scan(&nodes, &versions, &edges)
 	return fmt.Sprintf("%d/%d/%d", nodes, versions, edges), err
-}
-
-func (s *ExplorationStore) ProveGoal(goal, evidence int64) error {
-	e, err := s.GetNodeWithSources(evidence)
-	if err != nil {
-		return err
-	}
-	if e == nil || (e.Kind != KindFact && e.Kind != KindFinding) {
-		return fmt.Errorf("证据必须是可见的事实或漏洞")
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := lockTaskGraphWrite(tx, s.expID); err != nil {
-		return err
-	}
-	var id int64
-	if err := tx.QueryRow(`SELECT id FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='goal' FOR UPDATE`, goal, s.expID).Scan(&id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
-VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, s.expID, evidence, RelProves, goal); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE exploration_nodes SET state='met',content_version=content_version+1 WHERE id=$1`, goal); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 func (s *ExplorationStore) IntentsInState(state string) ([]*Node, error) {

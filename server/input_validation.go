@@ -2,7 +2,7 @@ package server
 
 import (
 	"errors"
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 	"net/http"
 )
 

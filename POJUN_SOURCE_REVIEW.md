@@ -122,7 +122,7 @@ Pojun 的 [compaction_deadlock_test.go](https://github.com/chu0119/Pojun/blob/dc
 - 失败复现：`.local/pojun-review-red.log`，三条 created 准入路径和 done/failed 时钟重置失败。
 - 定向验证：`.local/pojun-review-green.log`，生命周期、暂停保留预算、并发终态保护、静态缓存测试通过。
 - 最终 `go test -p 1 ./... -count=1` 在全新隔离数据库 `pojun_review_full` 通过，覆盖 server/db/agent/intercept 等全部根模块包；日志 `.local/pojun-review-full.log`。此轮包含 done/failed/timeout 的立即准入及 FIFO 准入、暂停继续保持预算等测试。
-- `go build ./...` 通过；`go build -tags embedui -o .local/artex-pojun-review.exe ./cmd/artex` 通过。
+- `go build ./...` 通过；`go build -tags embedui -o .local/artex-pojun-review.exe ./cmd/vestrail` 通过。
 - 本次未改 TypeScript，不重复前端依赖安装/构建；内嵌构建复用本工作区已有静态产物。未运行真实模型、外部目标或 Pojun 的运行服务。
 - `git diff --check` 通过。
 - 源码直接修改，没有生成 .patch 文件、运行时替换或修改线上数据库。

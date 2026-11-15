@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/intercept"
 )
 
 type phaseActivity struct {

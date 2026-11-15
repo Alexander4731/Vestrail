@@ -66,7 +66,7 @@ export function ChangePasswordDialog({
           <DialogHeader>
             <DialogTitle>修改密码</DialogTitle>
             <DialogDescription>
-              用户名固定为 <b>ARTEX</b>。需先输入当前密码验证；修改后其他登录会话立即失效，当前会话自动更新。
+              用户名固定为 <b>Vestrail</b>。需先输入当前密码验证；修改后其他登录会话立即失效，当前会话自动更新。
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3 py-4">

@@ -15,12 +15,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	pgdb "github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/enrich"
-	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Alexander4731/Vestrail/agent"
+	pgdb "github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/enrich"
+	"github.com/Alexander4731/Vestrail/guard"
+	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
@@ -817,6 +817,10 @@ func (m *Manager) AcquireRuntime(ctx context.Context, lost func(error)) (*pgdb.R
 	if err := m.pg.RecoverFindingRetests(); err != nil {
 		lock.Close()
 		return nil, err
+	}
+	if err := m.pg.InterruptVerifications(ctx); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("recover finding verifications: %w", err)
 	}
 	if err := intercept.ReplayExecutionReceipts(ctx, m.pg, filepath.Join(m.dir, "transcripts")); err != nil {
 		lock.Close()

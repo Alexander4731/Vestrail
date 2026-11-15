@@ -1,15 +1,15 @@
 @echo off
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
-title ARTEX-God Installer
+title Vestrail Installer
 
 echo ============================================================
-echo    ARTEX-God  -  Local install (build from source and run)
+echo    Vestrail  -  Local install (build from source and run)
 echo ============================================================
 echo.
 echo This will: check Go and Node, configure the PostgreSQL
 echo connection, build the single binary with the embedded web UI,
-echo and start ARTEX at http://localhost:8787
+echo and start Vestrail at http://localhost:8787
 echo.
 echo Requirements: Go ^>= 1.26, Node.js (npm), a reachable PostgreSQL,
 echo and an internet connection for the first build.
@@ -81,7 +81,7 @@ if defined NEED_REOPEN (
 REM ---------- Step 3/6: database ----------
 echo.
 echo [3/6] PostgreSQL connection
-echo       ARTEX needs a running PostgreSQL. The backend creates the
+echo       Vestrail needs a running PostgreSQL. The backend creates the
 echo       database and tables itself on first start (the DB user needs
 echo       permission to create a database, or create it beforehand).
 echo       No PostgreSQL yet? Install it and start the service first:
@@ -90,15 +90,15 @@ echo         or https://www.postgresql.org/download/windows/
 echo.
 set "DB_HOST=127.0.0.1"
 set "DB_PORT=5432"
-set "DB_USER=artex"
+set "DB_USER=vestrail"
 set "DB_PASS="
-set "DB_NAME=artex"
+set "DB_NAME=vestrail"
 set "DB_SSL=disable"
 set /p "DB_HOST=      host [127.0.0.1]: "
 set /p "DB_PORT=      port [5432]: "
-set /p "DB_USER=      user [artex]: "
+set /p "DB_USER=      user [vestrail]: "
 set /p "DB_PASS=      password: "
-set /p "DB_NAME=      dbname [artex]: "
+set /p "DB_NAME=      dbname [vestrail]: "
 set /p "DB_SSL=      sslmode (disable/require) [disable]: "
 
 REM ---------- Step 4/6: config.json ----------
@@ -160,22 +160,22 @@ echo       web UI embedded.
 
 REM ---------- Step 6/6: build backend ----------
 echo.
-echo [6/6] Compiling the backend into artex.exe (first build downloads Go modules)...
+echo [6/6] Compiling the backend into vestrail.exe (first build downloads Go modules)...
 set "CGO_ENABLED=0"
-go build -tags embedui -o artex.exe ".\cmd\artex"
+go build -tags embedui -o vestrail.exe ".\cmd\vestrail"
 if errorlevel 1 (
     echo [x] "go build" failed.
     pause
     exit /b 1
 )
-echo       built: artex.exe
+echo       built: vestrail.exe
 
 REM ---------- launch ----------
 echo.
 echo ============================================================
-echo   Build complete. Starting ARTEX...
+echo   Build complete. Starting Vestrail...
 echo ============================================================
-start "ARTEX-God" cmd /c start.bat
+start "Vestrail" cmd /c start.bat
 echo [*] Waiting for http://localhost:8787 to come up...
 set /a tries=0
 :waitloop
@@ -189,19 +189,19 @@ goto waitloop
 :ready
 start "" http://localhost:8787
 echo.
-echo [+] ARTEX is running:  http://localhost:8787
+echo [+] Vestrail is running:  http://localhost:8787
 echo     First visit goes to /setup to set the admin password.
 goto done
 
 :timeout
 echo.
-echo [!] Timed out waiting for the server. Look at the "ARTEX-God" window
+echo [!] Timed out waiting for the server. Look at the "Vestrail" window
 echo     for errors (most often the PostgreSQL connection in config.json).
 echo     Once it prints "listening", open http://localhost:8787 manually.
 
 :done
 echo.
-echo   Stop ARTEX:   close the "ARTEX-God" window.
+echo   Stop Vestrail:   close the "Vestrail" window.
 echo   Start again:  double-click start.bat
 echo   Rebuild:      run install.bat again (choose to overwrite config if asked)
 echo.

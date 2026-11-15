@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/internal/testutil"
+	"github.com/Alexander4731/Vestrail/internal/testutil"
 )
 
 // bulkRecord fills the index with inline bodies — the ones that actually make

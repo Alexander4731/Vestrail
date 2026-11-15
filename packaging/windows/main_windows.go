@@ -35,7 +35,7 @@ func main() {
 	noBrowser := flag.Bool("no-browser", false, "Do not open the browser")
 	flag.Parse()
 	if err := run(*addr, *proxy, *noBrowser); err != nil {
-		fmt.Fprintln(os.Stderr, "[ARTEX]", err)
+		fmt.Fprintln(os.Stderr, "[Vestrail]", err)
 		os.Exit(1)
 	}
 }
@@ -52,7 +52,7 @@ func run(addr, proxy string, noBrowser bool) error {
 	}
 	url := "http://" + addr
 	if healthy(url) {
-		fmt.Println("ARTEX is already running at", url)
+		fmt.Println("Vestrail is already running at", url)
 		if !noBrowser {
 			openBrowser(url)
 		}
@@ -73,17 +73,19 @@ func run(addr, proxy string, noBrowser bool) error {
 		return err
 	}
 	for name, value := range map[string]string{
-		"ARTEX_CONFIG":    filepath.Join(root, "config.json"),
-		"ARTEX_SKILL_DIR": filepath.Join(root, "skills"),
-		"CHROMIUM":        filepath.Join(root, "runtime", "chrome", "chrome.exe"),
-		"PYTHONUTF8":      "1",
+		"VESTRAIL_CONFIG":    filepath.Join(root, "config.json"),
+		"VESTRAIL_SKILL_DIR": filepath.Join(root, "skills"),
+		"CHROMIUM":           filepath.Join(root, "runtime", "chrome", "chrome.exe"),
+		"PYTHONUTF8":         "1",
 	} {
 		if err := os.Setenv(name, value); err != nil {
 			return err
 		}
 	}
-	if err := os.Unsetenv("ARTEX_PG_DSN"); err != nil {
-		return err
+	for _, name := range []string{"VESTRAIL_PG_DSN", "ARTEX_PG_DSN"} {
+		if err := os.Unsetenv(name); err != nil {
+			return err
+		}
 	}
 	cfg, err := loadConfiguration(root)
 	if err != nil {
@@ -129,10 +131,10 @@ func run(addr, proxy string, noBrowser bool) error {
 	}
 	defer func() {
 		if err := command(pgCtl, "-D", pgData, "-m", "fast", "-w", "-t", "30", "stop").Run(); err != nil {
-			fmt.Fprintln(os.Stderr, "[ARTEX] stop PostgreSQL:", err)
+			fmt.Fprintln(os.Stderr, "[Vestrail] stop PostgreSQL:", err)
 		}
 	}()
-	fmt.Println("ARTEX:", url)
+	fmt.Println("Vestrail:", url)
 	if !noBrowser {
 		go func() {
 			for i := 0; i < 45; i++ {
@@ -177,9 +179,9 @@ func loadConfiguration(root string) (configuration, error) {
 		return cfg, err
 	}
 	cfg.Database.Host = "127.0.0.1"
-	cfg.Database.User = "artex"
+	cfg.Database.User = "vestrail"
 	cfg.Database.Password = base64.RawURLEncoding.EncodeToString(password)
-	cfg.Database.DBName = "artex"
+	cfg.Database.DBName = "vestrail"
 	cfg.Database.SSLMode = "disable"
 	cfg.SkillDir = "skills"
 	data, err = json.MarshalIndent(cfg, "", "  ")
@@ -206,7 +208,7 @@ func healthy(url string) bool {
 		OK      bool   `json:"ok"`
 		Service string `json:"service"`
 	}
-	return response.StatusCode == http.StatusOK && json.NewDecoder(response.Body).Decode(&body) == nil && body.OK && body.Service == "artex"
+	return response.StatusCode == http.StatusOK && json.NewDecoder(response.Body).Decode(&body) == nil && body.OK && (body.Service == "vestrail" || body.Service == "artex")
 }
 
 func openBrowser(url string) {

@@ -17,22 +17,30 @@ var ErrRetestNotRunning = errors.New("本次复测已结束或尚未开始，请
 // FindingRetest is an immutable historical test once its conversation turn ends.
 // Snapshot is only loaded for the agent, never sent with the history list.
 type FindingRetest struct {
-	ID             int64           `json:"id"`
-	FindingID      int64           `json:"finding_id"`
-	ConversationID *int64          `json:"conversation_id"`
-	Status         string          `json:"status"`
-	Verdict        string          `json:"verdict"`
-	Notes          string          `json:"notes"`
-	Snapshot       json.RawMessage `json:"snapshot,omitempty"`
-	Summary        string          `json:"summary"`
-	Evidence       string          `json:"evidence"`
-	Error          string          `json:"error"`
-	CreatedAt      time.Time       `json:"created_at"`
-	StartedAt      *time.Time      `json:"started_at"`
-	FinishedAt     *time.Time      `json:"finished_at"`
+	AssessmentMethod  string          `json:"assessment_method"`
+	BaselineVersion   int64           `json:"baseline_version"`
+	StatusRevision    int64           `json:"status_revision"`
+	ApplicationState  string          `json:"application_state"`
+	AppliedBy         string          `json:"applied_by"`
+	ApplicationReason string          `json:"application_reason"`
+	AppliedAt         *time.Time      `json:"applied_at,omitempty"`
+	ID                int64           `json:"id"`
+	FindingID         int64           `json:"finding_id"`
+	ConversationID    *int64          `json:"conversation_id"`
+	Status            string          `json:"status"`
+	Verdict           string          `json:"verdict"`
+	Notes             string          `json:"notes"`
+	Snapshot          json.RawMessage `json:"snapshot,omitempty"`
+	Summary           string          `json:"summary"`
+	Evidence          string          `json:"evidence"`
+	Error             string          `json:"error"`
+	CreatedAt         time.Time       `json:"created_at"`
+	StartedAt         *time.Time      `json:"started_at"`
+	FinishedAt        *time.Time      `json:"finished_at"`
 }
 
-const retestCols = `id, finding_id, conversation_id, status, verdict, notes, summary, evidence, error, created_at, started_at, finished_at`
+const retestCols = `id, finding_id, conversation_id, status, verdict, notes, summary, evidence, error, created_at, started_at, finished_at,
+assessment_method,baseline_version,status_revision,application_state,applied_by,application_reason,applied_at`
 
 // ActiveFindingRetest is the small status payload polled by the findings list.
 // Finding IDs use the same string representation as the findings API.
@@ -64,7 +72,8 @@ func (d *DB) ListActiveFindingRetests(ctx context.Context) ([]ActiveFindingRetes
 func scanRetest(row interface{ Scan(...any) error }) (*FindingRetest, error) {
 	r := &FindingRetest{}
 	err := row.Scan(&r.ID, &r.FindingID, &r.ConversationID, &r.Status, &r.Verdict, &r.Notes,
-		&r.Summary, &r.Evidence, &r.Error, &r.CreatedAt, &r.StartedAt, &r.FinishedAt)
+		&r.Summary, &r.Evidence, &r.Error, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
+		&r.AssessmentMethod, &r.BaselineVersion, &r.StatusRevision, &r.ApplicationState, &r.AppliedBy, &r.ApplicationReason, &r.AppliedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -80,6 +89,12 @@ func (d *DB) CreateFindingRetest(ctx context.Context, findingID int64, notes str
 		return nil, nil, false, err
 	}
 	defer tx.Rollback()
+	if err := LockFindingEvidenceTx(ctx, tx, findingID, nil); err != nil {
+		if errors.Is(err, ErrFindingNotFound) {
+			err = sql.ErrNoRows
+		}
+		return nil, nil, false, err
+	}
 	var title string
 	var snapshot []byte
 	err = tx.QueryRowContext(ctx, `SELECT COALESCE(NULLIF(f.name,''), NULLIF(f.vulnclass,''), '未分类'),
@@ -106,7 +121,8 @@ func (d *DB) CreateFindingRetest(ctx context.Context, findingID int64, notes str
 	if err != nil {
 		return nil, nil, false, err
 	}
-	r, err = scanRetest(tx.QueryRowContext(ctx, `INSERT INTO finding_retests(finding_id,conversation_id,notes,snapshot) VALUES ($1,$2,$3,$4) RETURNING `+retestCols,
+	r, err = scanRetest(tx.QueryRowContext(ctx, `INSERT INTO finding_retests(finding_id,conversation_id,notes,snapshot,baseline_version,status_revision)
+SELECT id,$2,$3,$4,evidence_version,status_revision FROM findings WHERE id=$1 RETURNING `+retestCols,
 		findingID, c.ID, strings.TrimSpace(utf8Clean(notes)), snapshot))
 	if err != nil {
 		return nil, nil, false, err
@@ -125,6 +141,7 @@ func (d *DB) CreateFindingRetest(ctx context.Context, findingID int64, notes str
 
 func (r *FindingRetest) InitialMessage() string {
 	msg := fmt.Sprintf("请复测漏洞 #%d。先调用 get_finding_retest_context 读取本会话关联的原始证据与约束，再执行针对性验证，最后调用 record_finding_retest_result 保存结论。", r.FindingID)
+	msg += "\n本次结论按模型评估保存。fixed 不会自动改变处置状态，需要人工审阅后接受；工具返回成功只表示评估已保存。"
 	if r.Notes != "" {
 		msg += "\n\n本次复测补充说明：\n" + r.Notes
 	}
@@ -206,7 +223,8 @@ func (d *DB) RecordFindingRetestResult(ctx context.Context, conversationID int64
 
 // FinishFindingRetest seals the result. Cancellation/failure takes precedence
 // over a staged verdict so an interrupted test cannot appear successfully fixed.
-// Only a newly completed fixed verdict updates triage, in the same transaction.
+// Model verdicts remain advisory; applying fixed requires a separate reviewed
+// decision against the frozen evidence and manual status revisions.
 func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 	if status != "completed" && status != "failed" && status != "stopped" {
 		return errors.New("invalid terminal retest status")
@@ -225,32 +243,57 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 	if err != nil {
 		return err
 	}
-	var finalStatus, verdict string
-	err = tx.QueryRow(`UPDATE finding_retests SET
+	_, err = tx.Exec(`UPDATE finding_retests SET
 	status=CASE WHEN $2='completed' AND verdict='' THEN 'failed' ELSE $2 END,
 	error=CASE WHEN $2='completed' AND verdict='' THEN 'Agent 未保存复测结论，请查看会话后重新复测' ELSE $3 END,
-	finished_at=now() WHERE id=$1 AND status IN ('pending','running') RETURNING status,verdict`, id, status, utf8Clean(reason)).Scan(&finalStatus, &verdict)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil // A replay must not overwrite a later manual triage decision.
-	}
+	application_state=CASE WHEN $2='completed' AND verdict='fixed' THEN 'awaiting_review' ELSE 'not_applied' END,
+	finished_at=now() WHERE id=$1 AND status IN ('pending','running')`, id, status, utf8Clean(reason))
 	if err != nil {
 		return err
 	}
-	if finalStatus == "completed" && verdict == "fixed" {
-		// 走带通知的版本，与人工在详情页改状态共用同一套语义。
-		//
-		// 此前这里是裸的 UPDATE：复测判「已修复」时状态确实变了，但配了
-		// on_status_change 的渠道完全收不到推送——状态在界面上悄悄变了，
-		// 运维要打开平台才知道。状态更新与推送事件必须一起落库，
-		// SetFindingStatusTx 内部处理了「状态没变就不登记」等细节。
-		// 用 context.Background()：本函数整条都是无 ctx 的旧风格（d.Begin()/
-		// tx.QueryRow/tx.Exec），没有可传递的取消信号，硬加一个 ctx 参数会
-		// 牵动 server 侧调用点与多处测试，超出本次改动的范围。
-		if _, _, _, _, err := SetFindingStatusTx(context.Background(), tx, findingID, FindingFixed); err != nil {
+	return tx.Commit()
+}
+
+// AcceptFindingRetest is a human decision, never a model tool. Replayed requests
+// cannot overwrite a subsequent decision, even if the status changed and back.
+func (d *DB) AcceptFindingRetest(ctx context.Context, fid, id int64, actor, reason string) error {
+	actor, reason = strings.TrimSpace(utf8Clean(actor)), strings.TrimSpace(utf8Clean(reason))
+	if fid <= 0 || id <= 0 || actor == "" || len(actor) > 128 || reason == "" || len(reason) > 16000 {
+		return ErrVerificationInput
+	}
+	return d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		if err := LockFindingEvidenceTx(ctx, tx, fid, nil); err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		r, err := scanRetest(tx.QueryRowContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE finding_id=$1 AND id=$2 FOR UPDATE`, fid, id))
+		if err != nil {
+			return err
+		}
+		if r == nil {
+			return sql.ErrNoRows
+		}
+		if r.ApplicationState == "applied" {
+			if r.AppliedBy == actor && r.ApplicationReason == reason {
+				return nil
+			}
+			return ErrVerificationConflict
+		}
+		if r.Status != "completed" || r.Verdict != "fixed" || r.AssessmentMethod != "model_assessed" {
+			return ErrVerificationConflict
+		}
+		var version, revision, latest int64
+		if err = tx.QueryRowContext(ctx, `SELECT evidence_version,status_revision,(SELECT max(id) FROM finding_retests WHERE finding_id=$1) FROM findings WHERE id=$1`, fid).Scan(&version, &revision, &latest); err != nil {
+			return err
+		}
+		if version != r.BaselineVersion || revision != r.StatusRevision || latest != id {
+			return ErrVerificationConflict
+		}
+		if _, _, _, _, err = SetFindingStatusTx(ctx, tx, fid, FindingFixed); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE finding_retests SET application_state='applied',applied_by=$2,application_reason=$3,applied_at=now() WHERE id=$1`, id, actor, reason)
+		return err
+	})
 }
 
 func (d *DB) RecoverFindingRetests() error {

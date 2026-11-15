@@ -23,6 +23,6 @@ export const auth = {
   },
 
   getCurrentUser(): CurrentUser {
-    return { id: "1", name: "ARTEX", username: "ARTEX", email: "", avatar: "", role: "operator" };
+    return { id: "1", name: "Vestrail", username: "Vestrail", email: "", avatar: "", role: "operator" };
   },
 };

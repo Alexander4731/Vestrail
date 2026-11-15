@@ -7,9 +7,9 @@ import (
 
 	actool "github.com/Autumn-27/norma/tool"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/guard"
+	"github.com/Alexander4731/Vestrail/agent"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/guard"
 )
 
 type toolUsageRecorder interface {

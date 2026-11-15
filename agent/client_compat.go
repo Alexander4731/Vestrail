@@ -25,9 +25,9 @@ func ApplyClientCompat(req *http.Request, format llm.Format) {
 	if sid == "" {
 		sid = uuid.NewString()
 	} else {
-		// ARTEX session names are not UUIDs. Derive a stable, opaque identifier
+		// Vestrail session names are not UUIDs. Derive a stable, opaque identifier
 		// without exposing task names or sharing one identity across sessions.
-		sid = uuid.NewSHA1(uuid.NameSpaceURL, []byte("artex:"+sid)).String()
+		sid = uuid.NewSHA1(uuid.NameSpaceURL, []byte("vestrail:"+sid)).String()
 	}
 	req.Header.Set("x-client-request-id", uuid.NewString())
 	if req.Header.Get("Accept") == "" {

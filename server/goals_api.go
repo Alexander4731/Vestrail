@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 )
 
 // 总览「目标管理」的人工 CRUD 接口。与 agent 侧的 set_goals 工具写同一批 goal 节点,
@@ -24,6 +24,10 @@ func (s *Server) listGoals(w http.ResponseWriter, r *http.Request) {
 	goals, err := t.Store.ListByKind(db.KindGoal, 10000)
 	if err != nil {
 		writeErr(w, 500, err.Error())
+		return
+	}
+	if err := t.Store.AttachGoalAssessments(r.Context(), goals); err != nil {
+		writeErr(w, 500, "目标判定读取失败")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"goals": goalDTOs(goals)})

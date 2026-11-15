@@ -279,6 +279,8 @@ type CoverageByType struct {
 // NOT a precise metric. Denominator = assets matching any active task_scope row;
 // Tested = those anchored to at least one fact node in the exploration.
 type Coverage struct {
+	Metric      string           `json:"metric"`
+	Checks      *CoverageLedger  `json:"checks,omitempty"`
 	Enabled     bool             `json:"enabled"`     // 资产覆盖度功能是否开启；false 时其余字段为零值
 	ScopeRows   int              `json:"scope_rows"`  // 0 → 范围未锚定
 	Denominator int              `json:"denominator"` // 范围内资产数

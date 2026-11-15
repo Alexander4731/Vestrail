@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	pgdb "github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/internal/testutil"
+	pgdb "github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/internal/testutil"
 	"github.com/klauspost/compress/zstd"
 )
 

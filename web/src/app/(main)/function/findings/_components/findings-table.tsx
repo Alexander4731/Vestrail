@@ -1,5 +1,4 @@
 "use client";
-
 import * as React from "react";
 
 import Link from "next/link";
@@ -15,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { CopyButton } from "@/components/copy-button";
+import { VerificationBadge } from "@/components/finding-verification";
 import { Markdown } from "@/components/markdown";
 import { StatusBadge } from "@/components/status-badge";
 import {
@@ -214,6 +214,7 @@ export function FindingsTable({
                     )}
                     <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
                     <Badge variant="outline">流量证据 {f.traffic_count ?? 0} 条</Badge>
+                    <VerificationBadge value={f.verification} />
                   </div>
                 </TableCell>
                 <TableCell>

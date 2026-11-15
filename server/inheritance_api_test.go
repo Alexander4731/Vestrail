@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/internal/testutil"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/internal/testutil"
 )
 
 func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {

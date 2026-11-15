@@ -2,7 +2,7 @@ package llmrec
 
 import (
 	"fmt"
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/google/uuid"
 	"net/http"
@@ -13,7 +13,7 @@ import (
 )
 
 func TestNativeEmptyRetryMetersEveryAttempt(t *testing.T) {
-	dsn := os.Getenv("ARTEX_PG_DSN")
+	dsn := os.Getenv("VESTRAIL_PG_DSN")
 	if dsn == "" {
 		t.Skip("isolated PostgreSQL required")
 	}

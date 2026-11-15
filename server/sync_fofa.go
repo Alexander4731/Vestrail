@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/notify"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/notify"
 )
 
 // 资产同步（FOFA 数据源）。

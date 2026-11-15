@@ -27,11 +27,11 @@ function Wait-Healthy {
     do {
         try {
             $health = Invoke-RestMethod -Uri "$url/api/health" -TimeoutSec 2
-            if ($health.ok -and $health.service -eq 'artex') { return $health }
+            if ($health.ok -and $health.service -in @('vestrail', 'artex')) { return $health }
         } catch { }
         Start-Sleep -Seconds 1
     } while ((Get-Date) -lt $deadline)
-    throw 'The portable launcher did not start ARTEX.'
+    throw 'The portable launcher did not start Vestrail.'
 }
 
 function Stop-Portable {
@@ -61,7 +61,7 @@ try {
     $result.local_database_host = $cfg.database.host
     $env:PGPASSWORD = $cfg.database.password
     $env:PGCONNECT_TIMEOUT = '5'
-    $sql = & $psql -X -w -h 127.0.0.1 -p $cfg.database.port -U artex -d artex -At -c 'SELECT 1;'
+    $sql = & $psql -X -w -h 127.0.0.1 -p $cfg.database.port -U $cfg.database.user -d $cfg.database.dbname -At -c 'SELECT 1;'
     if ($LASTEXITCODE -ne 0 -or $sql -ne '1') { throw 'The bundled PostgreSQL query failed.' }
     $result.database_query = $true
     $result.node_version = (& (Join-Path $root 'runtime\node\node.exe') --version)
@@ -78,7 +78,7 @@ try {
     $headers = @{Authorization = "Bearer $($auth.token)"}
     $settings = Invoke-RestMethod -Headers $headers -Uri "$url/api/settings"
     $result.python_detected = $settings.python_interpreter -eq (Join-Path $root 'runtime\python\python3.exe')
-    if (-not $result.python_detected) { throw 'ARTEX did not detect the bundled Python path correctly.' }
+    if (-not $result.python_detected) { throw 'Vestrail did not detect the bundled Python path correctly.' }
     $result.admin_initialized = (Invoke-RestMethod -Uri "$url/api/auth/status").initialized
     $initialPort = $cfg.database.port
     Stop-Portable

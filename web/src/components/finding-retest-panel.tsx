@@ -15,6 +15,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type { FindingRetest } from "@/lib/types";
 
@@ -25,7 +26,52 @@ const statusLabels = {
   failed: "复测失败",
   stopped: "已停止",
 };
-const verdictLabels = { reproduced: "仍可复现", fixed: "已修复", inconclusive: "无法确认" };
+const verdictLabels = { reproduced: "评估：仍可复现", fixed: "评估：已修复", inconclusive: "无法确认" };
+
+function AcceptRetest({
+  findingId,
+  item,
+  onAccepted,
+}: {
+  findingId: string;
+  item: FindingRetest;
+  onAccepted: () => void;
+}) {
+  const [reason, setReason] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const accept = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api.acceptFindingRetest(findingId, item.id, reason);
+      onAccepted();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="flex flex-col gap-2">
+      <Textarea
+        aria-label="接受修复结论的理由"
+        value={reason}
+        maxLength={4000}
+        onChange={(event) => setReason(event.target.value)}
+        placeholder="说明审阅了哪些证据，以及为何接受修复结论"
+      />
+      <Button variant="outline" disabled={busy || !reason.trim()} onClick={() => void accept()}>
+        接受并标记已修复
+      </Button>
+      {error && (
+        <p role="alert" className="text-destructive text-sm">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
 
 function active(r: FindingRetest) {
   return r.status === "pending" || r.status === "running";
@@ -163,6 +209,25 @@ export function FindingRetestPanel({
                     </div>
                   </details>
                 ) : null}
+                <p className="text-muted-foreground text-xs">
+                  {item.assessment_method === "model_assessed" ? "模型评估" : "历史评估"} · 证据版本{" "}
+                  {item.baseline_version ?? "未知"}
+                </p>
+                {item.application_state === "applied" && (
+                  <p className="text-sm">
+                    人工已接受：{item.applied_by} · {item.application_reason}
+                  </p>
+                )}
+                {!readOnly && item.application_state === "awaiting_review" && item.id === items[0]?.id && (
+                  <AcceptRetest
+                    findingId={findingId}
+                    item={item}
+                    onAccepted={() => {
+                      void load();
+                      onCompleted?.();
+                    }}
+                  />
+                )}
               </div>
             ))
           : null}

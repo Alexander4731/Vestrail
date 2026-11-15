@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/intercept"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/tool"
 )

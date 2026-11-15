@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	TaskArchiveFormatVersion       = 4
+	TaskArchiveFormatVersion       = 5
 	TaskArchiveLegacyFormatVersion = 1
 	TaskArchiveLLMRecordsPath      = "database/llm_records.ndjson"
 )
@@ -254,6 +254,15 @@ WHERE t.id=$1 AND t.deleted_at IS NULL FOR UPDATE OF t`, taskID).Scan(
 	}
 	if !paused && !IsTerminal(status) {
 		return nil, ErrTaskArchiveIneligible
+	}
+	var activeVerification bool
+	if err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM findings f WHERE f.task_id=$1 AND (
+EXISTS(SELECT 1 FROM finding_verification_attempts a WHERE a.finding_id=f.id AND a.state='running') OR
+EXISTS(SELECT 1 FROM finding_retests r WHERE r.finding_id=f.id AND r.status IN ('pending','running'))))`, taskID).Scan(&activeVerification); err != nil {
+		return nil, err
+	}
+	if activeVerification {
+		return nil, fmt.Errorf("%w: 发现验证或复测仍在运行", ErrTaskArchiveIneligible)
 	}
 	var dependent int64
 	err = tx.QueryRow(`SELECT child.id FROM task_relations relation
@@ -588,6 +597,10 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		{"tasks", `SELECT * FROM tasks WHERE id=$1`, []any{taskID}},
 		{"explorations", `SELECT * FROM explorations WHERE id=$1`, []any{expID}},
 		{"exploration_nodes", `SELECT * FROM exploration_nodes WHERE exploration_id=$1 ORDER BY id`, []any{expID}},
+		{"goal_assessments", `SELECT * FROM goal_assessments WHERE exploration_id=$1 ORDER BY id`, []any{expID}},
+		{"coverage_plans", `SELECT * FROM coverage_plans WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"coverage_checks", `SELECT c.* FROM coverage_checks c JOIN coverage_plans p ON p.id=c.plan_id WHERE p.task_id=$1 ORDER BY c.id`, []any{taskID}},
+		{"coverage_attempts", `SELECT a.* FROM coverage_attempts a JOIN coverage_checks c ON c.id=a.check_id JOIN coverage_plans p ON p.id=c.plan_id WHERE p.task_id=$1 ORDER BY a.id`, []any{taskID}},
 		{"exploration_edges", `SELECT * FROM exploration_edges WHERE exploration_id=$1 ORDER BY src_id,dst_id`, []any{expID}},
 		{"exploration_anchors", `SELECT anchor.* FROM exploration_anchors anchor JOIN exploration_nodes node ON node.id=anchor.node_id WHERE node.exploration_id=$1 ORDER BY node_id,asset_id`, []any{expID}},
 		{"task_constraints", `SELECT * FROM task_constraints WHERE exploration_id=$1 ORDER BY id`, []any{expID}},
@@ -597,6 +610,8 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		{"task_llm_profiles", `SELECT * FROM task_llm_profiles WHERE task_id=$1 ORDER BY position`, []any{taskID}},
 		{"task_scope", `SELECT * FROM task_scope WHERE task_id=$1 ORDER BY id`, []any{taskID}},
 		{"findings", `SELECT * FROM findings WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"finding_verification_attempts", `SELECT a.* FROM finding_verification_attempts a JOIN findings f ON f.id=a.finding_id WHERE f.task_id=$1 ORDER BY a.id`, []any{taskID}},
+		{"finding_retests", `SELECT r.* FROM finding_retests r JOIN findings f ON f.id=r.finding_id WHERE f.task_id=$1 ORDER BY r.id`, []any{taskID}},
 		{"finding_traffic_bindings", `SELECT b.* FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE f.task_id=$1 ORDER BY b.finding_id,b.position,b.id`, []any{taskID}},
 		{"traffic_evidence_snapshots", `SELECT s.* FROM traffic_evidence_snapshots s WHERE EXISTS(SELECT 1 FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE b.snapshot_id=s.id AND f.task_id=$1) ORDER BY s.id`, []any{taskID}},
 		{"llm_records", `SELECT * FROM llm_records WHERE COALESCE(task_id,'')=$1 ORDER BY id`, []any{strconv.FormatInt(taskID, 10)}},

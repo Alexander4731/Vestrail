@@ -6,9 +6,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/agent"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/intercept"
 )
 
 func (e *Engine) pauseForInput(t *Task, reason string) {

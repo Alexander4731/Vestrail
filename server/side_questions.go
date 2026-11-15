@@ -9,16 +9,16 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/llmrec"
-	"github.com/Autumn-27/artex/sidequestion"
+	"github.com/Alexander4731/Vestrail/agent"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/internal/env"
+	"github.com/Alexander4731/Vestrail/llmrec"
+	"github.com/Alexander4731/Vestrail/sidequestion"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
@@ -52,7 +52,7 @@ func bindSideProvider(p llm.Provider, cfg agent.Config, id int64, name string) l
 
 func (s *Server) initSideQuestions() {
 	s.side = &sideQuestionState{pending: map[string]sidequestion.Snapshot{}, latest: map[string]sidequestion.Snapshot{}, seen: map[string][2]int64{}, runs: map[string]sideRun{}, done: make(chan struct{})}
-	if n, err := strconv.Atoi(os.Getenv("ARTEX_BTW_MAX_OUTPUT_TOKENS")); err == nil && n >= 256 && n <= 32768 {
+	if n, err := strconv.Atoi(env.Get("VESTRAIL_BTW_MAX_OUTPUT_TOKENS")); err == nil && n >= 256 && n <= 32768 {
 		s.side.outputTokens = n
 	}
 	if s.m.pg == nil {

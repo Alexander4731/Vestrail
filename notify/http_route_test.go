@@ -64,7 +64,7 @@ func TestNotificationDirectAndInvalidRoute(t *testing.T) {
 }
 
 func TestNotificationEnvironmentProxyDelivery(t *testing.T) {
-	if os.Getenv("ARTEX_NOTIFY_PROXY_CHILD") == "1" {
+	if os.Getenv("VESTRAIL_NOTIFY_PROXY_CHILD") == "1" {
 		if _, err := doJSON(WithHTTPRoute(t.Context(), "legacy_environment"), "POST", "http://notification.invalid/hook", nil, map[string]string{"text": "fixture"}); err != nil {
 			t.Fatal(err)
 		}
@@ -80,7 +80,7 @@ func TestNotificationEnvironmentProxyDelivery(t *testing.T) {
 	}))
 	defer proxy.Close()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestNotificationEnvironmentProxyDelivery$")
-	cmd.Env = append(os.Environ(), "ARTEX_NOTIFY_PROXY_CHILD=1", AllowLocalTargetsEnv+"=1", "HTTP_PROXY="+proxy.URL, "http_proxy="+proxy.URL, "NO_PROXY=", "no_proxy=")
+	cmd.Env = append(os.Environ(), "VESTRAIL_NOTIFY_PROXY_CHILD=1", AllowLocalTargetsEnv+"=1", "HTTP_PROXY="+proxy.URL, "http_proxy="+proxy.URL, "NO_PROXY=", "no_proxy=")
 	if raw, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("proxy delivery: %v %s", err, raw)
 	}

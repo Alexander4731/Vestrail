@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/intercept"
 )
 
 // ModelRequestTimeout bounds one model request even when the task has no deadline.

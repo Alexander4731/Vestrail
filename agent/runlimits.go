@@ -7,7 +7,7 @@ import (
 	"io/fs"
 	"time"
 
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	actool "github.com/Autumn-27/norma/tool"

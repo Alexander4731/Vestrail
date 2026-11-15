@@ -1,3 +1,13 @@
+## 待发布 — Vestrail
+
+项目原名 ARTEX-God，仓库与新构建产物统一使用 Vestrail。此次提交不创建 Release；下列版本记录为历史发布记录。
+
+新账号显示为 `Vestrail`，旧账号 `ARTEX` 与有效会话继续可用。运行环境支持 `VESTRAIL_` 前缀并兼容旧名。保留已有数据库、配置、密码、签名密钥与任务数据。首次切换需要同时更新程序和启动脚本，详见 [迁移说明](MIGRATING_TO_VESTRAIL.md)。
+
+材料完整性、执行回执、目标判定、复测人工接受及覆盖账本进入可审阅范围；v5 归档兼容边界与未完成能力见 [集成记录](INTEGRATION_STATUS.md)。
+
+---
+
 ## 0.3.24 — 已结束任务重新启动
 
 任务列表和详情页新增「重新启动」，支持已完成、失败和超时任务。在原任务保留会话、证据和产出，重新核验探索目标并继续规划；上一轮时限重新计时，达到并发上限时排队。
@@ -6,7 +16,7 @@
 
 小屏幕使用图标按钮，避免任务详情的操作入口超出屏幕。
 
-使用方式、语义边界和验证见 [TASK_RESTART.md](https://github.com/Alexander4731/ARTEX-God/blob/0.3.24/TASK_RESTART.md)。0.3.23 构建在发布前由本版取代。
+使用方式、语义边界和验证见 [TASK_RESTART.md](https://github.com/Alexander4731/Vestrail/blob/0.3.24/TASK_RESTART.md)。0.3.23 构建在发布前由本版取代。
 
 ---
 
@@ -16,7 +26,7 @@
 
 补齐 MCP 握手取消、断流传播及工具发现超时；任务详情轮询防止旧响应覆盖控制结果。Worker 持续保留总目标、明确依据和交回条件，并对反复失败的相同工具请求做单意图止损。保留自定义提示词、任务授权和执行恢复策略。
 
-完整检查范围、回归及方向判断的边界见 [TASK_CONTINUITY_REVIEW.md](https://github.com/Alexander4731/ARTEX-God/blob/0.3.22/TASK_CONTINUITY_REVIEW.md)。方向提示与重复失败守卫不等于任意目标必然成功；没有伪造完成、重放未知副作用或开启实验功能。
+完整检查范围、回归及方向判断的边界见 [TASK_CONTINUITY_REVIEW.md](https://github.com/Alexander4731/Vestrail/blob/0.3.22/TASK_CONTINUITY_REVIEW.md)。方向提示与重复失败守卫不等于任意目标必然成功；没有伪造完成、重放未知副作用或开启实验功能。
 
 ---
 
@@ -29,7 +39,7 @@
 - 增加前端错误边界、旧 WebView 降级和列表请求防晚到；发布校验前移至 PR，并收紧升级元数据和 ZIP 校验。
 - 包含此前的执行恢复后续修复，保留现有任务授权和全局设置。
 
-交付范围、验证记录、实验性 NOA 的既有测试失败和后续工作见 [首批交付记录](https://github.com/Alexander4731/ARTEX-God/blob/0.3.21/POJUN_FOUNDATION_DELIVERY.md)。本版未引入 Word/附件预览等后续批次能力。
+交付范围、验证记录、实验性 NOA 的既有测试失败和后续工作见 [首批交付记录](https://github.com/Alexander4731/Vestrail/blob/0.3.21/POJUN_FOUNDATION_DELIVERY.md)。本版未引入 Word/附件预览等后续批次能力。
 
 升级前保留一致的数据库、任务文件、配置、密钥和程序备份。新 v4 归档不能交给 0.3.20 读取；需要回退时使用升级前完整备份。通知升级库默认保持环境代理，新安装默认直连。
 
@@ -44,7 +54,7 @@
 - 执行前审批与执行后恢复分开展示，未知写入阻塞明确显示处理入口；保留核验依据与人工操作历史。
 - 发布增加 PostgreSQL 完整回归、执行器竞态检测、前端类型检查及 Windows 便携包启动验证。
 
-操作说明、接口和首版边界见 [执行恢复说明](https://github.com/Alexander4731/ARTEX-God/blob/0.3.20/EXECUTION_RECOVERY.md)。升级前保留并备份 `config.json`、`data`、`jwt.key` 和 PostgreSQL 数据库。数据库自动进行增量迁移；仅对明确选择的任务开启自动恢复。
+操作说明、接口和首版边界见 [执行恢复说明](https://github.com/Alexander4731/Vestrail/blob/0.3.20/EXECUTION_RECOVERY.md)。升级前保留并备份 `config.json`、`data`、`jwt.key` 和 PostgreSQL 数据库。数据库自动进行增量迁移；仅对明确选择的任务开启自动恢复。
 
 ## 0.3.19
 
@@ -55,7 +65,7 @@
 - 直接使用现有 HTTP 请求层，无需额外中转服务。保留原鉴权、提示词、工具调用和 SSE 实时输出；会话标识稳定且不同会话相互隔离。
 - 增加请求头、流式输出、数据库持久化及接口配置覆盖测试。真实 Responses 渠道的模型列表、连接测试、流式工具调用和工具结果续聊验证通过。
 
-该选项提供 HTTP 客户端标识兼容，不包含 CLI 的 OAuth 登录、TLS 指纹或私有协议；Codex 渠道建议选择 Responses API 格式。详见 [客户端兼容说明](https://github.com/Alexander4731/ARTEX-God/blob/0.3.19/CLIENT_COMPAT.md)。
+该选项提供 HTTP 客户端标识兼容，不包含 CLI 的 OAuth 登录、TLS 指纹或私有协议；Codex 渠道建议选择 Responses API 格式。详见 [客户端兼容说明](https://github.com/Alexander4731/Vestrail/blob/0.3.19/CLIENT_COMPAT.md)。
 
 ### 下载与升级
 

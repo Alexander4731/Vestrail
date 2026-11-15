@@ -32,7 +32,7 @@ func TestReleaseMetadataBoundaries(t *testing.T) {
 }
 
 func TestExtractRejectsAmbiguousAndInvalidMembers(t *testing.T) {
-	want := "artex"
+	want := "vestrail"
 	if runtime.GOOS == "windows" {
 		want += ".exe"
 	}
@@ -43,6 +43,7 @@ func TestExtractRejectsAmbiguousAndInvalidMembers(t *testing.T) {
 	}{
 		{"duplicate", []string{"pkg/" + want, "other/" + want}, 0},
 		{"same-name", []string{"pkg/" + want, "pkg/" + want}, 0},
+		{"mixed-brand", []string{"pkg/" + want, "pkg/" + strings.Replace(want, "vestrail", "artex", 1)}, 0},
 		{"traversal", []string{"../" + want}, 0},
 		{"absolute", []string{"/" + want}, 0},
 		{"backslash", []string{"pkg\\" + want}, 0},
@@ -81,6 +82,53 @@ func TestExtractRejectsAmbiguousAndInvalidMembers(t *testing.T) {
 			raw, err := os.ReadFile(dst)
 			if err != nil || string(raw) != "original" {
 				t.Fatalf("destination changed: %q %v", raw, err)
+			}
+		})
+	}
+}
+
+func TestLegacyReleaseCompatibility(t *testing.T) {
+	legacyName := "artex-0.3.24-" + runtime.GOOS + "-" + runtime.GOARCH + ".zip"
+	rel := Release{TagName: "0.3.24", Assets: []Asset{{Name: legacyName}}}
+	if asset, ok := rel.PlatformAsset(runtime.GOOS, runtime.GOARCH); !ok || asset.Name != legacyName {
+		t.Fatal("legacy release asset was not found")
+	}
+	currentName := AssetName(rel.TagName, runtime.GOOS, runtime.GOARCH)
+	rel.Assets = append(rel.Assets, Asset{Name: currentName})
+	if asset, ok := rel.PlatformAsset(runtime.GOOS, runtime.GOARCH); !ok || asset.Name != currentName {
+		t.Fatal("Vestrail release asset must take precedence")
+	}
+	for _, name := range []string{"artex", "vestrail"} {
+		t.Run(name, func(t *testing.T) {
+			if runtime.GOOS == "windows" {
+				name += ".exe"
+			}
+			dir := t.TempDir()
+			archive := filepath.Join(dir, "release.zip")
+			f, err := os.Create(archive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			zw := zip.NewWriter(f)
+			w, err := zw.Create("package/" + name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write([]byte("binary")); err != nil {
+				t.Fatal(err)
+			}
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			dst := filepath.Join(dir, "staged")
+			if err := extractBinary(archive, dst); err != nil {
+				t.Fatal(err)
+			}
+			if raw, err := os.ReadFile(dst); err != nil || string(raw) != "binary" {
+				t.Fatal("extracted binary changed")
 			}
 		})
 	}

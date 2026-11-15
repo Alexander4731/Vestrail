@@ -13,7 +13,7 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repo 'dist' }
 $versionName = $Version.TrimStart('v')
-$name = "artex-$versionName-windows-amd64"
+$name = "vestrail-$versionName-windows-amd64"
 $package = Join-Path $OutputDirectory $name
 if (Test-Path -LiteralPath $package) { throw "Package directory already exists: $package" }
 if (-not $ChromeRoot -and -not $ChromeArchive) { throw 'Supply ChromeRoot or ChromeArchive.' }
@@ -72,15 +72,17 @@ $env:PATH = (Join-Path $runtime 'node') + ';' + $env:PATH
 if ($LASTEXITCODE -ne 0) { throw 'Installing the bundled browser dependencies failed.' }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'start.bat') -Destination (Join-Path $package 'start.bat')
 Copy-Item -LiteralPath (Join-Path $repo 'start.bat') -Destination (Join-Path $package 'start-engine.bat')
-Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination (Join-Path $package 'LICENSE')
+foreach ($file in @('LICENSE', 'README.md', 'logo.png', 'MIGRATING_TO_VESTRAIL.md', 'INTEGRATION_STATUS.md')) {
+    Copy-Item -LiteralPath (Join-Path $repo $file) -Destination (Join-Path $package $file)
+}
 $env:CGO_ENABLED = '0'
 $env:GOOS = 'windows'
 $env:GOARCH = 'amd64'
 Push-Location $repo
 try {
-    & go.exe build -mod=readonly -tags embedui -trimpath -ldflags "-s -w -buildid= -X main.version=$versionName -X github.com/Autumn-27/artex/selfupdate.Repo=Alexander4731/ARTEX-God" -o (Join-Path $package 'artex.exe') ./cmd/artex
-    if ($LASTEXITCODE -ne 0) { throw 'Building ARTEX failed.' }
-    & go.exe build -mod=readonly -trimpath -ldflags '-s -w -buildid=' -o (Join-Path $package 'artex-launcher.exe') ./packaging/windows
+    & go.exe build -mod=readonly -tags embedui -trimpath -ldflags "-s -w -buildid= -X main.version=$versionName -X github.com/Alexander4731/Vestrail/selfupdate.Repo=Alexander4731/Vestrail" -o (Join-Path $package 'vestrail.exe') ./cmd/vestrail
+    if ($LASTEXITCODE -ne 0) { throw 'Building Vestrail failed.' }
+    & go.exe build -mod=readonly -trimpath -ldflags '-s -w -buildid=' -o (Join-Path $package 'vestrail-launcher.exe') ./packaging/windows
     if ($LASTEXITCODE -ne 0) { throw 'Building the portable launcher failed.' }
 } finally {
     Pop-Location

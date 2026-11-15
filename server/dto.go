@@ -6,12 +6,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/traffic"
 )
 
 // DTO/serialization layer: each handler emits EXACTLY the frontend's spec shapes
-// (artex/web/src/lib/types.ts). These reshape db package structs so the
+// (vestrail/web/src/lib/types.ts). These reshape db package structs so the
 // internal DB model never leaks over the API. The db structs and the frontend are
 // the canonical contracts; this file maps one onto the other.
 
@@ -210,12 +210,13 @@ func taskNodeDTO(n *db.Node) TaskNodeDTO {
 // GoalDTO is a goal node with its payload unpacked into text/vulnclass — the shape
 // the 总览「目标管理」UI works with (vs TaskNodeDTO which carries raw payload JSON).
 type GoalDTO struct {
-	ID        string `json:"id"`
-	Text      string `json:"text"`
-	VulnClass string `json:"vulnclass,omitempty"`
-	State     string `json:"state"`
-	Origin    string `json:"origin,omitempty"`
-	TS        string `json:"ts"`
+	Assessment *db.GoalAssessment `json:"assessment,omitempty"`
+	ID         string             `json:"id"`
+	Text       string             `json:"text"`
+	VulnClass  string             `json:"vulnclass,omitempty"`
+	State      string             `json:"state"`
+	Origin     string             `json:"origin,omitempty"`
+	TS         string             `json:"ts"`
 }
 
 func goalDTO(n *db.Node) GoalDTO {
@@ -225,12 +226,13 @@ func goalDTO(n *db.Node) GoalDTO {
 	}
 	_ = json.Unmarshal(n.Payload, &p)
 	return GoalDTO{
-		ID:        i64s(n.ID),
-		Text:      p.Text,
-		VulnClass: p.VulnClass,
-		State:     n.State,
-		Origin:    n.Origin,
-		TS:        rfc3339(n.CreatedAt),
+		Assessment: n.GoalAssessment,
+		ID:         i64s(n.ID),
+		Text:       p.Text,
+		VulnClass:  p.VulnClass,
+		State:      n.State,
+		Origin:     n.Origin,
+		TS:         rfc3339(n.CreatedAt),
 	}
 }
 
@@ -303,6 +305,7 @@ func coverageAssetRefDTO(ref db.AssetRef) CoverageAssetRefDTO {
 // ---- Finding (frontend "Finding") ----
 
 type FindingDTO struct {
+	Verification          db.VerificationSummary     `json:"verification"`
 	TrafficCount          int                        `json:"traffic_count"`
 	EvidenceVersion       int64                      `json:"evidence_version"`
 	ReportEvidenceVersion int64                      `json:"report_evidence_version"`
@@ -381,14 +384,15 @@ func findingDTO(n *db.Node) FindingDTO {
 	var p findingPayload
 	_ = json.Unmarshal(n.Payload, &p)
 	d := FindingDTO{
-		ID:        i64s(n.ID),
-		VulnClass: p.VulnClass,
-		Name:      p.Name,
-		Severity:  p.Severity,
-		Status:    db.FindingPending,
-		Summary:   p.Summary,
-		Evidence:  rawString(p.Evidence),
-		TS:        rfc3339(n.CreatedAt),
+		ID:           i64s(n.ID),
+		VulnClass:    p.VulnClass,
+		Name:         p.Name,
+		Severity:     p.Severity,
+		Status:       db.FindingPending,
+		Verification: db.VerificationSummary{State: "legacy_unverified", Assurance: "none", EvidenceVersion: -1},
+		Summary:      p.Summary,
+		Evidence:     rawString(p.Evidence),
+		TS:           rfc3339(n.CreatedAt),
 	}
 	if n.SourceTaskID > 0 {
 		d.SourceTaskID = i64s(n.SourceTaskID)
@@ -417,6 +421,9 @@ func findingDTOsForOwner(taskID, description string, in []*db.Node, meta map[int
 			d.FindingID = i64s(m.ID)
 			d.Status = m.Status
 			d.TrafficCount = m.TrafficCount
+			d.EvidenceVersion = m.EvidenceVersion
+			d.ReportEvidenceVersion = m.ReportEvidenceVersion
+			d.Verification = m.Verification
 			d.Assets = findingAssetDTOs(m.AssetIDs, assets)
 		}
 		out = append(out, d)
@@ -446,6 +453,7 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 	d := FindingDTO{
 		ID:           i64s(f.ID),
 		FindingID:    i64s(f.ID),
+		Verification: f.Verification(),
 		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
 		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
 		VulnClass: f.VulnClass,

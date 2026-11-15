@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ARTEX 更新脚本：本地编译更新（重建二进制）。
-# DB 迁移无需手动执行——artex 每次启动都会幂等重跑 schema.sql（含 ADD COLUMN/CREATE
+# Vestrail 更新脚本：本地编译更新（重建二进制）。
+# DB 迁移无需手动执行——vestrail 每次启动都会幂等重跑 schema.sql（含 ADD COLUMN/CREATE
 # INDEX IF NOT EXISTS），所以“重启即迁移”。数据（./data、./skills）不受影响。
 set -euo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
@@ -21,7 +21,7 @@ sync_repo(){
 }
 
 echo "=============================="
-echo "  ARTEX 更新（本地编译）"
+echo "  Vestrail 更新（本地编译）"
 echo "=============================="
 
 command -v go >/dev/null 2>&1 || die "未检测到 Go（>=1.26）：https://go.dev/dl/"
@@ -35,10 +35,10 @@ if command -v npm >/dev/null 2>&1; then
   ( cd web && npm ci && npm run build:static )
   rm -rf server/webui/dist && cp -r web/out server/webui/dist
   info "重新编译内嵌单二进制…"
-  CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+  CGO_ENABLED=0 go build -tags embedui -trimpath -o vestrail ./cmd/vestrail
 else
   warn "未检测到 npm：编译**不内嵌前端**的后端（前端需另跑 npm run dev）"
-  CGO_ENABLED=0 go build -o artex ./cmd/artex
+  CGO_ENABLED=0 go build -o vestrail ./cmd/vestrail
 fi
-ok "编译完成 → ./artex"
-warn "请重启正在运行的 artex 进程以生效（重启时会自动迁移 schema）"
+ok "编译完成 → ./vestrail"
+warn "请重启正在运行的 vestrail 进程以生效（重启时会自动迁移 schema）"

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/intercept"
 )
 
 // Pace actual HTTP attempts, including the SDK's internal retries. The SDK's

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/Autumn-27/artex/internal/testutil"
+	"github.com/Alexander4731/Vestrail/internal/testutil"
 )
 
 // openLegacyIndex builds the index exactly as the pre-reclamation Open did: a

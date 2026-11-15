@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,24 +20,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/llmpool"
-	"github.com/Autumn-27/artex/llmrec"
-	"github.com/Autumn-27/artex/report"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Alexander4731/Vestrail/agent"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/llmpool"
+	"github.com/Alexander4731/Vestrail/llmrec"
+	"github.com/Alexander4731/Vestrail/report"
+	"github.com/Alexander4731/Vestrail/traffic"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
-// BuildVersion is the backend application version, injected from cmd/artex at
+// BuildVersion is the backend application version, injected from cmd/vestrail at
 // startup (which in turn gets it from -ldflags "-X main.version=<tag>").
 // Defaults to "dev" for local builds. Exposed to the frontend via GET /api/health.
 var BuildVersion = "dev"
 
-// Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
+// Server exposes the Vestrail backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
 	stop         context.CancelCauseFunc
@@ -723,6 +724,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/task-archives/{id}", s.queueTaskArchiveDelete)
 	mux.HandleFunc("POST /api/task-archives/delete/batch", s.deleteTaskArchivesBatch)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
+	mux.HandleFunc("GET /api/tasks/{id}/coverage/checks", s.getCoverageLedger)
+	mux.HandleFunc("POST /api/tasks/{id}/coverage/plans", s.createCoveragePlan)
+	mux.HandleFunc("POST /api/tasks/{id}/coverage/checks/{check_id}/attempts", s.recordCoverageAttempt)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
 	mux.HandleFunc("POST /api/tasks/{id}/assets", s.attachTaskAssets)
@@ -740,7 +744,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/scope", s.taskScopeList)
 	mux.HandleFunc("POST /api/tasks/{id}/scope", s.taskScopeAdd)
 	mux.HandleFunc("DELETE /api/tasks/{id}/scope/{sid}", s.taskScopeDelete)
-	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals)                       // 目标管理:列出本任务全部目标
+	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals) // 目标管理:列出本任务全部目标
+	mux.HandleFunc("POST /api/tasks/{id}/goals/{gid}/assessments", s.acceptGoal)
+	mux.HandleFunc("GET /api/tasks/{id}/goal-assessments/{aid}", s.goalAssessmentSnapshots)
 	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                        // 目标管理:人工新增目标(复活任务)
 	mux.HandleFunc("PATCH /api/tasks/{id}/goals/{gid}", s.editGoal)                // 目标管理:修改目标(复活任务)
 	mux.HandleFunc("DELETE /api/tasks/{id}/goals/{gid}", s.deleteGoal)             // 目标管理:硬删除目标(不复活)
@@ -786,8 +792,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
+	mux.HandleFunc("GET /api/exploration/findings/{id}/verifications", s.listFindingVerifications)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/verifications", s.startFindingVerification)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/retests/{retest_id}/accept", s.acceptFindingRetest)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
@@ -984,7 +993,7 @@ func (s *Server) Handler() http.Handler {
 // --- handlers ---
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
+	writeJSON(w, 200, map[string]any{"ok": true, "service": "vestrail", "version": BuildVersion})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -1822,6 +1831,12 @@ func (s *Server) taskCoverage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cov.Enabled = true
+	cov.Metric = "exploration_reachability"
+	cov.Checks, err = s.m.pg.CoverageLedger(r.Context(), taskID, 0, 0)
+	if err != nil {
+		coverageError(w, err)
+		return
+	}
 	writeJSON(w, 200, cov)
 }
 
@@ -2199,7 +2214,7 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stage, err := os.MkdirTemp("", "artex-finding-export-")
+	stage, err := os.MkdirTemp("", "vestrail-finding-export-")
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -3916,22 +3931,43 @@ func (s *Server) fallbackChat(t *Task, msg string) string {
 }
 
 func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	taskRef := r.URL.Query().Get("task")
+	if taskRef != "" && taskRef != "active" {
+		id, err := strconv.ParseInt(taskRef, 10, 64)
+		if err != nil || id <= 0 {
+			writeErr(w, 400, "invalid task id")
+			return
+		}
+	}
+	t := s.m.ResolveTask(taskRef)
 	if t == nil {
 		writeErr(w, 404, "no active task")
 		return
 	}
-	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
-	counts := map[string]int{}
-	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
-		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
-		if len(ns) > 0 {
-			counts[ty] = len(ns)
+	taskID, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil {
+		writeErr(w, 500, "invalid stored task id")
+		return
+	}
+	snapshot, err := pg.TaskReport(r.Context(), taskID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "task not found")
+			return
 		}
+		log.Printf("[report] task %s: %v", t.ID, err)
+		writeErr(w, 500, "报告数据读取失败，请重试")
+		return
 	}
 	md := report.Markdown(report.Input{
-		Title: t.lifecycleSnapshot().Description, Goal: t.lifecycleSnapshot().Goal, GeneratedAt: time.Now(),
-		AssetCounts: counts, Findings: findings,
+		Title: snapshot.Title, Goal: snapshot.Goal, GeneratedAt: snapshot.AsOf,
+		TaskID: snapshot.TaskID, TaskStatus: snapshot.Status, AssetCounts: snapshot.AssetCounts,
+		Findings: snapshot.Findings, Goals: snapshot.Goals, FindingsTotal: snapshot.FindingsTotal,
+		GoalsTotal: snapshot.GoalsTotal, Limitations: snapshot.Limitations,
 	})
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)

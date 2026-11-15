@@ -106,8 +106,8 @@ func TestRetestAtomicDeduplicationAndHistory(t *testing.T) {
 		t.Fatal("overwrote sealed result", err)
 	}
 	f, _ := d.GetFinding(fid)
-	if f.Status != FindingFixed || f.Evidence != "changed evidence" || f.Report != "" {
-		t.Fatal("fixed retest did not update only triage", f)
+	if f.Status != FindingPending || f.Evidence != "changed evidence" || f.Report != "" {
+		t.Fatal("model assessment changed original finding", f)
 	}
 	next, _, created, err := d.CreateFindingRetest(ctx, fid, "second")
 	if err != nil || !created || next.ID == r.ID {
@@ -191,7 +191,7 @@ func TestRetestValidationAndRollback(t *testing.T) {
 
 func TestRetestFixedTriageOnlyAfterSuccessfulCompletion(t *testing.T) {
 	for _, tc := range []struct{ verdict, terminal, want string }{
-		{"fixed", "completed", FindingFixed},
+		{"fixed", "completed", FindingInProgress},
 		{"fixed", "failed", FindingInProgress},
 		{"fixed", "stopped", FindingInProgress},
 		{"reproduced", "completed", FindingInProgress},

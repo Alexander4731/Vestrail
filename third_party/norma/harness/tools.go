@@ -26,12 +26,8 @@ func acceptsRawInput(t tool.CoreTool) bool {
 // failures become error results. It is safe to call from the streaming
 // executor's goroutines (read-only access to loop config; permission/hook
 // callbacks are the host's responsibility to make safe).
-func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
+func (l *loop) execOne(baseCtx context.Context, use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
 	callCtx := tool.WithExecutionCallID(l.ctx, use.ID)
-	baseCtx := l.toolCtx
-	if baseCtx == nil {
-		baseCtx = l.ctx
-	}
 	execCtx := tool.WithExecutionToolName(tool.WithExecutionCallID(baseCtx, use.ID), use.Name)
 	t, ok := l.in.Tools.Get(use.Name)
 	if !ok {
@@ -94,7 +90,7 @@ func (l *loop) execOne(use llm.ContentBlock, emitProgress func(tool.ProgressInfo
 			if name == tool.ExecuteExtraToolName {
 				return tool.Errorf("Nested deferred gateways are not supported"), nil
 			}
-			result, extra := l.execOne(llm.ContentBlock{Type: llm.BlockToolUse, ID: use.ID, Name: name, Input: input}, emitProgress)
+			result, extra := l.execOne(baseCtx, llm.ContentBlock{Type: llm.BlockToolUse, ID: use.ID, Name: name, Input: input}, emitProgress)
 			return tool.Result{Content: result.Content, IsError: result.IsError, Extra: extra}, nil
 		},
 		ExecutionContext: execCtx,

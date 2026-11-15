@@ -16,12 +16,12 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: artex_test
+          POSTGRES_USER: vestrail_test
           POSTGRES_PASSWORD: local-ci-only
-          POSTGRES_DB: artex_test
+          POSTGRES_DB: vestrail_test
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U artex_test"
+          --health-cmd "pg_isready -U vestrail_test"
           --health-interval 5s --health-timeout 5s --health-retries 12
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
           cache: true
       - name: Test application with PostgreSQL
         env:
-          ARTEX_PG_DSN: postgres://artex_test:local-ci-only@127.0.0.1:5432/artex_test?sslmode=disable
+          VESTRAIL_PG_DSN: postgres://vestrail_test:local-ci-only@127.0.0.1:5432/vestrail_test?sslmode=disable
         run: go test -p 1 ./...
       - name: Test executor lifecycle and concurrency
         working-directory: third_party/norma

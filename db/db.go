@@ -1,4 +1,4 @@
-// Package db is the PostgreSQL data source for ARTEX (取代旧 graph 单文件 SQLite)。
+// Package db is the PostgreSQL data source for Vestrail (取代旧 graph 单文件 SQLite)。
 // 它打开连接、应用 schema、并 seed 内置 agent 与变量目录。
 package db
 
@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/config"
+	"github.com/Alexander4731/Vestrail/config"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver ("pgx")
 )
@@ -45,7 +45,7 @@ func isPostgresDeadlock(err error) bool {
 
 func applySchemaWithRetry(ctx context.Context, execer schemaExecer, sleep func(time.Duration)) error {
 	for attempt := 0; ; attempt++ {
-		if _, err := execer.ExecContext(ctx, notificationRouteBeforeSchema+schemaSQL+"\n"+triggerQueueSchema+"\n"+executionRecoverySchema+notificationRouteAfterSchema+llmUsageSchema); err != nil {
+		if _, err := execer.ExecContext(ctx, notificationRouteBeforeSchema+schemaSQL+"\n"+triggerQueueSchema+"\n"+executionRecoverySchema+notificationRouteAfterSchema+llmUsageSchema+"\n"+goalAssessmentSchema+"\n"+findingVerificationSchema+"\n"+coverageLedgerSchema); err != nil {
 			if !isPostgresDeadlock(err) || attempt >= len(schemaDeadlockRetryDelays) {
 				return err
 			}
@@ -87,7 +87,7 @@ func coordinateWithSchemaMigration(tx *sql.Tx) error {
 }
 
 // DSN resolves the PostgreSQL connection string and reports where it came from.
-// Precedence: env ARTEX_PG_DSN > config file (config.json). There is no
+// Precedence: env VESTRAIL_PG_DSN > config file (config.json). There is no
 // built-in default — it errors if neither source is configured.
 func DSN() (dsn, source string, err error) {
 	return config.PostgresDSN()
@@ -330,7 +330,7 @@ var builtinSkillVisibility = map[string][]string{
 	"mqtt-iov":      {"auto", "pentest", "worker"},
 	"satcom-recon":  {"auto", "pentest", "worker"},
 	"iot-protocols": {"auto", "pentest", "worker"},
-	// ARTEX 投毒后门检测/验证 skill（登录接口 captcha 未授权 RCE）。
+	// Vestrail 投毒后门检测/验证 skill（登录接口 captcha 未授权 RCE）。
 	"artex-auth-rce": {"auto", "pentest", "worker"},
 }
 

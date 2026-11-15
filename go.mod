@@ -1,4 +1,4 @@
-module github.com/Autumn-27/artex
+module github.com/Alexander4731/Vestrail
 
 go 1.26.3
 

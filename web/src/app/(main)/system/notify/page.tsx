@@ -314,7 +314,7 @@ export default function NotifyPage() {
             <Label htmlFor="n-base">回链地址</Label>
             <Input
               id="n-base"
-              placeholder="https://artex.example.com"
+              placeholder="https://vestrail.example.com"
               value={baseURL}
               onChange={(e) => setBaseURL(e.target.value)}
             />
@@ -336,7 +336,9 @@ export default function NotifyPage() {
           <div className="grid gap-2">
             <Label htmlFor="n-route">通知 HTTP 路由</Label>
             <Select value={httpRoute} onValueChange={setHTTPRoute}>
-              <SelectTrigger id="n-route"><SelectValue /></SelectTrigger>
+              <SelectTrigger id="n-route">
+                <SelectValue />
+              </SelectTrigger>
               <SelectContent>
                 <SelectItem value="direct">直连</SelectItem>
                 <SelectItem value="legacy_environment">环境代理（兼容旧配置）</SelectItem>

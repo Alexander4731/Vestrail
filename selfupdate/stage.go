@@ -39,7 +39,7 @@ const (
 // 其余阶段传 -1。
 type Progress func(ph Phase, pct int, msg string)
 
-// Stage 下载指定 Release 的当前平台发布包，校验后把新二进制暂存为 artex.new。
+// Stage 下载指定 Release 的当前平台发布包，校验后把新二进制暂存为 vestrail.new。
 //
 // 走的是完整 zip 而不是裸二进制，理由有两个：现有 Release 的 SHA256SUMS 本来就
 // 只覆盖 zip，走 zip 不需要改 CI，也能兼容已经发布出去的历史版本；zip 里还带着
@@ -59,10 +59,11 @@ func Stage(ctx context.Context, c *http.Client, rel *Release, currentVersion str
 	}
 
 	name := AssetName(rel.TagName, runtime.GOOS, runtime.GOARCH)
-	asset, ok := rel.FindAsset(name)
+	asset, ok := rel.PlatformAsset(runtime.GOOS, runtime.GOARCH)
 	if !ok {
 		return fmt.Errorf("该版本没有提供 %s/%s 的发布包（缺少 %s）", runtime.GOOS, runtime.GOARCH, name)
 	}
+	name = asset.Name
 
 	prog(PhaseDownload, 0, "获取校验和清单…")
 	sums, err := fetchSums(ctx, c, rel)
@@ -226,7 +227,7 @@ func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, err
 	if err := checkURL(req.URL); err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "artex-selfupdate")
+	req.Header.Set("User-Agent", "vestrail-selfupdate")
 	req.Header.Set("Accept", "application/octet-stream")
 	setUpdateAuth(req)
 	resp, err := c.Do(req)
@@ -240,14 +241,16 @@ func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, err
 	return resp.Body, nil
 }
 
-// extractBinary 从发布包里取出 artex 可执行文件。
+// extractBinary 从发布包里取出 vestrail 可执行文件。
 //
-// 包内结构是 artex-<版本>-<os>-<arch>/artex，但这里按**基名**匹配而不是拼完整
+// 包内结构是 vestrail-<版本>-<os>-<arch>/vestrail，但这里按**基名**匹配而不是拼完整
 // 路径：版本号在包名里出现过一次，拼错一个字符就整个升级失败，按基名找更耐改。
 func extractBinary(zipPath, dst string) error {
-	want := "artex"
+	want := "vestrail"
+	legacy := "artex"
 	if runtime.GOOS == "windows" {
-		want = "artex.exe"
+		want += ".exe"
+		legacy += ".exe"
 	}
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -257,12 +260,13 @@ func extractBinary(zipPath, dst string) error {
 
 	var selected *zip.File
 	for _, entry := range zr.File {
-		if !strings.EqualFold(path.Base(strings.ReplaceAll(entry.Name, "\\", "/")), want) {
+		base := path.Base(strings.ReplaceAll(entry.Name, "\\", "/"))
+		if !strings.EqualFold(base, want) && !strings.EqualFold(base, legacy) {
 			continue
 		}
 		// Validate the original member spelling and mode before opening any output.
 		if selected != nil {
-			return fmt.Errorf("发布包含多个 %s", want)
+			return fmt.Errorf("发布包含多个候选可执行文件（%s / %s）", want, legacy)
 		}
 		if !entry.Mode().IsRegular() || !fs.ValidPath(entry.Name) || strings.ContainsAny(entry.Name, "\\:\x00") {
 			return fmt.Errorf("发布包内可执行文件路径或类型无效")
@@ -280,7 +284,7 @@ func extractBinary(zipPath, dst string) error {
 		return fmt.Errorf("读取二进制: %w", err)
 	}
 	defer rc.Close()
-	f, err := os.CreateTemp(filepath.Dir(dst), ".artex-extract-*")
+	f, err := os.CreateTemp(filepath.Dir(dst), ".vestrail-extract-*")
 	if err != nil {
 		return err
 	}
@@ -308,7 +312,7 @@ func extractBinary(zipPath, dst string) error {
 // checkWritable 提前确认目录可写。没有这一步，非 root 运行、或二进制被放在系统
 // 目录时，会在下载完几十 MB 之后才在换装那一刻失败。
 func checkWritable(dir string) error {
-	probe, err := os.CreateTemp(dir, ".artex-update-probe-*")
+	probe, err := os.CreateTemp(dir, ".vestrail-update-probe-*")
 	if err != nil {
 		return fmt.Errorf("程序目录 %s 不可写，无法自动更新（请检查权限或改用手动升级）: %w", dir, err)
 	}

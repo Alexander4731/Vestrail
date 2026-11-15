@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/notify"
+	"github.com/Alexander4731/Vestrail/notify"
 )
 
 var (
@@ -138,19 +138,24 @@ func TrafficSnapshotID(snapshot TrafficEvidenceSnapshot) string {
 
 // LockTaskEvidenceTx serializes writes with archive queueing (which locks the
 // same task row). Once queued, its snapshot must not acquire new evidence.
-func LockTaskEvidenceTx(tx *sql.Tx, taskID int64) error {
+func LockTaskEvidenceTx(ctx context.Context, tx *sql.Tx, taskID int64) error {
 	if taskID == 0 {
 		return nil
 	}
 	var deleted sql.NullTime
-	if err := tx.QueryRow(`SELECT deleted_at FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&deleted); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT deleted_at FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&deleted); err != nil {
 		return err
 	}
 	if deleted.Valid {
 		return ErrTaskArchiveState
 	}
+	return checkTaskArchiveWriteTx(ctx, tx, taskID)
+}
+
+// The caller holds the task row lock, so archive queueing cannot race this check.
+func checkTaskArchiveWriteTx(ctx context.Context, tx *sql.Tx, taskID int64) error {
 	var state string
-	err := tx.QueryRow(`SELECT state FROM task_archives WHERE task_id=$1`, taskID).Scan(&state)
+	err := tx.QueryRowContext(ctx, `SELECT state FROM task_archives WHERE task_id=$1`, taskID).Scan(&state)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -160,19 +165,19 @@ func LockTaskEvidenceTx(tx *sql.Tx, taskID int64) error {
 	return nil
 }
 
-func LockFindingEvidenceTx(tx *sql.Tx, findingID int64, version *int64) error {
+func LockFindingEvidenceTx(ctx context.Context, tx *sql.Tx, findingID int64, version *int64) error {
 	var taskID sql.NullInt64
-	if err := tx.QueryRow(`SELECT task_id FROM findings WHERE id=$1`, findingID).Scan(&taskID); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT task_id FROM findings WHERE id=$1`, findingID).Scan(&taskID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrFindingNotFound
 		}
 		return err
 	}
-	if err := LockTaskEvidenceTx(tx, taskID.Int64); err != nil {
+	if err := LockTaskEvidenceTx(ctx, tx, taskID.Int64); err != nil {
 		return err
 	}
 	var current int64
-	if err := tx.QueryRow(`SELECT evidence_version FROM findings WHERE id=$1 FOR UPDATE`, findingID).Scan(&current); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT evidence_version FROM findings WHERE id=$1 FOR UPDATE`, findingID).Scan(&current); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrFindingNotFound
 		}
@@ -268,6 +273,15 @@ FROM finding_traffic_bindings b JOIN traffic_evidence_snapshots s ON s.id=b.snap
 	return out, rows.Err()
 }
 
+// FindingTrafficUsageTx inspects at most limit bindings before a verifier loads
+// their metadata. Call under the evidence lock so the later read sees this set.
+func FindingTrafficUsageTx(ctx context.Context, tx *sql.Tx, findingID int64, limit int) (count int, metadataBytes int64, err error) {
+	err = tx.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(octet_length(to_jsonb(s)::text)::bigint+octet_length(b.note)),0)
+FROM (SELECT snapshot_id,note FROM finding_traffic_bindings WHERE finding_id=$1 ORDER BY position,id LIMIT $2) b
+JOIN traffic_evidence_snapshots s ON s.id=b.snapshot_id`, findingID, limit).Scan(&count, &metadataBytes)
+	return
+}
+
 func (d *DB) GetFindingTraffic(ctx context.Context, findingID int64) (out *FindingTraffic, err error) {
 	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error { var e error; out, e = FindingTrafficTx(tx, findingID); return e })
 	return
@@ -278,7 +292,7 @@ func (d *DB) EditFindingTraffic(ctx context.Context, findingID, bindingID, versi
 		return errors.New("无效的流量用途")
 	}
 	return d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
-		if err := LockFindingEvidenceTx(tx, findingID, &version); err != nil {
+		if err := LockFindingEvidenceTx(ctx, tx, findingID, &version); err != nil {
 			return err
 		}
 		if order != nil {
@@ -340,7 +354,7 @@ type RecordedFinding struct {
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
 // 事务内新加的推送事件写入同样应受调用方的取消与超时约束。
 func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
-	if err := LockTaskEvidenceTx(tx, in.TaskID); err != nil {
+	if err := LockTaskEvidenceTx(ctx, tx, in.TaskID); err != nil {
 		return nil, err
 	}
 	if in.TaskID > 0 {
@@ -422,6 +436,10 @@ func (d *DB) FindingIDByNodeID(nodeID int64) (id int64, err error) {
 // PopulateFindingTrafficIDs only enriches already-visible nodes. It performs no
 // discovery or ID guessing, and leaves the legacy node ID unchanged.
 func (s *ExplorationStore) PopulateFindingTrafficIDs(nodes []*Node) error {
+	return populateFindingMetadata(context.Background(), s.db, nodes)
+}
+
+func populateFindingMetadata(ctx context.Context, q nodeMetadataQuerier, nodes []*Node) error {
 	byID := map[int64]*Node{}
 	var args []any
 	var placeholders []string
@@ -436,7 +454,9 @@ func (s *ExplorationStore) PopulateFindingTrafficIDs(nodes []*Node) error {
 	if len(args) == 0 {
 		return nil
 	}
-	rows, err := s.db.Query(`SELECT f.id,f.node_id,(SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id) FROM findings f WHERE f.node_id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	rows, err := q.QueryContext(ctx, `SELECT f.id,f.node_id,(SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),f.status,
+f.evidence_version,f.verification_state,f.verification_assurance,f.verification_evidence_version,f.verification_attempt_id,`+verificationStaleSQL+`
+FROM findings f WHERE f.node_id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return err
 	}
@@ -444,11 +464,15 @@ func (s *ExplorationStore) PopulateFindingTrafficIDs(nodes []*Node) error {
 	for rows.Next() {
 		var findingID, nodeID int64
 		var count int
-		if err := rows.Scan(&findingID, &nodeID, &count); err != nil {
+		var f DBFinding
+		if err := rows.Scan(&findingID, &nodeID, &count, &f.Status, &f.EvidenceVersion, &f.VerificationState, &f.VerificationAssurance, &f.VerificationEvidenceVersion, &f.VerificationAttemptID, &f.verificationStale); err != nil {
 			return err
 		}
 		n := byID[nodeID]
 		n.FindingID, n.FindingNodeID, n.TrafficCount = findingID, nodeID, count
+		n.FindingStatus = f.Status
+		verification := f.Verification()
+		n.FindingVerification = &verification
 	}
 	return rows.Err()
 }
@@ -462,7 +486,7 @@ func (d *DB) SetFindingReportVersionByNodeID(ctx context.Context, nodeID int64, 
 			}
 			return err
 		}
-		if err := LockFindingEvidenceTx(tx, id, version); err != nil {
+		if err := LockFindingEvidenceTx(ctx, tx, id, version); err != nil {
 			return err
 		}
 		res, err := tx.Exec(`UPDATE findings SET report=$2,report_evidence_version=COALESCE($3::bigint,CASE WHEN evidence_version=0 THEN 0 ELSE -1 END) WHERE id=$1`, id, report, version)

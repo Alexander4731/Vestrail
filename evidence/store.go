@@ -11,13 +11,14 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/traffic"
 )
 
 type Store struct {
@@ -40,14 +41,36 @@ func hashPath(dir, hash string) (string, error) {
 	return filepath.Join(dir, "blobs", hash[:2], hash+".bin"), nil
 }
 
-func verifyFile(path, hash string, length int64) error {
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
+func verifyFile(ctx context.Context, path, hash string, length int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if length < 0 || length == math.MaxInt64 || !info.Mode().IsRegular() || info.Size() != length {
+		return fmt.Errorf("证据正文长度或文件类型不匹配: %s", hash)
+	}
 	h := sha256.New()
-	n, err := io.Copy(h, f)
+	n, err := io.Copy(h, io.LimitReader(contextReader{ctx: ctx, r: f}, length+1))
 	if err != nil {
 		return err
 	}
@@ -92,7 +115,7 @@ func (s *Store) writeBody(r io.Reader, expectedLength int64, expectedHash string
 		return "", err
 	}
 	if _, err = os.Stat(path); err == nil {
-		if err = verifyFile(path, hash, n); err != nil {
+		if err = verifyFile(context.Background(), path, hash, n); err != nil {
 			return "", err
 		}
 		// Refresh the grace period for a restored but not-yet-committed body.
@@ -173,7 +196,7 @@ func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) ([]db.Prepare
 
 func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.TrafficRef) (out *db.RecordedFinding, err error) {
 	err = s.DB.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
-		if err := db.LockTaskEvidenceTx(tx, in.TaskID); err != nil {
+		if err := db.LockTaskEvidenceTx(ctx, tx, in.TaskID); err != nil {
 			return err
 		}
 		prepared, err := s.prepare(ctx, refs)
@@ -188,7 +211,7 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 
 func (s *Store) Bind(ctx context.Context, findingID int64, refs []db.TrafficRef) (out *db.FindingTraffic, err error) {
 	err = s.DB.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
-		if err := db.LockFindingEvidenceTx(tx, findingID, nil); err != nil {
+		if err := db.LockFindingEvidenceTx(ctx, tx, findingID, nil); err != nil {
 			return err
 		}
 		prepared, err := s.prepare(ctx, refs)
@@ -247,11 +270,21 @@ func (s *Store) OpenBody(snapshot db.TrafficEvidenceSnapshot, side string) (*os.
 	if err != nil {
 		return nil, 0, err
 	}
-	if err = verifyFile(path, hash, length); err != nil {
+	if err = verifyFile(context.Background(), path, hash, length); err != nil {
 		return nil, 0, err
 	}
 	f, err := os.Open(path)
 	return f, length, err
+}
+
+// VerifyBody checks a blob without reopening it for download. Verification
+// callers hold the evidence lock and may cache this result within that lock.
+func (s *Store) VerifyBody(ctx context.Context, hash string, length int64) error {
+	path, err := hashPath(s.Dir, hash)
+	if err != nil {
+		return err
+	}
+	return verifyFile(ctx, path, hash, length)
 }
 
 // CopySnapshots is used by both report downloads and portable task archives.
@@ -282,7 +315,7 @@ func (s *Store) copySnapshots(snapshots []db.TrafficEvidenceSnapshot, dest strin
 				}
 				out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 				if os.IsExist(err) {
-					return verifyFile(target, hash, length)
+					return verifyFile(context.Background(), target, hash, length)
 				}
 				if err != nil {
 					return err

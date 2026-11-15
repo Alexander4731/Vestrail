@@ -1,47 +1,24 @@
 <div align="center">
 
-<img src="logo.png" width="250" height="250">
+<img src="logo.png" alt="Vestrail" width="160" height="160">
 
-# ARTEX - God
+# Vestrail
 
-AI 自主渗透测试系统 ARTEX **增强**版（Go 后端 + Next.js 前端）
-
-核心增强：**getshell后渗透**、**Fofa资产批量打**、**高危操作卡点收紧**、**IoT类资产协议支持**
-
-**能挖到漏洞的Agent，才是好Agent** 
-
-开箱即用，任何使用、部署问题、直接提issue
-
-接受**任何**程度的批评与评论
-
-因为，**今天**如果我没更新，**下周**它就被淘汰了。
-
-**使用方法**：①Agent打开目录一键部署(首推)
-
-②下载后双击目录下install.bat即可傻瓜式一键部署安装
+基于 ARTEX 的自主渗透测试与证据审阅系统（Go 后端 + Next.js 前端）。
 
 </div>
 
----
+项目原名 **ARTEX-God**，当前仓库为 [Alexander4731/Vestrail](https://github.com/Alexander4731/Vestrail)。感谢 [ARTEX](https://github.com/Autumn-27/ARTEX) 及 [norma](https://github.com/Autumn-27/norma) 上游；原有许可证与第三方归属保留。
 
-## 以下为原项目README，包含核心功能架构介绍，再次致敬伟大项目ARTEX
+源码构建从 `./install.sh`（Windows：`install.bat`）开始。已有部署见 [Vestrail 迁移说明](MIGRATING_TO_VESTRAIL.md)，开发入口为 `./cmd/vestrail`。
 
-<div align="center">
-
-# ARTEX
-
-AI 自主渗透测试系统（Go 后端 + Next.js 前端）
-
-
-🌐 **在线 Demo**： [https://artex-demo.vercel.app/](https://artex-demo.vercel.app/)
-
-</div>
+已实现范围、验证记录与后续工作见 [全范围集成记录](INTEGRATION_STATUS.md)。当前提供证据完整性检查、目标判定留痕、复测审阅和覆盖账本；材料完整性不等于漏洞已验证，纳入规划的能力也不等于已经交付。
 
 ---
 
 ## 截图预览
 
-> 完整交互见[在线 Demo](https://artex-demo.vercel.app/)。
+> 以下截图与 [ARTEX 上游 Demo](https://artex-demo.vercel.app/) 展示历史版本，尚未更新为 Vestrail 界面。
 
 | 仪表盘（总览 / Token 消耗 / 活动流） | 任务列表 |
 | :---: | :---: |
@@ -77,7 +54,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 ## 审批记录详情
 
 全局「审批记录」、任务内「拦截审批」及对话中的审批卡片均支持展开查看详情。展示结构参考
-[AegisHook 的审批详情组件](https://github.com/RuoJi6/AegisHook/blob/main/web/src/components/CallDetail.vue)，沿用 ARTEX 的组件和主题：
+[AegisHook 的审批详情组件](https://github.com/RuoJi6/AegisHook/blob/main/web/src/components/CallDetail.vue)，沿用 Vestrail 的组件和主题：
 
 
 ## 资产同步（ScopeSentry）
@@ -86,7 +63,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 - 在「**资产同步**」页填 ScopeSentry 的地址与 API Key，接入数据源；
 - 按**项目**或**任务**维度选择要同步的目标与资产类型（域名 / 子域 / IP / 端口 / 站点 / 端点…）；
-- 一键导入并按公司资产范围归并，直接进入 ARTEX 的资产图供 agent 探索使用。
+- 一键导入并按公司资产范围归并，直接进入 Vestrail 的资产图供 agent 探索使用。
 
 ---
 
@@ -99,8 +76,8 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 ### 方式一：一键安装脚本（推荐）
 
 ```bash
-git clone https://github.com/Xiao1an/ARTEX-God.git
-cd ARTEX-God
+git clone https://github.com/Alexander4731/Vestrail.git
+cd Vestrail
 ./install.sh
 ```
 
@@ -115,15 +92,17 @@ cd ARTEX-God
 
 ### 方式二：下载预编译二进制（Releases）
 
-到 [Releases](https://github.com/Xiao1an/ARTEX-God/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
+到 [Releases](https://github.com/Alexander4731/Vestrail/releases) 下载对应平台的 zip。新名称的包为 `vestrail-<版本>-<os>-<arch>.zip`；历史 ARTEX 包仍保留原文件名。首次从 ARTEX 切换请阅读 [迁移说明](MIGRATING_TO_VESTRAIL.md)。
+
+Windows 便携包双击 `start.bat`，由启动器管理内置运行库和本地数据库。Linux/macOS 包包含 `vestrail`、`start.sh`、`skills/` 和 `config.example.json`：
 
 ```bash
 cp config.example.json config.json   # 填好 database 连接
 ./start.sh                           # → http://localhost:8787
 ```
 
-> 请用 `start.sh` / `start.bat` 启动，而不是直接跑 `./artex`。它是个守护脚本：程序退出后按退出码决定是否重新拉起，**页面上的[一键更新](#方式一页面一键更新推荐)靠它完成换装**。直接运行 `./artex` 时更新完就不会被拉起了。
-> 后台常驻：`nohup ./start.sh >artex.log 2>&1 &`。
+> 请用 `start.sh` / `start.bat` 启动，而不是直接跑 `./vestrail`。它是个守护脚本：程序退出后按退出码决定是否重新拉起，**页面上的[一键更新](#方式一页面一键更新推荐)靠它完成换装**。直接运行 `./vestrail` 时更新完就不会被拉起了。
+> 后台常驻：`nohup ./start.sh >vestrail.log 2>&1 &`。
 
 ### 方式三：从源码编译单二进制
 
@@ -133,7 +112,7 @@ cd web && npm ci && npm run build:static && cd ..
 # 2) 拷进内嵌目录
 cp -r web/out server/webui/dist
 # 3) 编译（-tags embedui 才内嵌前端）
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
+CGO_ENABLED=0 go build -tags embedui -o vestrail ./cmd/vestrail
 ./start.sh
 ```
 
@@ -143,13 +122,13 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 ```bash
 ./build.sh --release
-# 产物：dist/artex-0.3.3-*.zip
+# 产物：dist/vestrail-0.3.3-*.zip
 ```
 
-UPX 自解压二进制可能与部分 Linux 内核、虚拟化环境或安全策略不兼容，因此默认不启用。可用 `ARTEX_TARGETS` 自定义目标；确认目标运行环境兼容时，可显式传入 `--upx` 进一步缩小二进制：
+UPX 自解压二进制可能与部分 Linux 内核、虚拟化环境或安全策略不兼容，因此默认不启用。可用 `VESTRAIL_TARGETS` 自定义目标；确认目标运行环境兼容时，可显式传入 `--upx` 进一步缩小二进制：
 
 ```bash
-ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
+VESTRAIL_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 ./build.sh --target linux/amd64 --upx
 ```
 
@@ -157,31 +136,31 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 ## 更新升级
 
-> 升级只换程序、不动数据：`./data`（jwt.key / SQLite 等）、`./skills` 与你的 PostgreSQL 都会保留。**数据库迁移无需手动执行**——`artex` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
+> 改名前后的切换请先阅读 [迁移说明](MIGRATING_TO_VESTRAIL.md)。升级只换程序、不动数据：`./data`、根目录的 `jwt.key`、`./skills` 与你的 PostgreSQL 都会保留。**数据库迁移无需手动执行**——`vestrail` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
 
 ### 本仓库的私有 Release 更新源
 
-页面一键更新固定从 [Xiao1an/ARTEX-God Releases](https://github.com/Xiao1an/ARTEX-God/releases) 检查和下载版本。克隆或通过 Git 更新源码也使用 `Xiao1an/ARTEX-God`；原项目的 Go module 路径保持不变。
+页面一键更新固定从 [Alexander4731/Vestrail Releases](https://github.com/Alexander4731/Vestrail/releases) 检查和下载版本。克隆或通过 Git 更新源码也使用 `Alexander4731/Vestrail`；原项目的 Go module 路径保持不变。
 
-若仓库为私有，请为运行 ARTEX 的后端进程设置 `ARTEX_UPDATE_GITHUB_TOKEN`，令牌只需本仓库的 **Contents: read** 权限。令牌由后端用于查询 Release 和下载附件，不发送给浏览器，也不要提交到 Git。公开仓库则无需令牌。
+若仓库为私有，请为运行 Vestrail 的后端进程设置 `VESTRAIL_UPDATE_GITHUB_TOKEN`，令牌只需本仓库的 **Contents: read** 权限。令牌由后端用于查询 Release 和下载附件，不发送给浏览器，也不要提交到 Git。公开仓库则无需令牌。
 
 ```bash
-# 先在当前 shell 或服务环境中安全设置 ARTEX_UPDATE_GITHUB_TOKEN
+# 先在当前 shell 或服务环境中安全设置 VESTRAIL_UPDATE_GITHUB_TOKEN
 ./start.sh
 ```
 
-如需配置更新令牌（仅私有仓库），把 `ARTEX_UPDATE_GITHUB_TOKEN` 导出到运行 artex 的进程环境即可。
+如需配置更新令牌（仅私有仓库），把 `VESTRAIL_UPDATE_GITHUB_TOKEN` 导出到运行 vestrail 的进程环境即可。
 
-需要先在本仓库发布非 draft、非 prerelease 的正式 Release，并附上 `artex-<版本>-<os>-<arch>.zip` 和 `SHA256SUMS`，页面才能提供可安装更新。仓库里只有源码时还不能在线升级。现有 Release 工作流会在推送 `v*` tag 时为当前仓库生成这些附件。
+需要先在本仓库发布非 draft、非 prerelease 的正式 Release，并附上 `vestrail-<版本>-<os>-<arch>.zip` 和 `SHA256SUMS`，页面才能提供可安装更新。仓库里只有源码时还不能在线升级。现有 Release 工作流会在推送 `v*` tag 时为当前仓库生成这些附件。
 
 ### 方式一：页面一键更新（推荐）
 
 在 **系统配置** 页（侧边栏「系统配置」→ `/system/settings`）的**版本与更新**卡片里，可以直接检查并安装新版本，无需登录服务器。
 
-点「更新」后：下载当前平台的发布包 → 比对 Release 的 `SHA256SUMS` → 用 `-h` 冒烟测试新二进制 → 暂存为 `artex.new` → 程序退出，由 `start.sh` / `start.bat` 重新拉起并完成换装。页面会自动等到新版本上线后刷新。
+点「更新」后：下载当前平台的发布包 → 比对 Release 的 `SHA256SUMS` → 用 `-h` 冒烟测试新二进制 → 暂存为 `vestrail.new` → 程序退出，由 `start.sh` / `start.bat` 重新拉起并完成换装。页面会自动等到新版本上线后刷新。
 
-- **失败不会留下坏程序**：校验或冒烟不通过就丢弃暂存件、继续跑当前版本；换装后的新版若连续 3 次启动失败，会自动回滚到 `artex.old`（失败的那个留作 `artex.failed` 供排查）。
-- **随时可回退**：上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
+- **失败不会留下坏程序**：校验或冒烟不通过就丢弃暂存件、继续跑当前版本；换装后的新版若连续 3 次启动失败，会自动回滚到 `vestrail.old`（失败的那个留作 `vestrail.failed` 供排查）。
+- **随时可回退**：上一版本保留为 `vestrail.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
 - **更新会中断正在运行的任务**——更新即重启，请在空闲时进行。
 - **开发构建不给更新**：版本号是 `dev` 或 `git describe` 带后缀时禁用，避免正式版覆盖掉本地调试的二进制。
 - 访问 GitHub 需要代理时，在同一页面配置**全局代理**即可，更新链路会走它。更新只从 GitHub 域名下载并强制 HTTPS。
@@ -189,18 +168,18 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 ### 方式二：一键更新脚本
 
 ```bash
-cd ARTEX-God
+cd Vestrail
 ./update.sh
 ```
 
-脚本先可选 `git pull` 拉取最新代码，再重建前端静态产物 → 重新编译 `./artex`（完成后重启进程生效）。
+脚本先可选 `git pull` 拉取最新代码，再重建前端静态产物 → 重新编译 `./vestrail`（完成后重启进程生效）。
 
 ### 方式三：预编译二进制（Releases）
 
-到 [Releases](https://github.com/Xiao1an/ARTEX-God/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
+到 [Releases](https://github.com/Alexander4731/Vestrail/releases) 下载新版本 zip，停掉旧进程后覆盖 `vestrail` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
 
 ```bash
-cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
+cp -r <解压目录>/skills ./ && cp <解压目录>/vestrail ./
 ./start.sh
 ```
 
@@ -210,7 +189,7 @@ cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
 git pull
 cd web && npm ci && npm run build:static && cd ..
 cp -r web/out server/webui/dist
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
+CGO_ENABLED=0 go build -tags embedui -o vestrail ./cmd/vestrail
 # 重启 ./start.sh
 ```
 
@@ -218,24 +197,24 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 ## 配置
 
-**数据库**（`config.json`，或用环境变量 `ARTEX_PG_DSN` 覆盖）：
+**数据库**（`config.json`，或用环境变量 `VESTRAIL_PG_DSN` 覆盖）：
 
 ```json
 {
   "database": {
     "host": "127.0.0.1", "port": 5432,
-    "user": "artex", "password": "yourpass",
-    "dbname": "artex", "sslmode": "disable"
+    "user": "vestrail", "password": "yourpass",
+    "dbname": "vestrail", "sslmode": "disable"
   }
 }
 ```
 
 **LLM**：`export ANTHROPIC_API_KEY=sk-...`（或 `OPENAI_API_KEY`），也可在 UI 的「LLM 配置」页填写。
-可选：`ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ARTEX_LLM_PROXY`。
+可选：`VESTRAIL_LLM_PROVIDER` / `VESTRAIL_LLM_MODEL` / `VESTRAIL_LLM_BASE_URL` / `VESTRAIL_LLM_PROXY`。
 
 **并发**：每个任务的 work agent 数在「系统设置」里配置（默认 3）。
 
-**常用参数**：`./start.sh -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。
+**常用参数**：`./start.sh -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `vestrail`。
 
 ### 反向代理部署（HTTPS / 只开放 443）
 
@@ -288,7 +267,7 @@ server {
 ./dev.sh    # 后端(:8787) + 流量代理(:8788) + 前端 next dev(:5173) → http://localhost:5173
 ```
 
-- 后端：`go run ./cmd/artex`（不带 `-tags embedui` 则不内嵌前端）
+- 后端：`go run ./cmd/vestrail`（不带 `-tags embedui` 则不内嵌前端）
 - 前端：`cd web && npm run dev`（`/api` 反代到后端，带热更新）
 - 测试：`go test ./...`
 - Mock 预览（无后端）：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev`
@@ -297,7 +276,7 @@ server {
 
 ## 系统技术架构
 
-ARTEX 是一套 **LLM 多 agent 驱动的自主渗透系统**：Go 单体后端（内嵌 Next.js 前端）+ PostgreSQL，agent 能力由 [`norma`](https://github.com/Autumn-27/norma) SDK 提供（`agentcore` / `tool` / `permission` / `harness` / `memory` / `transcript`）。核心是**双图架构**，以及围绕它的两条自主性机制：**worker 间过程级信息交换**与 **planner 多轮共享 todolist 稳定攻击链路**。
+Vestrail 是一套 **LLM 多 agent 驱动的自主渗透系统**：Go 单体后端（内嵌 Next.js 前端）+ PostgreSQL，agent 能力由 [`norma`](https://github.com/Autumn-27/norma) SDK 提供（`agentcore` / `tool` / `permission` / `harness` / `memory` / `transcript`）。核心是**双图架构**，以及围绕它的两条自主性机制：**worker 间过程级信息交换**与 **planner 多轮共享 todolist 稳定攻击链路**。
 
 ### 总体分层
 
@@ -461,7 +440,7 @@ flowchart TB
   R3["第 3 轮（②产出 fact）　派意图③"] --> T3
 ```
 
-于是攻击链在“事件驱动 + 无状态会话”的环境下依然**稳定推进、不重复、不错序**——这是 ARTEX 能自主走完多步利用链的关键。
+于是攻击链在“事件驱动 + 无状态会话”的环境下依然**稳定推进、不重复、不错序**——这是 Vestrail 能自主走完多步利用链的关键。
 
 ---
 
@@ -482,7 +461,7 @@ https://github.com/Autumn-27/ARTEX
 
 > ⚠️ **重要提示**：开源协议本身不限制软件的使用用途。以下的「使用限制」与「免责声明」是作者对使用者的额外约定与郑重声明，请务必遵守。
 
-**ARTEX 仅供个人学习、代码研究与本地技术验证使用，不得用于对任何线上系统或网站发起实际测试。**
+**Vestrail 仅供个人学习、代码研究与本地技术验证使用，不得用于对任何线上系统或网站发起实际测试。**
 
 ### 允许使用范围
 

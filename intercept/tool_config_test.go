@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 )
 
 func TestToolConfigRoundTripPreservesDynamicDefaults(t *testing.T) {

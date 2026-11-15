@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ARTEX 安装脚本：本地编译运行（需已有 PostgreSQL）
+# Vestrail 安装脚本：本地编译运行（需已有 PostgreSQL）
 set -euo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
 
@@ -10,15 +10,15 @@ die(){  printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ask(){  local p="$1" d="${2:-}" a; read -rp "$p${d:+ [$d]}: " a; echo "${a:-$d}"; }
 
 echo "=============================="
-echo "  ARTEX 安装（本地编译运行）"
+echo "  Vestrail 安装（本地编译运行）"
 echo "=============================="
 
 # ── 数据库连接（需已有 PostgreSQL）─────────────────
 DB_HOST="$(ask '数据库地址' 127.0.0.1)"
 DB_PORT="$(ask '端口' 5432)"
-DB_USER="$(ask '账号' artex)"
+DB_USER="$(ask '账号' vestrail)"
 DB_PASS="$(ask '密码' '')"
-DB_NAME="$(ask '数据库名' artex)"
+DB_NAME="$(ask '数据库名' vestrail)"
 DB_SSL="$(ask 'sslmode (disable/require)' disable)"
 
 # ── 生成 config.json ───────────────────────────────
@@ -46,12 +46,12 @@ if command -v npm >/dev/null 2>&1; then
   ( cd web && npm ci && npm run build:static )
   rm -rf server/webui/dist && cp -r web/out server/webui/dist
   info "编译内嵌单二进制…"
-  CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+  CGO_ENABLED=0 go build -tags embedui -trimpath -o vestrail ./cmd/vestrail
 else
   warn "未检测到 npm：将编译**不内嵌前端**的后端（前端需另跑 npm run dev）"
-  CGO_ENABLED=0 go build -o artex ./cmd/artex
+  CGO_ENABLED=0 go build -o vestrail ./cmd/vestrail
 fi
-ok "编译完成 → ./artex"
+ok "编译完成 → ./vestrail"
 
 info "启动…（Ctrl-C 退出）"
 exec ./start.sh

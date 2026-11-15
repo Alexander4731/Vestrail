@@ -12,9 +12,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/agent"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/intercept"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -56,6 +56,42 @@ func (s *Server) listFindingRetests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"retests": items})
+}
+
+func (s *Server) acceptFindingRetest(w http.ResponseWriter, r *http.Request) {
+	if s.pg(w) == nil {
+		return
+	}
+	fid, ok := s.findingTrafficAccess(w, r, true)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("retest_id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, 400, "invalid retest id")
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if !decodeConversationRequest(w, r, &req) {
+		return
+	}
+	err = s.m.pg.AcceptFindingRetest(r.Context(), fid, id, "human:Vestrail", req.Reason)
+	if err != nil {
+		status := 500
+		switch {
+		case errors.Is(err, sql.ErrNoRows), errors.Is(err, db.ErrFindingNotFound):
+			status = 404
+		case errors.Is(err, db.ErrVerificationConflict), errors.Is(err, db.ErrTaskArchiveState):
+			status = 409
+		case errors.Is(err, db.ErrVerificationInput):
+			status = 400
+		}
+		writeErr(w, status, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"accepted": true})
 }
 
 func (s *Server) startFindingRetest(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +157,10 @@ func (s *Server) startFindingRetest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "finding not found")
 		return
 	}
+	if errors.Is(err, db.ErrTaskArchiveState) {
+		writeErr(w, 409, err.Error())
+		return
+	}
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -167,7 +207,7 @@ func (s *Server) findingRetestTools() []actool.CoreTool {
 				}
 				return jsonResult(map[string]any{"retest": r, "current_constraints": constraints})
 			}),
-		wrTool("record_finding_retest_result", "为当前复测会话保存唯一结论；原漏洞证据与报告保持不变。会话成功结束且结论为 fixed 时，系统自动将漏洞状态改为已修复；其他结论保留原状态。必须提供本次实际检查的证据，无法确认时写明阻塞原因。",
+		wrTool("record_finding_retest_result", "为当前复测会话保存唯一模型评估；fixed 需人工审阅后接受，不自动改变漏洞处置状态。必须提供本次实际检查的证据，无法确认时写明阻塞原因。",
 			objSchema(map[string]any{
 				"verdict":  map[string]any{"type": "string", "enum": []string{"reproduced", "fixed", "inconclusive"}},
 				"summary":  strParam("本次复测结论摘要"),
@@ -184,7 +224,7 @@ func (s *Server) findingRetestTools() []actool.CoreTool {
 				if err := s.m.pg.RecordFindingRetestResult(ctx, intercept.ConvIDFromContext(ctx), a.Verdict, a.Summary, a.Evidence); err != nil {
 					return actool.Errorf(err.Error()), nil
 				}
-				return jsonResult(map[string]any{"saved": true, "verdict": a.Verdict})
+				return jsonResult(map[string]any{"saved": true, "verdict": a.Verdict, "assessment_method": "model_assessed", "triage_applied": false, "note": "修复结论需人工审阅后接受"})
 			}),
 	}
 }

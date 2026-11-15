@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/notify"
+	"github.com/Alexander4731/Vestrail/notify"
 )
 
 // 本文件的用例都会真连 PostgreSQL（无库时跳过）。这些 SQL 用到了
@@ -843,6 +843,9 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	}
 	if err := d.FinishFindingRetest(rt.ID, "completed", ""); err != nil {
 		t.Fatalf("结束复测失败: %v", err)
+	}
+	if err := d.AcceptFindingRetest(ctx, f.FindingID, rt.ID, "human:test", "reviewed evidence"); err != nil {
+		t.Fatal(err)
 	}
 
 	var status string

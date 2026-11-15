@@ -3,9 +3,10 @@ chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set "BIN=artex.exe"
+set "BIN=vestrail.exe"
+if not exist "%BIN%" set "BIN=artex.exe"
 if not exist "%BIN%" (
-	echo [artex] 找不到可执行文件 %BIN% 1>&2
+	echo [vestrail] 找不到可执行文件 %BIN% 1>&2
 	exit /b 1
 )
 
@@ -18,17 +19,17 @@ set /a delay=1
 set "code=!ERRORLEVEL!"
 
 if "!code!"=="0" (
-	echo [artex] 正常退出
+	echo [vestrail] 正常退出
 	exit /b 0
 )
 
 if "!code!"=="%RESTART_CODE%" (
-	echo [artex] 请求重启（应用新版本）…
+	echo [vestrail] 请求重启（应用新版本）…
 	set /a delay=1
 	goto loop
 )
 
-echo [artex] 异常退出 ^(code=!code!^)，!delay!s 后重启 1>&2
+echo [vestrail] 异常退出 ^(code=!code!^)，!delay!s 后重启 1>&2
 set /a pings=!delay!+1
 ping -n !pings! 127.0.0.1 >nul 2>&1
 set /a delay=!delay!*2

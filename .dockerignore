@@ -8,6 +8,8 @@ jwt.key
 .env.*
 artex
 artex.exe
+vestrail
+vestrail.exe
 *.log
 skills/**/node_modules
 skills/**/__pycache__

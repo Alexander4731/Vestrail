@@ -28,7 +28,9 @@ import type {
   Conversation,
   ConvTokenSummary,
   CoverageAssetRefs,
+  CoverageCheckSpec,
   CoverageGraphData,
+  CoverageLedger,
   DailyTokenBucket,
   DeleteTaskOptions,
   DeleteTaskResult,
@@ -104,6 +106,7 @@ import type {
   TrafficResp,
   UpdateCheck,
   UsageStats,
+  VerificationAttempt,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
@@ -158,7 +161,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // EventSource uses the server-issued session cookie with credentials enabled.
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
-  return `# ARTEX 渗透测试报告 — Acme Corp
+  return `# Vestrail 渗透测试报告 — Acme Corp
 
 ## 概览
 - 范围：acme.com（含 www / admin / api / shop / vpn 子域）
@@ -225,7 +228,9 @@ export const api = {
   setExecutionPolicy: (taskId: string, mode: "legacy" | "observe" | "auto") =>
     put<{ mode: "legacy" | "observe" | "auto" }>(`/tasks/${taskId}/execution-policy`, { mode }),
   executionRecoveries: (taskId: string, before?: number) =>
-    get<import("./execution-types").ExecutionRecovery[]>(`/tasks/${taskId}/execution-recoveries${before ? `?before=${before}` : ""}`),
+    get<import("./execution-types").ExecutionRecovery[]>(
+      `/tasks/${taskId}/execution-recoveries${before ? `?before=${before}` : ""}`,
+    ),
   decideExecutionRecovery: (
     taskId: string,
     id: number,
@@ -319,7 +324,9 @@ export const api = {
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
   controlTask: (id: string, action: "pause" | "resume" | "restart", signal?: AbortSignal) =>
     http<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/control`, {
-      method: "POST", body: JSON.stringify({ action }), signal,
+      method: "POST",
+      body: JSON.stringify({ action }),
+      signal,
     }),
   controlTasksBatch: (taskIds: string[], action: "pause" | "resume") =>
     post<{ items: BatchControlItem[] }>("/tasks/control/batch", { task_ids: taskIds, action }),
@@ -675,11 +682,45 @@ export const api = {
     get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
       arr(r.retests),
     ),
+  findingVerifications: (id: string, before?: string) =>
+    get<{ attempts: VerificationAttempt[] }>(
+      `/exploration/findings/${encodeURIComponent(id)}/verifications${before ? `?before=${encodeURIComponent(before)}` : ""}`,
+    ),
+  coverageLedger: (taskId: string, planId?: string, after?: string) => {
+    const query = new URLSearchParams();
+    if (planId) query.set("plan_id", planId);
+    if (after) query.set("after", after);
+    return get<CoverageLedger>(`/tasks/${encodeURIComponent(taskId)}/coverage/checks?${query}`);
+  },
+  createCoveragePlan: (taskId: string, previousPlanId: string, requestKey: string, checks: CoverageCheckSpec[]) =>
+    post(`/tasks/${encodeURIComponent(taskId)}/coverage/plans`, {
+      previous_plan_id: previousPlanId,
+      request_key: requestKey,
+      checks,
+    }),
+  recordCoverageCheck: (
+    taskId: string,
+    checkId: string,
+    request: { request_key: string; outcome: string; reason: string; evidence_node_id?: string },
+  ) => post(`/tasks/${encodeURIComponent(taskId)}/coverage/checks/${encodeURIComponent(checkId)}/attempts`, request),
+  verifyFinding: (id: string, evidenceVersion: number, requestKey: string) =>
+    post<{ attempt: VerificationAttempt; created: boolean }>(
+      `/exploration/findings/${encodeURIComponent(id)}/verifications`,
+      {
+        request_key: requestKey,
+        evidence_version: evidenceVersion,
+        verifier: "evidence_integrity",
+      },
+    ),
   activeFindingRetests: () =>
     get<{ retests: ActiveFindingRetest[] }>("/exploration/findings/retests/active").then((r) => arr(r.retests)),
   startFindingRetest: (id: string, notes: string) =>
     post<{ retest: FindingRetest; created: boolean }>(`/exploration/findings/${encodeURIComponent(id)}/retests`, {
       notes,
+    }),
+  acceptFindingRetest: (id: string, retestId: number, reason: string) =>
+    post<{ accepted: boolean }>(`/exploration/findings/${encodeURIComponent(id)}/retests/${retestId}/accept`, {
+      reason,
     }),
   deepenFinding: (id: string, description: string) =>
     post<FindingDeepenResponse>(`/exploration/findings/${id}/deepen`, { description }),

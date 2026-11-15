@@ -14,16 +14,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/internal/testutil"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/internal/testutil"
+	"github.com/Alexander4731/Vestrail/traffic"
 )
 
 func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
 	t.Helper()
-	dsn := os.Getenv("ARTEX_PG_DSN")
+	dsn := os.Getenv("VESTRAIL_PG_DSN")
 	if dsn == "" {
-		t.Skip("ARTEX_PG_DSN is required for evidence integration tests")
+		t.Skip("VESTRAIL_PG_DSN is required for evidence integration tests")
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
@@ -48,6 +48,36 @@ func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
 	store := New(pg, tr, filepath.Join(dir, "evidence"))
 	in := db.RecordFindingInput{TaskID: task.ID, ExplorationID: task.ExplorationID, Worker: "test", VulnClass: "TEST", Name: "Evidence fixture", Severity: "low", Summary: "local test"}
 	return store, in, dir
+}
+
+func TestVerifyBodyRejectsChangedAndCancelledFiles(t *testing.T) {
+	store := New(nil, nil, t.TempDir())
+	body := []byte("original evidence")
+	hash, err := store.writeBody(bytes.NewReader(body), int64(len(body)), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.VerifyBody(t.Context(), hash, int64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err = store.VerifyBody(ctx, hash, int64(len(body))); !errors.Is(err, context.Canceled) {
+		t.Fatal("cancelled integrity read continued", err)
+	}
+	if err = store.VerifyBody(t.Context(), hash, int64(len(body)+1)); err == nil {
+		t.Fatal("wrong body length accepted")
+	}
+	path, err := hashPath(store.Dir, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, bytes.Repeat([]byte("x"), len(body)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.VerifyBody(t.Context(), hash, int64(len(body))); err == nil {
+		t.Fatal("same-length tampering accepted")
+	}
 }
 
 func seedExchange(t *testing.T, s *Store, id string, body []byte, spill bool) {

@@ -2,10 +2,10 @@ package agent
 
 import (
 	"context"
-	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Alexander4731/Vestrail/llmrec"
 	"strconv"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 )
 
 // RunInfo identifies WHICH run a tool call belongs to. Tool assembly only receives

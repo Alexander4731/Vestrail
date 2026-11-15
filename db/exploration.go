@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -65,22 +66,25 @@ func jsonbClean(b []byte) []byte {
 
 // Node is a typed reasoning node (= old task_nodes). kind ∈ goal|intent|finding|hint.
 type Node struct {
-	FindingID     int64           `json:"finding_id,omitempty"` // populated by finding-aware reads; never inferred from ID
-	FindingNodeID int64           `json:"finding_node_id,omitempty"`
-	TrafficCount  int             `json:"traffic_count,omitempty"`
-	ID            int64           `json:"id"`
-	Kind          string          `json:"kind"`
-	Payload       json.RawMessage `json:"payload"`
-	Priority      int             `json:"priority"`
-	State         string          `json:"state"`
-	Origin        string          `json:"origin,omitempty"`
-	Owner         string          `json:"owner,omitempty"`
-	BlockedReason string          `json:"blocked_reason,omitempty"`
-	DeleteReason  string          `json:"delete_reason,omitempty"` // 仅意图假删除(state='deleted')时非空
-	Anchors       []int64         `json:"anchors,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	SourceTaskID  int64           `json:"source_task_id,omitempty"`
-	Inherited     bool            `json:"inherited,omitempty"`
+	FindingVerification *VerificationSummary `json:"verification,omitempty"`
+	FindingStatus       string               `json:"finding_status,omitempty"`
+	GoalAssessment      *GoalAssessment      `json:"assessment,omitempty"`
+	FindingID           int64                `json:"finding_id,omitempty"` // populated by finding-aware reads; never inferred from ID
+	FindingNodeID       int64                `json:"finding_node_id,omitempty"`
+	TrafficCount        int                  `json:"traffic_count,omitempty"`
+	ID                  int64                `json:"id"`
+	Kind                string               `json:"kind"`
+	Payload             json.RawMessage      `json:"payload"`
+	Priority            int                  `json:"priority"`
+	State               string               `json:"state"`
+	Origin              string               `json:"origin,omitempty"`
+	Owner               string               `json:"owner,omitempty"`
+	BlockedReason       string               `json:"blocked_reason,omitempty"`
+	DeleteReason        string               `json:"delete_reason,omitempty"` // 仅意图假删除(state='deleted')时非空
+	Anchors             []int64              `json:"anchors,omitempty"`
+	CreatedAt           time.Time            `json:"created_at"`
+	SourceTaskID        int64                `json:"source_task_id,omitempty"`
+	Inherited           bool                 `json:"inherited,omitempty"`
 }
 
 // Activity is one worker execution step (= old task_activity).
@@ -211,7 +215,7 @@ func (s *ExplorationStore) AddNodeLinked(kind string, payload map[string]any, pr
 	}
 	defer tx.Rollback()
 	if kind == KindGoal || kind == KindIntent {
-		if err := lockTaskGraphWrite(tx, s.expID); err != nil {
+		if err := lockTaskGraphWrite(context.Background(), tx, s.expID); err != nil {
 			return 0, err
 		}
 	}
@@ -299,7 +303,10 @@ func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) e
 		payload["vulnclass"] = vulnclass
 	}
 	raw, _ := json.Marshal(payload)
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET payload=$1 WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(jsonbClean(raw)), id, s.expID)
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET payload=$1,
+state=CASE WHEN payload IS DISTINCT FROM $1::jsonb THEN 'open' ELSE state END,
+content_version=content_version+CASE WHEN payload IS DISTINCT FROM $1::jsonb THEN 1 ELSE 0 END
+WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(jsonbClean(raw)), id, s.expID)
 	if err != nil {
 		return err
 	}

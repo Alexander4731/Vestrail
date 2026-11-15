@@ -42,13 +42,13 @@ func TestPrivateReleaseMetadataChecksumsAndDownload(t *testing.T) {
 			}
 			return updateResponse(req, 200, fmt.Sprintf(`{"tag_name":"v0.3.16","assets":[
 				{"name":"SHA256SUMS","url":"https://api.github.com/repos/%s/releases/assets/1","browser_download_url":"https://github.com/unusable-sums"},
-				{"name":"artex-0.3.16-darwin-arm64.zip","url":"https://api.github.com/repos/%s/releases/assets/2","browser_download_url":"https://github.com/unusable-zip","size":%d}
+				{"name":"vestrail-0.3.16-darwin-arm64.zip","url":"https://api.github.com/repos/%s/releases/assets/2","browser_download_url":"https://github.com/unusable-zip","size":%d}
 			]}`, Repo, Repo, len(payload))), nil
 		case "https://api.github.com/repos/" + Repo + "/releases/assets/1":
 			if req.Header.Get("Accept") != "application/octet-stream" {
 				t.Fatal("checksum request must ask for binary data")
 			}
-			return updateResponse(req, 200, wantSum+"  artex-0.3.16-darwin-arm64.zip\n"), nil
+			return updateResponse(req, 200, wantSum+"  vestrail-0.3.16-darwin-arm64.zip\n"), nil
 		case "https://api.github.com/repos/" + Repo + "/releases/assets/2":
 			if req.Header.Get("Accept") != "application/octet-stream" {
 				t.Fatal("archive request must ask for binary data")
@@ -71,7 +71,7 @@ func TestPrivateReleaseMetadataChecksumsAndDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	asset, ok := rel.FindAsset("artex-0.3.16-darwin-arm64.zip")
+	asset, ok := rel.FindAsset("vestrail-0.3.16-darwin-arm64.zip")
 	if !ok {
 		t.Fatal("archive missing")
 	}

@@ -11,7 +11,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --chmod=755 dist/${TARGETARCH}/artex ./artex
+COPY --chmod=755 dist/${TARGETARCH}/vestrail ./vestrail
 COPY --chmod=755 start.sh ./start.sh
 COPY config.example.json ./config.example.json
 COPY skills ./skills

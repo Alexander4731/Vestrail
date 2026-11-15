@@ -7,16 +7,17 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/Alexander4731/Vestrail/internal/env"
 )
 
 // Repo is the release source, fixed at build time with -X when distributing a fork.
-var Repo = "Alexander4731/ARTEX-God"
+var Repo = "Alexander4731/Vestrail"
 
 // GitHubTokenEnv 只由后端进程读取，不通过前端或配置 API 传递令牌。
-const GitHubTokenEnv = "ARTEX_UPDATE_GITHUB_TOKEN"
+const GitHubTokenEnv = "VESTRAIL_UPDATE_GITHUB_TOKEN"
 
 // latestURL 是 GitHub 的"最新正式版"接口。它会自动跳过 prerelease 和 draft。
 var latestURL = "https://api.github.com/repos/" + Repo + "/releases/latest"
@@ -70,7 +71,7 @@ func setUpdateAuth(req *http.Request) {
 		!strings.HasPrefix(strings.ToLower(u.EscapedPath()), strings.ToLower("/repos/"+Repo+"/releases/")) {
 		return
 	}
-	if token := strings.TrimSpace(os.Getenv(GitHubTokenEnv)); token != "" {
+	if token := strings.TrimSpace(env.Get(GitHubTokenEnv)); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 }
@@ -128,7 +129,7 @@ func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "artex-selfupdate")
+	req.Header.Set("User-Agent", "vestrail-selfupdate")
 	setUpdateAuth(req)
 
 	resp, err := c.Do(req)
@@ -168,9 +169,18 @@ func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
 }
 
 // AssetName 返回当前平台对应的发布包名，与 build.sh 的 package_binary 保持一致：
-// artex-<版本>-<os>-<arch>.zip（版本号不带 v 前缀）。
+// vestrail-<版本>-<os>-<arch>.zip（版本号不带 v 前缀）。
 func AssetName(tag, goos, goarch string) string {
-	return fmt.Sprintf("artex-%s-%s-%s.zip", strings.TrimPrefix(tag, "v"), goos, goarch)
+	return fmt.Sprintf("vestrail-%s-%s-%s.zip", strings.TrimPrefix(tag, "v"), goos, goarch)
+}
+
+// PlatformAsset prefers Vestrail packages, with a fallback for historical releases.
+func (r *Release) PlatformAsset(goos, goarch string) (Asset, bool) {
+	name := AssetName(r.TagName, goos, goarch)
+	if asset, ok := r.FindAsset(name); ok {
+		return asset, true
+	}
+	return r.FindAsset("artex-" + strings.TrimPrefix(name, "vestrail-"))
 }
 
 // FindAsset 在 Release 里按名字找资产。

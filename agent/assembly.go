@@ -7,8 +7,8 @@ import (
 	"log"
 	"runtime/debug"
 
-	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/guard"
+	"github.com/Alexander4731/Vestrail/intercept"
 	actool "github.com/Autumn-27/norma/tool"
 )
 

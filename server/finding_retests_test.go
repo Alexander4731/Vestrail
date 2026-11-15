@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Alexander4731/Vestrail/agent"
+	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/intercept"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -261,7 +261,7 @@ func TestRetestStopsFailuresAndNoVerdict(t *testing.T) {
 	}
 }
 
-func TestRetestFixedUpdatesFindingThroughConversation(t *testing.T) {
+func TestRetestFixedRequiresHumanAcceptance(t *testing.T) {
 	s, fid := newRetestServer(t)
 	var calls atomic.Int32
 	setRetestProvider(s, retestProvider{complete: func(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
@@ -276,8 +276,8 @@ func TestRetestFixedUpdatesFindingThroughConversation(t *testing.T) {
 	}
 	waitRetestIdle(t, s)
 	f, err := s.m.pg.GetFinding(fid)
-	if err != nil || f.Status != db.FindingFixed || f.Evidence != "original proof" {
-		t.Fatalf("fixed finding=%+v err=%v", f, err)
+	if err != nil || f.Status != db.FindingPending || f.Evidence != "original proof" {
+		t.Fatalf("model changed finding=%+v err=%v", f, err)
 	}
 	// The new manual status is also accepted by the existing update API.
 	w = retestRequest(s.patchFinding, "PATCH", fid, `{"status":"fixed"}`)

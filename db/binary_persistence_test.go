@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/Autumn-27/artex/notify"
-	"github.com/Autumn-27/artex/sidequestion"
+	"github.com/Alexander4731/Vestrail/notify"
+	"github.com/Alexander4731/Vestrail/sidequestion"
 )
 
 func TestBinaryPersistence(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"sync"
 
-	"github.com/Autumn-27/artex/agent"
+	"github.com/Alexander4731/Vestrail/agent"
 )
 
 type failedToolAttempt struct{ failures, warnings int }

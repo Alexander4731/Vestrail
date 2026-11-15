@@ -27,6 +27,9 @@ func (d *DB) CompleteTaskArchive(
 	if err := ValidateArchiveExecutions(snapshot); err != nil {
 		return err
 	}
+	if err := validateArchiveAssessments(snapshot); err != nil {
+		return err
+	}
 	countsRaw, err := json.Marshal(snapshot.DataCounts)
 	if err != nil {
 		return err
@@ -98,6 +101,7 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 		{`DELETE FROM task_asset_links WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_llm_profiles WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_scope WHERE task_id=$1`, []any{taskID}},
+		{`DELETE FROM coverage_plans WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_constraints WHERE exploration_id=$1`, []any{expID}},
 		{`DELETE FROM activity WHERE exploration_id=$1`, []any{expID}},
 		{`DELETE FROM exploration_nodes WHERE exploration_id=$1`, []any{expID}},
@@ -177,6 +181,9 @@ func (d *DB) restoreTaskArchive(
 	if err := ValidateArchiveExecutions(snapshot); err != nil {
 		return nil, err
 	}
+	if err := validateArchiveAssessments(snapshot); err != nil {
+		return nil, err
+	}
 	streamedLLMRecords := snapshot.StreamedTables["llm_records"]
 	if (len(snapshot.StreamedTables) > 0 && snapshot.FormatVersion < 2) ||
 		len(snapshot.StreamedTables) > 1 ||
@@ -252,7 +259,7 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	}
 	// Insert graph rows in foreign-key order. The archived stub has no graph rows,
 	// so an ID conflict signals external corruption and must stop the restore.
-	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity"} {
+	for _, table := range []string{"exploration_nodes", "goal_assessments", "coverage_plans", "coverage_checks", "coverage_attempts", "exploration_edges", "exploration_anchors", "task_constraints", "activity"} {
 		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
@@ -277,7 +284,7 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	} else {
 		warnings = append(warnings, warning...)
 	}
-	for _, table := range []string{"task_asset_links", "findings"} {
+	for _, table := range []string{"task_asset_links", "findings", "finding_verification_attempts", "finding_retests"} {
 		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
@@ -378,6 +385,26 @@ func rowExists(tx *sql.Tx, table string, id int64) bool {
 }
 
 func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
+	if table == "finding_retests" && len(raw) > 0 {
+		rows, err := decodeArchiveRows(raw)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			// Conversations live outside task archives. Retain the frozen result
+			// without attaching it to a possibly unrelated local conversation.
+			row["conversation_id"] = nil
+			for key, value := range map[string]any{"assessment_method": "legacy", "baseline_version": -1, "status_revision": -1, "application_state": "not_applied", "applied_by": "", "application_reason": ""} {
+				if row[key] == nil {
+					row[key] = value
+				}
+			}
+		}
+		raw, err = json.Marshal(rows)
+		if err != nil {
+			return err
+		}
+	}
 	// json_populate_recordset inserts NULL for absent columns, bypassing SQL
 	// defaults. Preserve compatibility with v3 archives predating side memory.
 	if (table == "side_question_sessions" || table == "side_question_requests") && len(raw) > 0 {
@@ -401,7 +428,11 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 		}
 	}
 	allowed := map[string]bool{
-		"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
+		"coverage_plans": true, "coverage_checks": true, "coverage_attempts": true,
+		"finding_retests":               true,
+		"finding_verification_attempts": true,
+		"goal_assessments":              true,
+		"exploration_nodes":             true, "exploration_edges": true, "exploration_anchors": true,
 		"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
 		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
 		"side_question_sessions": true, "side_question_requests": true,
@@ -595,14 +626,26 @@ func remapArchiveAssetReferences(tables map[string]json.RawMessage, mapping map[
 				container = payload
 			}
 			if values, ok := container[key].([]any); ok {
+				changed := false
 				for i, value := range values {
 					if old, ok := jsonInt64(value); ok {
-						if replacement, exists := mapping[old]; exists {
+						if replacement, exists := mapping[old]; exists && replacement != old {
 							values[i] = replacement
+							changed = true
 						}
 					}
 				}
 				container[key] = values
+				if changed {
+					versionKey := "content_version"
+					if table == "findings" {
+						versionKey = "evidence_version"
+					}
+					if table != "task_scope" {
+						version, _ := jsonInt64(row[versionKey])
+						row[versionKey] = version + 1
+					}
+				}
 			}
 		}
 		out[table], _ = json.Marshal(rows)

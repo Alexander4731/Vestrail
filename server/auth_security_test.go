@@ -5,7 +5,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -33,6 +35,13 @@ func TestPasswordChangeRevokesOldSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{m: m, jwtKey: []byte(strings.Repeat("k", 32))}
+	for _, username := range []string{adminUsername, legacyAdminUsername} {
+		w := httptest.NewRecorder()
+		s.authLogin(w, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"`+username+`","password":"old-password"}`)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("login %s: %d %s", username, w.Code, w.Body.String())
+		}
+	}
 	old, _ := signJWT(s.jwtKey, "old")
 	r := httptest.NewRequest("POST", "https://example.com/api/auth/change-password", strings.NewReader(`{"old_password":"old-password","new_password":"new-password"}`))
 	r.Header.Set("Authorization", "Bearer "+old)
@@ -45,13 +54,56 @@ func TestPasswordChangeRevokesOldSession(t *testing.T) {
 		t.Fatalf("old token valid=%v err=%v", valid, err)
 	}
 	cookies := w.Result().Cookies()
-	if len(cookies) != 1 || !cookies[0].HttpOnly || !cookies[0].Secure {
+	if len(cookies) != 2 || cookies[0].Name != authCookieName || !cookies[0].HttpOnly || !cookies[0].Secure ||
+		cookies[1].Name != legacyAuthCookieName || cookies[1].MaxAge != -1 {
 		t.Fatal("missing secure HttpOnly session cookie")
 	}
 	fresh := httptest.NewRequest("GET", "https://example.com/api/events", nil)
 	fresh.AddCookie(cookies[0])
 	if valid, err := s.validAuth(fresh); !valid || err != nil {
 		t.Fatalf("new cookie valid=%v err=%v", valid, err)
+	}
+}
+
+func TestRebrandSessionCompatibility(t *testing.T) {
+	key := []byte(strings.Repeat("k", 32))
+	for _, subject := range []string{adminUsername, legacyAdminUsername, "", "other"} {
+		for _, expired := range []bool{false, true} {
+			expires := time.Now().Add(time.Hour)
+			if expired {
+				expires = time.Now().Add(-time.Hour)
+			}
+			token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+				Subject: subject, ID: "epoch", ExpiresAt: jwt.NewNumericDate(expires),
+			}).SignedString(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := !expired && (subject == adminUsername || subject == legacyAdminUsername)
+			if verifyJWT(token, key, "epoch") != want || verifyJWT(token, key, "changed") {
+				t.Fatalf("subject=%q expired=%v: session validity or revocation failed", subject, expired)
+			}
+		}
+	}
+	r := httptest.NewRequest("POST", "https://example.com/api/auth/logout", nil)
+	r.AddCookie(&http.Cookie{Name: legacyAuthCookieName, Value: "legacy"})
+	if extractToken(r) != "legacy" {
+		t.Fatal("legacy cookie ignored")
+	}
+	r.AddCookie(&http.Cookie{Name: authCookieName, Value: "current"})
+	if extractToken(r) != "current" {
+		t.Fatal("current cookie must take precedence")
+	}
+	w := httptest.NewRecorder()
+	(&Server{}).authLogout(w, r)
+	cookies := w.Result().Cookies()
+	if len(cookies) != 2 {
+		t.Fatalf("logout cookies=%d", len(cookies))
+	}
+	for _, cookie := range cookies {
+		if cookie.Value != "" || cookie.MaxAge != -1 || !cookie.HttpOnly || !cookie.Secure {
+			t.Fatalf("logout did not securely clear %s", cookie.Name)
+		}
 	}
 }
 

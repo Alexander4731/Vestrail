@@ -58,7 +58,10 @@ function cacheHitRate(cacheRead: number, input: number): string {
 
 // 测试范围一条的显示值：域名 / 网段 / 公司。
 function scopeValue(row: TaskScopeRow): string {
-  if (row.kind === "collection") return `${row.collection_name || "已删除合集"}（创建时快照）`;
+  if (row.kind === "collection") {
+    if (!row.collection_name) return "已删除合集（创建时快照）";
+    return `${row.collection_name}（创建时快照）`;
+  }
   if (row.value) return row.value;
   if (row.domain) return row.domain;
   if (row.net) return row.net;
@@ -554,7 +557,27 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                 ) : (
                   <div key={g.id} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm">
                     <StatusBadge domain="goal" value={g.state} />
-                    <span className="min-w-0 flex-1 break-words">{g.text}</span>
+                    <div className="min-w-0 flex-1 break-words">
+                      <span>{g.text}</span>
+                      {g.assessment ? (
+                        <details className="mt-1 text-muted-foreground text-xs">
+                          <summary className="cursor-pointer">
+                            {g.assessment.method === "human_accepted"
+                              ? "人工验收"
+                              : g.assessment.method === "machine_checked"
+                                ? "机器判定"
+                                : "模型判定"}
+                            {g.assessment.stale ? " · 目标或证据已变化" : " · 查看判定依据"}
+                          </summary>
+                          <p className="mt-1 whitespace-pre-wrap">{g.assessment.reason || "旧调用未提供理由"}</p>
+                          <p>
+                            证据 #{g.assessment.evidence_id} · {g.assessment.actor}
+                          </p>
+                        </details>
+                      ) : g.state === "met" ? (
+                        <p className="mt-1 text-muted-foreground text-xs">历史判定，缺少判定审计记录</p>
+                      ) : null}
+                    </div>
                     {g.vulnclass && (
                       <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-xs">
                         {g.vulnclass}
@@ -720,7 +743,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
-              <TargetIcon className="size-4 text-emerald-500" /> 资产测试覆盖度
+              <TargetIcon className="size-4 text-emerald-500" /> 资产探索触达率
               <span className="text-muted-foreground text-xs font-normal">（粗估，仅供参考）</span>
             </CardTitle>
           </CardHeader>
@@ -730,7 +753,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                 {coverage.pct != null ? Math.round(coverage.pct * 100) + "%" : "—"}
               </span>
               <span className="text-muted-foreground text-sm">
-                已测 {coverage.tested} / 范围内 {coverage.denominator}
+                已触达 {coverage.tested} / 范围内 {coverage.denominator}
               </span>
             </div>
             {coverage.pct != null && <Progress value={Math.round(coverage.pct * 100)} />}

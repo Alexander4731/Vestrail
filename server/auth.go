@@ -19,11 +19,15 @@ import (
 )
 
 const (
-	jwtKeyFilename = "jwt.key"
-	authPassKey    = "auth.password_hash"
-	authEpochKey   = "auth.session_epoch"
-	jwtTTL         = 7 * 24 * time.Hour
-	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	adminUsername        = "Vestrail"
+	legacyAdminUsername  = "ARTEX"
+	authCookieName       = "vestrail_token"
+	legacyAuthCookieName = "artex_token"
+	jwtKeyFilename       = "jwt.key"
+	authPassKey          = "auth.password_hash"
+	authEpochKey         = "auth.session_epoch"
+	jwtTTL               = 7 * 24 * time.Hour
+	keyChars             = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	// 下限与 setup 页的前端校验一致——校验只放在前端等于没放，直接打 API 就能
 	// 绕过。上限是 bcrypt 的硬限制：超过 72 字节 GenerateFromPassword 会返回
@@ -86,7 +90,7 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	return buf, nil
 }
 
-// signJWT issues a 7-day HS256 token for user ARTEX.
+// signJWT issues a 7-day HS256 token for user Vestrail.
 func signJWT(key []byte, epoch ...string) (string, error) {
 	version := ""
 	if len(epoch) > 0 {
@@ -94,7 +98,7 @@ func signJWT(key []byte, epoch ...string) (string, error) {
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
 		ID:        version,
-		Subject:   "ARTEX",
+		Subject:   adminUsername,
 		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
 		IssuedAt:  jwt.NewNumericDate(time.Now()),
 	}).SignedString(key)
@@ -105,12 +109,13 @@ func verifyJWT(tokenStr string, key []byte, epoch ...string) bool {
 	claims := &jwt.RegisteredClaims{}
 	t, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
 		return key, nil
-	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired(), jwt.WithSubject("ARTEX"))
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 	version := ""
 	if len(epoch) > 0 {
 		version = epoch[0]
 	}
-	return err == nil && t.Valid && claims.ID == version
+	return err == nil && t.Valid && claims.ID == version &&
+		(claims.Subject == adminUsername || claims.Subject == legacyAdminUsername)
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
@@ -119,8 +124,10 @@ func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
-	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
-		return c.Value
+	for _, name := range []string{authCookieName, legacyAuthCookieName} {
+		if c, err := r.Cookie(name); err == nil && c.Value != "" {
+			return c.Value
+		}
 	}
 	return ""
 }
@@ -156,7 +163,11 @@ func setAuthCookie(w http.ResponseWriter, r *http.Request, token string) {
 	if token == "" {
 		age = -1
 	}
-	http.SetCookie(w, &http.Cookie{Name: "artex_token", Value: token, Path: "/", MaxAge: age,
+	http.SetCookie(w, &http.Cookie{Name: authCookieName, Value: token, Path: "/", MaxAge: age,
+		HttpOnly: true, Secure: r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https", SameSite: http.SameSiteLaxMode})
+	// Delete the old cookie on both login and logout, so a stale legacy session
+	// cannot become active again after the new cookie is removed.
+	http.SetCookie(w, &http.Cookie{Name: legacyAuthCookieName, Value: "", Path: "/", MaxAge: -1,
 		HttpOnly: true, Secure: r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https", SameSite: http.SameSiteLaxMode})
 	w.Header().Set("Cache-Control", "no-store")
 }
@@ -351,7 +362,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
-	if req.Username != "ARTEX" {
+	if req.Username != adminUsername && req.Username != legacyAdminUsername {
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}

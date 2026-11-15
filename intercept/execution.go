@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Autumn-27/norma/tool"
 )
 

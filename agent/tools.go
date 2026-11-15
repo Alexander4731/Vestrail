@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Alexander4731/Vestrail/db"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -468,7 +469,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	} else {
 		out["error"] = "待执行意图计数失败: " + err.Error()
 	}
-	// findings (confirmed vulns) and facts (worker exploration results) are
+	// findings (registered claims) and facts (worker exploration results) are
 	// now distinct node kinds. recent_facts surfaces fact summaries (esp.
 	// negative results) so the planner sees them in one call; full content
 	// via node_detail(id).
@@ -487,6 +488,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// 每条只留 {id, summary, from_intent?}：from_intent 是产生本漏洞的意图。
 	// evidence/assets/vulnclass/severity/state 等仍可用 list_findings / node_detail(id) 取。
 	const findingListCap = 10
+	if err := t.ts.PopulateFindingTrafficIDs(vulnNodes[:min(findingListCap, len(vulnNodes))]); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	findingList := make([]map[string]any, 0, findingListCap)
 	for _, n := range vulnNodes {
 		if len(findingList) >= findingListCap {
@@ -494,7 +498,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		}
 		var fp map[string]any
 		_ = json.Unmarshal(n.Payload, &fp)
-		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
+		m := map[string]any{"id": n.ID, "summary": fp["summary"], "verification": n.FindingVerification, "finding_status": n.FindingStatus}
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本漏洞由哪个意图产生
 		}
@@ -603,7 +607,8 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 					m["denominator"] = cov.Denominator
 					m["tested"] = cov.Tested
 					m["by_type"] = cov.ByType
-					m["note"] = "coverage资产测试覆盖度（包括接口等各种相关资产），粗略估计、仅供参考：包含当前任务与直接关联任务的 scope、事实锚点；关联 scope 只读。容器型资产/大量枚举会让它偏低，勿据此认为已测完；可用 add_task_scope 增补本任务范围、list_untested_assets 看未测资产【通常不调用list_untested_assets，按照任务推进即可】；"
+					m["metric"] = "exploration_reachability"
+					m["note"] = "资产探索触达率：只表示资产有事实锚点，包含直接关联任务的只读范围；不代表漏洞类别或身份测试完成。具体测试项与缺口查看 list_coverage_checks。"
 					if cov.Denominator == 0 {
 						m["pct"] = nil
 						m["status"] = "范围未锚定"
@@ -620,6 +625,16 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			if len(m) > 0 {
 				out["coverage"] = m
 			}
+		}
+	}
+	if t.taskID > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ledger, err := t.ts.TaskCoverageSummary(ctx)
+		cancel()
+		if err != nil {
+			out["check_coverage"] = map[string]any{"availability": "unavailable", "error": err.Error()}
+		} else {
+			out["check_coverage"] = ledger
 		}
 	}
 	return out
@@ -960,6 +975,11 @@ func compactFinding(n *db.Node) map[string]any {
 	var p map[string]any
 	_ = json.Unmarshal(n.Payload, &p)
 	m := map[string]any{"id": n.ID, "state": n.State, "summary": p["summary"]}
+	m["verification"] = n.FindingVerification
+	if n.FindingVerification == nil {
+		m["verification"] = db.VerificationSummary{State: "legacy_unverified", Assurance: "none", EvidenceVersion: -1}
+	}
+	m["finding_status"] = n.FindingStatus
 	if n.Inherited {
 		inheritedMap(m, n.SourceTaskID)
 	}
@@ -973,10 +993,13 @@ func compactFinding(n *db.Node) map[string]any {
 }
 
 func (t *ToolSet) listFindings() actool.CoreTool {
-	return t.readExpTool("list_findings", "列本任务及直接关联任务的【确认漏洞】(紧凑：id+task_id+intent_id+vulnclass+severity+摘要+状态)。关联任务条目带 source_task_id/inherited=true 且只读。这里只含漏洞；普通探索事实用 list_facts，详情用 node_detail(id)。",
+	return t.readExpTool("list_findings", "列本任务及直接关联任务的登记发现。verification 为宿主验证状态，finding_status 为人工处置；旧图 state=confirmed 不代表机器验证。关联任务条目带 source_task_id/inherited=true 且只读。普通探索事实用 list_facts，详情用 node_detail(id)。",
 		obj(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
-			f, _ := t.ts.ListByKindWithSources(db.KindFinding, 500)
+			f, err := t.ts.ListByKindWithSources(db.KindFinding, 500)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			if err := t.ts.PopulateFindingTrafficIDs(f); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
@@ -1217,8 +1240,14 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 func (t *ToolSet) listGoals() actool.CoreTool {
 	return t.readExpTool("list_goals", "列出本任务的目标节点及其状态（open/met），用于判断是否达成。",
 		obj(map[string]any{}),
-		func(context.Context, json.RawMessage) (actool.Result, error) {
-			g, _ := t.ts.ListByKind(db.KindGoal, 100)
+		func(ctx context.Context, _ json.RawMessage) (actool.Result, error) {
+			g, err := t.ts.ListByKind(db.KindGoal, 100)
+			if err != nil {
+				return actool.Errorf("目标读取失败: " + err.Error()), nil
+			}
+			if err = t.ts.AttachGoalAssessments(ctx, g); err != nil {
+				return actool.Errorf("目标判定读取失败: " + err.Error()), nil
+			}
 			return jsonResult(g)
 		})
 }
@@ -1230,7 +1259,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			"evidence_id": idp("证明它的发现/事实节点 id"),
 			"reason":      str("为什么这个证据满足该目标"),
 		}, "goal_id", "evidence_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
@@ -1249,7 +1278,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
 			}
-			if err := t.ts.ProveGoal(goal, ev); err != nil {
+			if err := t.ts.AssessGoal(ctx, db.GoalAssessmentInput{GoalID: goal, EvidenceID: ev, Method: db.GoalModelAssessed, Actor: "agent:" + t.worker, Reason: a.Reason}); err != nil {
 				return actool.Errorf("目标证明保存失败: " + err.Error()), nil
 			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
@@ -1266,7 +1295,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 }
 
 func (t *ToolSet) goalMet() actool.CoreTool {
-	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
+	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 也会检查全部目标均已达成，不能绕过逐项判定。",
 		obj(map[string]any{"reason": str("达成理由（必须是目标真正达成的证据，不能是“本轮无新方向”这类结束本轮的理由）")}, "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
@@ -1290,7 +1319,7 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
+	return writeTool("report_finding", "登记候选发现，用 evidence 提供命令输出、日志等可核对材料；登记不授予机器验证结论。任务上下文传当前 intent_id。返回的 finding_id 是独立记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
 		"evidence":         str("证据/PoC 文本"),
@@ -2139,5 +2168,6 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		t.listCoverageChecks(), t.recordCoverageCheck(),
 	}
 }

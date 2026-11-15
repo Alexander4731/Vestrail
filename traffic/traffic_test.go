@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/internal/testutil"
+	"github.com/Alexander4731/Vestrail/internal/testutil"
 
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
 )
