@@ -4,13 +4,38 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
-	"sync/atomic"
-	"time"
 	"unicode/utf8"
 )
 
 const defaultMaxOutput = 30000
+
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+// cleanDisplayNoise removes ANSI control sequences and carriage-return progress
+// overwrites from a display preview. Capture archives the original bytes before
+// returning a changed preview.
+func cleanDisplayNoise(s string) string {
+	if strings.Contains(s, "\x1b[") {
+		s = ansiEscapeRE.ReplaceAllString(s, "")
+	}
+	if strings.ContainsRune(s, '\r') {
+		s = strings.ReplaceAll(s, "\r\n", "\n")
+		// Collapse carriage-return progress overwrites by keeping only the final
+		// segment on lines containing bare '\r'.
+		if strings.ContainsRune(s, '\r') {
+			lines := strings.Split(s, "\n")
+			for i, line := range lines {
+				if idx := strings.LastIndexByte(line, '\r'); idx >= 0 {
+					lines[i] = line[idx+1:]
+				}
+			}
+			s = strings.Join(lines, "\n")
+		}
+	}
+	return s
+}
 
 func maxOut(tc *ToolContext) int {
 	if tc != nil && tc.MaxOutputChars > 0 {
@@ -19,37 +44,52 @@ func maxOut(tc *ToolContext) int {
 	return defaultMaxOutput
 }
 
-var spillSeq atomic.Int64
-
 // Capture bounds a tool's textual output for the model. When the output exceeds
 // the limit (ToolContext.MaxOutputChars, default 30000) and the host configured
-// an OutputDir, the FULL output is written to a file there and a tight head + a
-// pointer to that file is returned — so the model can read slices on demand
-// (grep/sed) instead of losing the overflow. Without an OutputDir it falls back
-// to a head+tail truncation (the overflow is discarded). Tools that produce
+// an OutputDir, the FULL output is written to a file there and a head+tail
+// preview + a pointer to that file is returned — so the model sees both opening
+// headers and trailing errors/summaries and can read slices on demand (grep/sed)
+// instead of losing the overflow. Without an OutputDir it falls back to a
+// head+tail truncation of the original bytes (the overflow is discarded).
+// Changed previews are also archived even when they fit the limit. An archive
+// failure is explicit and falls back to an uncleaned preview. Tools that produce
 // potentially large output should return Capture(tc, output) rather than the raw
 // string.
 //
 // The pointer is always an ABSOLUTE path: a relative one only resolves from the
 // working directory it was computed against, and the reader is often somewhere
 // else — a later command after a `cd`, a resumed session with a different
-// WorkingDir, or an out-of-band tool (grep/sed) the model runs itself. Heads cut
-// by Capture and tail-fallbacks in truncate() are aligned to UTF-8 rune
-// boundaries, so a bounded result never carries a half-encoded character.
+// WorkingDir, or an out-of-band tool (grep/sed) the model runs itself. Heads and
+// tails cut by Capture and truncate() are aligned to UTF-8 rune boundaries, so a
+// bounded result never carries a half-encoded character.
 func Capture(tc *ToolContext, s string) string {
 	max := maxOut(tc)
-	if len(s) <= max {
+	if tc == nil || tc.OutputDir == "" {
+		return truncate(s, max)
+	}
+	cleaned := cleanDisplayNoise(s)
+	if len(s) <= max && cleaned == s {
 		return s
 	}
-	if tc != nil && tc.OutputDir != "" {
-		if path, err := spillOutput(tc.OutputDir, s); err == nil {
-			lines := strings.Count(s, "\n") + 1
-			return cutHead(s, max) + fmt.Sprintf(
-				"\n\n... <persisted-output>[Output too large: full %d bytes / %d lines.Full output saved to  %s </persisted-output>",
-				len(s), lines, path)
+	path, err := spillOutput(tc.OutputDir, s)
+	if err != nil {
+		return truncate(s, max) + fmt.Sprintf("\n\n[output-archive-failed] Full raw output was not saved: %v", err)
+	}
+	preview := cleaned
+	if len(cleaned) > max {
+		headLen := max * 6 / 10
+		tailLen := max - headLen
+		head, tail := cutHead(cleaned, headLen), cutTail(cleaned, tailLen)
+		omitted := len(cleaned) - len(head) - len(tail)
+		if omitted > 0 {
+			preview = head + fmt.Sprintf("\n\n... [%d bytes omitted from middle] ...\n\n", omitted) + tail
+		} else {
+			preview = cutHead(cleaned, max)
 		}
 	}
-	return truncate(s, max)
+	return preview + fmt.Sprintf(
+		"\n\n... <persisted-output>[Full raw output: %d bytes / %d lines. Full output saved to %s </persisted-output>",
+		len(s), strings.Count(s, "\n")+1, path)
 }
 
 // alreadyCaptured reports whether s already carries a marker Capture leaves
@@ -60,7 +100,8 @@ func Capture(tc *ToolContext, s string) string {
 // the guard fails to re-cap already-large output; it never corrupts. The markers
 // are distinctive enough that this is vanishingly rare.
 func alreadyCaptured(s string) bool {
-	return strings.Contains(s, "<persisted-output>") || (strings.Contains(s, "characters truncated]") || strings.Contains(s, "bytes truncated]"))
+	return strings.Contains(s, "<persisted-output>") || strings.Contains(s, "[output-archive-failed]") ||
+		strings.Contains(s, "characters truncated]") || strings.Contains(s, "bytes truncated]")
 }
 
 // CaptureOnce is Capture with an idempotency guard: output a tool already ran
@@ -93,11 +134,26 @@ func spillOutput(dir, s string) (string, error) {
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("output-%d-%d.txt", time.Now().Unix(), spillSeq.Add(1))
-	path := filepath.Join(abs, name)
-	if err := os.WriteFile(path, []byte(s), 0o644); err != nil {
+	// Exclusive creation avoids overwriting an earlier archive after a restart.
+	file, err := os.CreateTemp(abs, "output-*.txt")
+	if err != nil {
 		return "", err
 	}
+	path := file.Name()
+	complete := false
+	defer func() {
+		if !complete {
+			_ = file.Close()
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.WriteString(s); err != nil {
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	complete = true
 	return path, nil
 }
 

@@ -32,14 +32,14 @@ var wrapupDefaults = map[string]string{
 }
 
 // wrapupTurnDefaults: 各 agent 收尾阶段【自身】的轮数预算内置默认(可被后台 >0 覆盖)。
-// 均给 10 轮,保证收尾阶段有足够步数落库。未命中走 genericWrapupTurns。
+// 收尾阶段已禁用探测工具，只需批量写回结果与输出总结，默认 4 轮避免空转烧 token。
 var wrapupTurnDefaults = map[string]int{
-	"worker":    10,
-	"planner":   10,
-	"mainagent": 10,
+	"worker":    4,
+	"planner":   4,
+	"mainagent": 4,
 }
 
-const genericWrapupTurns = 10
+const genericWrapupTurns = 4
 
 const plannerWrapUpDefault = "你本轮规划的步数即将用尽——注意只是【这一轮】结束,系统之后仍会随态势变化再次唤醒你继续规划,并非任务终止,你无需在此收束整个规划。请把本轮已经想清楚的结论落地、别让这一轮白跑,但也【不要为了收尾硬凑意图】(本轮 0 个意图仍是完全正常的结果)：(1) 若已判断出【当前就该派发】的探索方向,用一次 add_intent 批量提交(想好的别憋着不发);(2) 对已被某发现/事实证明达成的目标,调 prove_goal 标记 met(别漏判);(3) 若识别出需要分步的串行利用链,用 TodoWrite 记下,便于下次唤醒接着派。做完直接结束本轮,无需输出总结文本。"
 
@@ -93,9 +93,10 @@ func resolveWrapupTurns(agentKey string) int {
 // (reads DB live), so edits apply on the next run without a restart.
 func wrapupSettlement(agentKey string, disabledTools []string) *harness.Settlement {
 	return &harness.Settlement{
-		Prompt:        resolveWrapup(agentKey),
-		DisabledTools: disabledTools,
-		MaxTurns:      resolveWrapupTurns(agentKey),
+		PreserveThinking: !OptimizationEnabled("VESTRAIL_OPT_SETTLEMENT_THINKING"),
+		Prompt:           resolveWrapup(agentKey),
+		DisabledTools:    disabledTools,
+		MaxTurns:         resolveWrapupTurns(agentKey),
 	}
 }
 
@@ -156,9 +157,10 @@ func resolveTaskTimeoutTurns(agentKey string) int {
 func wrapupSettlementForTask(agentKey string, disabledTools []string, clamped bool) *harness.Settlement {
 	perRun := resolveWrapup(agentKey)
 	st := &harness.Settlement{
-		Prompt:        perRun, // 兜底(也是非 clamped 时两种 reason 的取值)
-		DisabledTools: disabledTools,
-		MaxTurns:      resolveWrapupTurns(agentKey),
+		PreserveThinking: !OptimizationEnabled("VESTRAIL_OPT_SETTLEMENT_THINKING"),
+		Prompt:           perRun, // 兜底(也是非 clamped 时两种 reason 的取值)
+		DisabledTools:    disabledTools,
+		MaxTurns:         resolveWrapupTurns(agentKey),
 	}
 	if clamped {
 		if tt := resolveTaskTimeoutWrapup(agentKey); tt != "" {

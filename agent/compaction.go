@@ -441,9 +441,15 @@ func nodeSummary(n *db.Node) string {
 	var p map[string]any
 	if json.Unmarshal(n.Payload, &p) == nil {
 		if s, ok := p["summary"].(string); ok {
+			if OptimizationEnabled("VESTRAIL_OPT_COMPACTION") {
+				return truncRuneSummary(s, 240).(string)
+			}
 			return s
 		}
 		if t, ok := p["text"].(string); ok {
+			if OptimizationEnabled("VESTRAIL_OPT_COMPACTION") {
+				return truncRuneSummary(t, 240).(string)
+			}
 			return t
 		}
 	}
@@ -529,13 +535,19 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 		MaxTokens: 1500,
 		Thinking:  "disabled",
 	}
-	msg, _, _, err := c.prov.Complete(llmrec.WithPurpose(ctx, "compaction"), req)
+	if OptimizationEnabled("VESTRAIL_OPT_COMPACTION") {
+		req.DynamicBoundary, req.MaxTokens = 1, 900
+	}
+	msg, stop, _, err := c.prov.Complete(llmrec.WithPurpose(ctx, "compaction"), req)
 	if err != nil {
 		return "", err
 	}
 	body := strings.TrimSpace(msg.Text())
 	if body == "" {
 		return "", fmt.Errorf("empty body from model")
+	}
+	if stop == "max_tokens" || stop == "length" || len(msg.ToolUses()) > 0 {
+		return "", fmt.Errorf("incomplete cold-node summary (stop=%s)", stop)
 	}
 	return body, nil
 }

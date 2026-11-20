@@ -153,9 +153,11 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	captureRun(ctx, agentcore.Options{
 		Provider:               prov,
 		SystemPrompt:           []string{sys},
+		DynamicBoundary:        1,
 		Tools:                  tools,
 		PermissionMode:         acperm.ModeBypass,
 		DisableBackgroundTasks: true,
+		MaxToolOutputChars:     defaultToolOutputChars,
 		// 3 步(抽约束 → 登记范围 → 拆目标)各需一次工具调用,给足回合避免收尾前漏调 set_goals。
 		MaxTurns:     8,
 		NonStreaming: nonStreaming, // 该 profile 选非流式时走 Provider.Complete

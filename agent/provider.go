@@ -129,6 +129,34 @@ func (c Config) CompactionWindow() int {
 	return k * 1000
 }
 
+// Token-efficiency defaults for long-running security agents:
+//   - defaultToolOutputChars caps inline tool output at 10KB (head+tail preview);
+//     the full raw output is always persisted lossless in cmd-output/.
+//   - defaultSoftWindow keeps active loop context compact (~38K micro / ~51K auto)
+//     even on 200K/1M models instead of letting raw logs accumulate to 115K+.
+//   - defaultMicroBatchGrowth defers repeated MicroCompact sweeps between batch
+//     cycles so Anthropic prompt-cache prefixes stay byte-stable across turns.
+const (
+	defaultToolOutputChars  = 10000
+	defaultSoftWindow       = 108000
+	defaultMicroKeepRecent  = 4
+	defaultMicroBatchGrowth = 30000
+)
+
+// extraCompactableDomainTools lists Vestrail's high-volume read/query tools whose
+// stale outputs are safe to clear during MicroCompact (they remain queryable or
+// persisted on disk).
+var extraCompactableDomainTools = []string{
+	"traffic_get", "traffic_blob", "traffic_search",
+	"list_assets", "list_facts", "list_findings", "list_untested_assets",
+	"list_coverage_checks", "list_companies",
+	"node_detail", "graph_overview", "expand_digest",
+	"get_worker_trace", "get_worker_output", "search_all_worker_traces", "list_worker_traces",
+	"shell_send", "shell_read",
+	"ExecuteExtraTool", "SearchExtraTools", "web_search",
+	"RunScript",
+}
+
 // compactionConfig builds the agent-core compaction config for a context window
 // in tokens. agentcore.NewSession wires the summarizer (same provider) when this
 // is set on Options.Compaction.
@@ -136,7 +164,22 @@ func compactionConfig(windowTokens int) *compaction.Config {
 	if windowTokens <= 0 {
 		windowTokens = defaultWindowK * 1000
 	}
-	return &compaction.Config{ContextWindow: windowTokens}
+	soft := defaultSoftWindow
+	growth := defaultMicroBatchGrowth
+	if !OptimizationEnabled("VESTRAIL_OPT_COMPACTION") {
+		soft, growth = 72000, 18000
+	}
+	if windowTokens < soft {
+		soft = windowTokens
+	}
+	return &compaction.Config{
+		ContextWindow:    windowTokens,
+		SoftWindow:       soft,
+		MicroKeepRecent:  defaultMicroKeepRecent,
+		MicroBatchGrowth: growth,
+		ExtraCompactable: extraCompactableDomainTools,
+		ConciseSummary:   true,
+	}
 }
 
 // FromEnv resolves the LLM provider config:

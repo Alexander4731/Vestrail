@@ -30,6 +30,42 @@ type anthropicReq struct {
 	Stream        bool                   `json:"stream"`
 }
 
+// anthropicWireReq is the serialized Anthropic request carrying ephemeral
+// message-level cache_control breakpoints without mutating caller-owned history.
+type anthropicWireReq struct {
+	Model         string                 `json:"model"`
+	System        []anthropicSystemBlock `json:"system,omitempty"`
+	Messages      []anthropicMessage     `json:"messages"`
+	Tools         []anthropicTool        `json:"tools,omitempty"`
+	MaxTokens     int                    `json:"max_tokens"`
+	Temperature   *float64               `json:"temperature,omitempty"`
+	StopSequences []string               `json:"stop_sequences,omitempty"`
+	Thinking      *anthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig  *anthropicOutputConfig `json:"output_config,omitempty"`
+	Stream        bool                   `json:"stream"`
+}
+
+// anthropicMessage mirrors Message for Anthropic wire serialization so prompt
+// cache breakpoints can be attached without mutating caller-owned history.
+type anthropicMessage struct {
+	Role    Role                    `json:"role"`
+	Content []anthropicContentBlock `json:"content"`
+}
+
+type anthropicContentBlock struct {
+	Type         BlockType               `json:"type"`
+	Text         string                  `json:"text,omitempty"`
+	Thinking     string                  `json:"thinking,omitempty"`
+	Signature    string                  `json:"signature,omitempty"`
+	ID           string                  `json:"id,omitempty"`
+	Name         string                  `json:"name,omitempty"`
+	Input        json.RawMessage         `json:"input,omitempty"`
+	ToolUseID    string                  `json:"tool_use_id,omitempty"`
+	Content      []anthropicContentBlock `json:"content,omitempty"`
+	IsError      bool                    `json:"is_error,omitempty"`
+	CacheControl map[string]any          `json:"cache_control,omitempty"`
+}
+
 // anthropicThinking is the "thinking":{"type":"enabled"|"disabled"} switch.
 type anthropicThinking struct {
 	Type string `json:"type"`
@@ -42,9 +78,82 @@ type anthropicOutputConfig struct {
 }
 
 type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	InputSchema  map[string]any `json:"input_schema"`
+	CacheControl map[string]any `json:"cache_control,omitempty"`
+}
+
+func ephemeralCacheControl() map[string]any {
+	return map[string]any{"type": "ephemeral"}
+}
+
+func toAnthropicBlock(b ContentBlock) anthropicContentBlock {
+	ab := anthropicContentBlock{
+		Type:      b.Type,
+		Text:      b.Text,
+		Thinking:  b.Thinking,
+		Signature: b.Signature,
+		ID:        b.ID,
+		Name:      b.Name,
+		Input:     b.Input,
+		ToolUseID: b.ToolUseID,
+		IsError:   b.IsError,
+	}
+	if len(b.Content) > 0 {
+		ab.Content = make([]anthropicContentBlock, len(b.Content))
+		for i, cb := range b.Content {
+			ab.Content[i] = toAnthropicBlock(cb)
+		}
+	}
+	return ab
+}
+
+func toAnthropicMessages(msgs []Message, cacheEnabled bool) []anthropicMessage {
+	out := make([]anthropicMessage, len(msgs))
+	for i, m := range msgs {
+		blocks := make([]anthropicContentBlock, len(m.Content))
+		for j, b := range m.Content {
+			blocks[j] = toAnthropicBlock(b)
+		}
+		out[i] = anthropicMessage{Role: m.Role, Content: blocks}
+	}
+	if !cacheEnabled || len(out) == 0 {
+		return out
+	}
+	// Attach rolling ephemeral cache breakpoints to at most 2 message turns:
+	// the latest message and the preceding user turn. Paired with the static
+	// tool + system breakpoints, this uses <= 4 total breakpoints (Anthropic's
+	// hard limit) and guarantees a direct cache hit on turn N from turn N-1.
+	placed := 0
+	for i := len(out) - 1; i >= 0 && placed < 2; i-- {
+		if placed == 1 && out[i].Role != RoleUser {
+			continue
+		}
+		if markLastCacheableBlock(out[i].Content) {
+			placed++
+		}
+	}
+	return out
+}
+
+// markLastCacheableBlock sets cache_control on the last block Anthropic allows
+// caching on (non-empty text, tool_result, or tool_use; never thinking or empty
+// text). Returns true if a breakpoint was placed.
+func markLastCacheableBlock(blocks []anthropicContentBlock) bool {
+	for i := len(blocks) - 1; i >= 0; i-- {
+		switch blocks[i].Type {
+		case BlockToolResult, BlockToolUse:
+			blocks[i].CacheControl = ephemeralCacheControl()
+			return true
+		case BlockText:
+			if blocks[i].Text != "" {
+				blocks[i].CacheControl = ephemeralCacheControl()
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
@@ -62,9 +171,11 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 		thinkingType = req.Thinking
 		thinkingEnabled = req.Thinking == "enabled"
 	}
-	body := anthropicReq{
+	cacheEnabled := req.DynamicBoundary > 0
+	merged := mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, thinkingEnabled))
+	body := anthropicWireReq{
 		Model:         p.cfg.Model,
-		Messages:      mergeAdjacentSameRole(filterThinkingBlocks(req.Messages, thinkingEnabled)),
+		Messages:      toAnthropicMessages(merged, cacheEnabled),
 		MaxTokens:     maxTok,
 		Temperature:   req.Temperature,
 		StopSequences: req.Stop,
@@ -73,6 +184,9 @@ func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byt
 	}
 	for _, t := range req.Tools {
 		body.Tools = append(body.Tools, anthropicTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
+	}
+	if cacheEnabled && len(body.Tools) > 0 {
+		body.Tools[len(body.Tools)-1].CacheControl = ephemeralCacheControl()
 	}
 	if thinkingType != "" {
 		body.Thinking = &anthropicThinking{Type: thinkingType}

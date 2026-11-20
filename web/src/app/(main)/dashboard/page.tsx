@@ -22,6 +22,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Progress } from "@/components/ui/progress";
 import { api } from "@/lib/api";
+import { splitTokenUsage } from "@/lib/token-usage";
 import type {
   Activity,
   Agent,
@@ -44,7 +45,7 @@ import { cn } from "@/lib/utils";
 // ── chart constants ───────────────────────────────────────────────────────────
 
 const dailyTrendConfig = {
-  input: { label: "输入", color: "hsl(217 91% 60%)" },
+  inputWithoutCacheRead: { label: "输入(非缓存读)", color: "hsl(217 91% 60%)" },
   output: { label: "输出", color: "hsl(263 70% 60%)" },
   cacheRead: { label: "缓存读", color: "hsl(160 60% 45%)" },
 } satisfies ChartConfig;
@@ -329,7 +330,7 @@ export default function DashboardPage() {
   const defaultProfileId = activeProfile ? Number(activeProfile.id) : null;
 
   // 数据源开关：旧版 = activity（task.tokens + 会话），新版 = llm_usage 计量账本。
-  const [tokenVersion, setTokenVersion] = React.useState<"old" | "new">("old");
+  const [tokenVersion, setTokenVersion] = React.useState<"old" | "new">("new");
   // selected profile tab: "all" = 全部; number = specific profile id
   const [tokenTab, setTokenTab] = React.useState<number | null | "all">("all");
   // day range for the daily bar chart
@@ -422,6 +423,8 @@ export default function DashboardPage() {
       : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, taskCount: 0 };
   }, [tokenTab, tokenByProfile]);
 
+  const displayedUsage = splitTokenUsage(displayedTokens);
+
   // 旧版每日：把任务/会话的总量按其创建日期归桶（近似，非真实每日消耗）。
   const dailyTokenDataOld = React.useMemo(() => {
     const now = new Date();
@@ -468,7 +471,14 @@ export default function DashboardPage() {
     return [...m.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, v]) => ({ date: date.slice(5), ...v }));
   }, [usageStats, tokenDays, tokenTab, profileIdByName, defaultProfileId]);
 
-  const dailyTokenData = tokenVersion === "new" ? dailyTokenDataNew : dailyTokenDataOld;
+  const dailyTokenData = React.useMemo(
+    () =>
+      (tokenVersion === "new" ? dailyTokenDataNew : dailyTokenDataOld).map(({ date, ...usage }) => ({
+        date,
+        ...splitTokenUsage(usage),
+      })),
+    [tokenVersion, dailyTokenDataNew, dailyTokenDataOld],
+  );
 
   // activity kind label
   function kindLabel(a: Activity): string {
@@ -683,7 +693,7 @@ export default function DashboardPage() {
             <div>
               <div className="text-[10px] text-muted-foreground">合计 (输入+输出)</div>
               <div className="mt-0.5 text-3xl font-bold tabular-nums tracking-tight">
-                {fmtTokens(displayedTokens.input + displayedTokens.output) || "—"}
+                {fmtTokens(displayedUsage.total) || "—"}
               </div>
               <div className="mt-0.5 text-[10px] text-muted-foreground">{displayedTokens.taskCount} 个任务</div>
             </div>
@@ -691,25 +701,25 @@ export default function DashboardPage() {
             {/* Per-type bars */}
             <div className="space-y-3">
               {(() => {
-                // input 已含缓存；拆成不重叠三段：未命中输入 + 缓存命中 + 输出 = 总量。
-                const total = displayedTokens.input + displayedTokens.output;
+                // input 已含缓存读；其余输入（含缓存写入）+ 缓存读 + 输出 = 总量。
+                const total = displayedUsage.total;
                 return [
                   {
-                    label: "输入(未命中)",
-                    value: displayedTokens.input - displayedTokens.cacheRead,
-                    barColor: dailyTrendConfig.input.color!,
+                    label: "输入(非缓存读)",
+                    value: displayedUsage.inputWithoutCacheRead,
+                    barColor: dailyTrendConfig.inputWithoutCacheRead.color,
                     text: "text-blue-400",
                   },
                   {
                     label: "缓存命中",
-                    value: displayedTokens.cacheRead,
-                    barColor: dailyTrendConfig.cacheRead.color!,
+                    value: displayedUsage.cacheRead,
+                    barColor: dailyTrendConfig.cacheRead.color,
                     text: "text-emerald-400",
                   },
                   {
                     label: "输出",
-                    value: displayedTokens.output,
-                    barColor: dailyTrendConfig.output.color!,
+                    value: displayedUsage.output,
+                    barColor: dailyTrendConfig.output.color,
                     text: "text-violet-400",
                   },
                 ].map(({ label, value, barColor, text }) => {
@@ -734,9 +744,7 @@ export default function DashboardPage() {
 
             {/* Cache hit rate */}
             {(() => {
-              // input 已含缓存 → 命中率 = 缓存命中 / 总输入。
-              const denominator = displayedTokens.input;
-              const hitPct = denominator > 0 ? Math.round((displayedTokens.cacheRead / denominator) * 100) : 0;
+              const hitPct = Math.round(displayedUsage.cacheHitPercent);
               return (
                 <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-3 py-2 text-[10px]">
                   <span className="text-muted-foreground">缓存命中率</span>
@@ -754,7 +762,7 @@ export default function DashboardPage() {
           <div className="flex min-h-0 flex-col">
             <div className="mb-2 flex items-center justify-between">
               <div className="flex gap-3 text-[9px] text-muted-foreground">
-                {(["input", "output", "cacheRead"] as const).map((k) => (
+                {(["inputWithoutCacheRead", "output", "cacheRead"] as const).map((k) => (
                   <span key={k} className="flex items-center gap-1">
                     <span
                       className="inline-block size-2 rounded-sm"
@@ -834,7 +842,12 @@ export default function DashboardPage() {
                       />
                     }
                   />
-                  <Bar dataKey="input" stackId="1" fill="var(--color-input)" radius={[0, 0, 0, 0]} />
+                  <Bar
+                    dataKey="inputWithoutCacheRead"
+                    stackId="1"
+                    fill="var(--color-inputWithoutCacheRead)"
+                    radius={[0, 0, 0, 0]}
+                  />
                   <Bar dataKey="output" stackId="1" fill="var(--color-output)" radius={[0, 0, 0, 0]} />
                   <Bar dataKey="cacheRead" stackId="1" fill="var(--color-cacheRead)" radius={[4, 4, 0, 0]} />
                 </BarChart>

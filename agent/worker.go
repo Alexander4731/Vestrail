@@ -270,6 +270,14 @@ func workerArtifactSpec(runDir string) string {
 	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
 }
 
+// workerStaticArtifactSpec is the cacheable (intent-independent) form of 段 [C]:
+// it omits the per-intent i<intentID> path so all workers in the same task share
+// an identical static system prefix for prompt caching; the concrete runDir is
+// supplied in the dynamic per-intent tail after DynamicBoundary.
+func workerStaticArtifactSpec() string {
+	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律直接用相对路径写到当前工作目录**（系统已为本次意图建好并切入专属目录，具体路径见下方意图段）——**不要写 /tmp、不要用其它绝对路径**。"
+}
+
 // ensureRunDir builds and creates an agent's working directory under base:
 // <base>/tasks/<taskID> for planner/main; <base>/tasks/<taskID>/i<intentID> for a
 // worker (intentID<=0 → task dir only). The "tasks/" segment groups per-task dirs
@@ -295,6 +303,13 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	return body + workerFocusContract + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
 }
 
+// workerStaticSystem builds the intent-independent static worker system prefix so
+// concurrent and sequential workers in the same task share prompt-cache hits.
+func workerStaticSystem(proxyAddr, caCert, dataDir string) string {
+	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
+	return body + workerFocusContract + workerTrafficBlock(caCert != "") + workerStaticArtifactSpec()
+}
+
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
 // the intent is the worker's whole job. It used to live in the system prompt; it now
 // rides in the first user turn (together with the situational overview) so the system
@@ -316,6 +331,24 @@ func intentAssetIDs(intent *db.Node) []int64 {
 }
 
 func renderIntentTask(intent *db.Node) string {
+	var p struct {
+		Summary        string          `json:"summary"`
+		Brief          string          `json:"brief"`
+		BriefOriginal  string          `json:"brief_original"`
+		BriefTruncated bool            `json:"brief_truncated"`
+		AssetIDs       json.RawMessage `json:"asset_ids"`
+		ParentIDs      json.RawMessage `json:"parent_ids"`
+	}
+	if json.Unmarshal(intent.Payload, &p) == nil && p.Brief != "" {
+		if p.BriefOriginal != "" {
+			p.Brief = p.BriefOriginal
+		}
+		task := fmt.Sprintf("\n\n【意图摘要】：\n%s\n【执行交底】：\n%s\nasset_ids: %s\nparent_ids: %s\n意图 id: %d（写回时传它，只做这一条）", p.Summary, p.Brief, p.AssetIDs, p.ParentIDs, intent.ID)
+		if p.BriefTruncated && p.BriefOriginal == "" {
+			task += "\n交底预览已缩略，完整原文保存在 node_detail 的 brief_original 中。"
+		}
+		return task
+	}
 	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
 }
 
@@ -369,6 +402,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
+	tsx.workerIntentID = intent.ID
 	tsx.SetOwnerNode(intent.ID)         // assets this worker discovers anchor to its intent → visible to the task
 	tsx.SetEnrich(enr)                  // async DNS/HTTP auto-completion for assets this worker writes
 	tsx.SetNotifyFinding(notifyFinding) // report_finding 落库时当场唤醒 planner，带上「哪个意图+finding」
@@ -379,58 +413,82 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	if OptimizationEnabled("VESTRAIL_OPT_RUNSCRIPT") {
+		base = append(base, NewRunScriptTool())
+	}
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
+	// Defer low-frequency secondary worker tools so their JSON schemas are not
+	// resent on every turn; they remain unlocked and callable on demand via
+	// SearchExtraTools / ExecuteExtraTool.
+	def = deferBuiltinTools(tools, def,
+		"search_all_worker_traces", "get_worker_trace", "node_detail", "traffic_blob", "sleep",
+	)
 
-	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
-	// 原始数据一起放进 system prompt：system 每次 run 都重新拼一遍、绝不会被 compaction 压掉，
-	// 长 run 里意图永远在场，续跑时也不依赖 transcript 历史是否留住那条首消息。代价是 system
-	// 混入 per-intent 易变数据、失去跨意图缓存复用；这是刻意的取舍（意图丢失比省 token 严重得多）。
-	// 与 planner「态势块放 user turn」分叉是有意的：planner 本身是产意图的那个、没有单一 mandate，
-	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
-	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
-	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
-	// The run-wide intent is not the current tool action. Do not forward it or
-	// inherit a parent run's background into the action reviewer.
-	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
-	if w.wantConstraints() {
-		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
+	// 静态系统前缀(角色指令 + 约束 + 任务总目标 + 延迟工具索引)置于 DynamicBoundary 之前，
+	// 同一任务下所有并发/串行 worker 共享缓存前缀；per-intent 易变段(意图正文、专属目录、
+	// 恢复摘要、目标资产 JSON)置于 DynamicBoundary 之后的 system 第二段：既绝不会被
+	// compaction 压丢，又不破坏跨意图前缀缓存。全局态势采用 worker 专用轻量视图。
+	lane := w.prepareWorkerLane(ctx, taskID, ts, intent, message)
+	if OptimizationEnabled("VESTRAIL_OPT_LANE_WORKER") || lane.Context != nil {
+		tools, def = stableSessionTools(tools, def)
 	}
-	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
-	sysBody += taskObjectiveBlock(ctx)
-	sysBody += renderIntentTask(intent)
-	sysBody += intercept.RecoverySummary(ctx)
+	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
+	if lane.Context != nil {
+		runDir = lane.Context.Directory
+	}
+	staticSys := workerStaticSystem(w.proxyAddr, w.proxyCACert, w.workDir)
+	if w.wantConstraints() {
+		staticSys += constraintBlock(ts)
+	}
+	staticSys += taskObjectiveBlock(ctx)
+	configJSON, _ := json.Marshal([]any{w.proxyAddr, w.proxyCACert, w.webSearch, w.compactionWindow(), w.nonStreaming(), w.maxTokens(), w.noaEnabledFn != nil && w.noaEnabledFn(), actool.BackgroundTasksDisabled()})
+	fingerprint := toolFingerprint(staticSys+string(configJSON), w.model+providerCacheIdentity(w.prov), tools, def)
+	if lane.Source != "" && lane.Context.Fingerprint != fingerprint {
+		lane.Note = "接力配置已变化，使用独立工作会话。"
+		lane.Source, lane.Context = "", nil
+		runDir = ensureRunDir(w.workDir, taskID, intent.ID)
+	}
+	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
+	var overview string
+	if lane.Source == "" {
+		overview = renderWorkerGraphOverview(tsx.workerOverviewData(intent))
+	}
+	var assetBody string
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
-			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
-				if b, err := json.Marshal(assets); err == nil {
-					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
-				}
-				// 意图明确针对的这些资产 → 自动纳入任务测试范围（与 insertAssets 同一套
-				// 保守粒度）。upsertTaskScope 的 ON CONFLICT DO NOTHING + uq_task_scope
-				// 唯一索引保证不会重复添加；重跑/重试同样是幂等 no-op。
-				// 资产覆盖度功能关闭时不再累积测试范围(分母)。
-				if coverageEnabled {
-					for _, a := range assets {
-						_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
-					}
+			assets, assetErr := as.GetByIDs(ids)
+			if assetErr != nil {
+				return harness.ReasonModelError, tsx.Writes(), assetErr
+			}
+			if b, err := json.Marshal(assets); err == nil {
+				assetBody = "\n\n本意图目标资产：\n" + string(b)
+			}
+			if coverageEnabled {
+				for _, a := range assets {
+					_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
 				}
 			}
 		}
 	}
-	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
-	system, boundary := deferredSystem(sysBody, def)
+	laneMode := (w.noaEnabledFn == nil || !w.noaEnabledFn()) && (lane.Context != nil || OptimizationEnabled("VESTRAIL_OPT_LANE_WORKER"))
+	tail := renderIntentTask(intent) + "\n本次意图专属工作目录: " + runDir + intercept.RecoverySummary(ctx) + assetBody
+	if laneMode {
+		tail = laneSystemTail(intent, runDir)
+	}
+	system, boundary := deferredSystemWithDynamic(staticSys, tail, def)
+	if lane.Context != nil && lane.Context.Fingerprint == fingerprint {
+		system, boundary = lane.Context.System, lane.Context.Boundary
+	}
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
 	ctx, cancelRun := runDeadline(ctx, maxDur)
 	defer cancelRun()
-	settle := wrapupSettlement("worker", []string{"Bash"})
+	settle := wrapupSettlement("worker", []string{"Bash", "RunScript"})
 	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
+		settle = wrapupSettlementForTask("worker", []string{"Bash", "RunScript"}, clamped)
 	}
 	opts := agentcore.Options{
 		Provider:        w.prov,
@@ -466,13 +524,19 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// clamped(被任务 deadline 夹逼)时用 PromptByReason:因超时=任务到点→任务超时词,
 		// 因步数=夹逼窗口内步数先耗尽→回落 per-run 词。非 clamped 维持纯 per-run。
 		Settlement: settle,
-		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
-		// full output preserved on disk. 截断上限用 SDK 默认(30000 字符)。
-		ToolOutputDir: cmdOutDir(runDir),
-		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
-		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
-		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		// large tool output spills to cmd-output/ with a compact 10KB head+tail preview
+		// and a file pointer (SDK tool.Capture); full output preserved lossless on disk.
+		ToolOutputDir:      cmdOutDir(runDir),
+		MaxToolOutputChars: defaultToolOutputChars,
+		Compaction:         compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
+		Todos:              actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		NonStreaming:       w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
+		MaxTokens:          w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+	}
+	if laneMode {
+		opts.PreserveReasoningHistory = true
+		opts.Compaction.PinnedUserPrefix = "【当前执行意图 #"
+		opts.Compaction.PinnedUserEndMarker = "\n\n【背景态势】"
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
@@ -492,6 +556,27 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 这条启动 user 消息只承载【全局态势 overview】——可降级的了解大局信息，压掉无碍。
 	// overview 罕见地 marshal 失败为空时，回退一句启动词，避免首轮出现空 user 消息。
 	input := overview
+	if laneMode {
+		input = currentIntentInput(intent, assetBody+intercept.RecoverySummary(ctx)) + "\n\n【背景态势】" + overview
+	}
+	if lane.Source != "" {
+		input = currentIntentInput(intent, assetBody) + fmt.Sprintf("\n写回必须归属当前 intent_id=%d，来源意图只作背景。", intent.ID)
+	}
+	if lane.Note != "" {
+		input += "\n" + lane.Note
+	}
+	if handoff := readIntentLane(intent); lane.Source == "" && (handoff.Continue > 0 || handoff.Handoff > 0) {
+		sourceID := handoff.Continue
+		if sourceID == 0 {
+			sourceID = handoff.Handoff
+		}
+		if w.tx != nil {
+			if state, e := readWorkerContext(w.tx.MainPath(WorkerSessionID(ts.ID(), sourceID)) + ".lane.json"); e == nil && state.TaskID == taskID && contextDirectory(w.workDir, taskID, state.Directory) {
+				input += "\n上游脚本目录（只作交接参考，复制到当前目录后使用）：" + state.Directory + "\n当前执行仍使用本意图目录：" + runDir
+			}
+		}
+	}
+
 	if strings.TrimSpace(input) == "" {
 		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
 	}
@@ -502,7 +587,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	ctx = attachSideCapture(ctx, &opts)
 	opts.Hooks = guard.WithToolReview(opts.Hooks, opts.Tools)
 	s := newAgentSession(opts)
-	defer s.Close() // release the session's background-task manager (temp dir + processes)
+	defer func() { s.Close() }() // release the session's background-task manager (temp dir + processes)
 
 	// Resume prior conversation if this intent was paused/blocked/exhausted and is
 	// being re-run. The transcript ID is deterministic per intent, so if a prior
@@ -510,13 +595,39 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// restarting from scratch.
 	alreadyRecorded := false
 	if w.tx != nil {
-		if err := resumeSession(s, opts.SessionID); err != nil {
+		if lane.Source != "" {
+			if forkErr := s.ForkFrom(lane.Source, opts.SessionID); forkErr != nil {
+				if _, e := os.Stat(w.tx.MainPath(opts.SessionID)); e == nil {
+					return harness.ReasonModelError, tsx.Writes(), fmt.Errorf("接力目标会话已存在，保留现有记录：%w", forkErr)
+				}
+				// An exclusive publish failure leaves no partial destination history.
+				s.Close()
+				runDir = ensureRunDir(w.workDir, taskID, intent.ID)
+				opts.WorkingDir, opts.ToolOutputDir = runDir, cmdOutDir(runDir)
+				opts.SystemPrompt, opts.DynamicBoundary = deferredSystemWithDynamic(staticSys, laneSystemTail(intent, runDir), def)
+				system, boundary = opts.SystemPrompt, opts.DynamicBoundary
+				ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
+				s = newAgentSession(opts)
+				lane.Context, lane.Source = nil, ""
+				if overview == "" {
+					overview = renderWorkerGraphOverview(tsx.workerOverviewData(intent))
+				}
+				input = currentIntentInput(intent, assetBody+intercept.RecoverySummary(ctx)) + "\n\n【背景态势】" + overview
+				emitWrap(db.Activity{Kind: "text", Summary: "执行线接力失败，已使用独立会话", Detail: forkErr.Error()})
+			}
+		} else if err := resumeSession(s, opts.SessionID); err != nil {
 			return harness.ReasonModelError, tsx.Writes(), err
 		}
+		if lane.Context != nil && def.Unlock != nil {
+			def.Unlock.Add(lane.Context.Unlocked...)
+		}
 		alreadyRecorded = requestID != "" && hasWorkerChatMessage(s.Messages(), requestID)
-		if len(s.Messages()) > 0 && message == "" {
+		if len(s.Messages()) > 0 && message == "" && lane.Source == "" {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
 			input = "继续执行。"
+			if laneMode {
+				input = currentIntentInput(intent, assetBody+intercept.RecoverySummary(ctx)) + "\n继续执行，避免重复已经完成的动作。"
+			}
 		} else if len(s.Messages()) > 0 {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
 		}
@@ -539,6 +650,29 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// enters the wrap-up phase on the live ctx, so a run whose tool overran the budget
 	// still settles (no external hard-timeout backstop needed). ctx itself carries only
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
+	if w.tx != nil && laneMode && lane.Context == nil {
+		if e := ts.SetEffectiveLane(intent.ID, intent.ID, 1); e != nil {
+			emitWrap(db.Activity{Kind: "text", Summary: "独立执行线元数据保存失败", Detail: e.Error()})
+		}
+	}
 	_, reason, err := captureRunSession(ctx, s, opts.Transcript, input, emitWrap)
+	if w.tx != nil && laneMode {
+		root, depth := intent.ID, 1
+		if lane.Context != nil {
+			root, depth = lane.Context.RootID, lane.Context.Depth
+			if lane.Source != "" {
+				depth++
+			}
+		}
+		state := &workerContext{TaskID: taskID, IntentID: intent.ID, RootID: root, Depth: depth, Directory: runDir, Fingerprint: fingerprint, System: system, Boundary: boundary}
+		if s.UnlockSet() != nil {
+			state.Unlocked = s.UnlockSet().List()
+		}
+		if e := s.CheckpointWorkingSet(); e != nil {
+			emitWrap(db.Activity{Kind: "text", Summary: "工作上下文保存失败，后续接力将停用", Detail: e.Error()})
+		} else if e := saveWorkerContext(w.tx.MainPath(opts.SessionID)+".lane.json", state); e != nil {
+			emitWrap(db.Activity{Kind: "text", Summary: "执行线元数据保存失败，后续接力将停用", Detail: e.Error()})
+		}
+	}
 	return reason, tsx.Writes(), err
 }

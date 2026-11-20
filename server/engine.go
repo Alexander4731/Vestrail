@@ -91,6 +91,8 @@ func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
 // (re)installed at runtime (LLM configured from the UI); the loops always run
 // but idle until an LLM is set.
 type Engine struct {
+	laneBusy         sync.Map // laneKey -> intent id
+	noGainStreak     sync.Map // task id -> *atomic.Int64
 	recoverExecution func(context.Context, *Task)
 	phases           sync.Map
 	stopping         bool // guarded by deleteMu
@@ -283,6 +285,13 @@ func (e *Engine) StopTask(taskID string) {
 	e.llmCalls.Delete(taskID)
 	e.phases.Delete(taskID)
 	e.paused.Delete(taskID)
+	e.noGainStreak.Delete(taskID)
+	e.laneBusy.Range(func(k, v any) bool {
+		if k.(laneKey).taskID == taskID {
+			e.laneBusy.Delete(k)
+		}
+		return true
+	})
 	e.dropCnt.Delete(taskID)
 	e.plannerRound.Delete(taskID)
 	e.settling.Delete(taskID)
@@ -392,7 +401,7 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
 func NewEngine(m *Manager) *Engine {
-	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
+	return &Engine{m: m, debounce: 2500 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
 		runtimes: map[string]*taskRuntime{}}
@@ -607,7 +616,7 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
 	if h.failures != nil {
-		h.failures.after(name, input, isErr)
+		h.failures.after(name, input, isErr, result)
 	}
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
@@ -820,7 +829,30 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
+// onlyDoneTriggers reports whether every pending trigger is an ordinary worker
+// completion ("done"). Findings, goal/hint edits, cancellations, or bare wakes
+// always return false so high-priority events bypass coalescing immediately.
+func onlyDoneTriggers(evs []agent.TriggerEvent) bool {
+	if len(evs) == 0 {
+		return false
+	}
+	for _, ev := range evs {
+		if ev.Kind != "done" {
+			return false
+		}
+	}
+	return true
+}
+
+const plannerSaturatedCooldown = 45 * time.Second
+
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
+	var previousPlanner *agent.Planner
+	defer func() {
+		if previousPlanner != nil {
+			previousPlanner.CloseEpoch(t.Store.ID())
+		}
+	}()
 	interval := plannerHeartbeatInterval(t)
 	// 心跳定时器在 loop 入口臂 = 从任务 start 计时:即使是跳过首轮 planner 的 seed 任务
 	// (Run 里 frontier 非空不 kick 首轮)、这里一直阻塞,心跳也会在「任务 start + interval」
@@ -830,6 +862,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	nextRound := interval
 	failures, emptyRounds := 0, 0
 	var retryAt time.Time
+	var lastPlanAt time.Time
 	endBackoff := func() {}
 	defer func() { endBackoff() }()
 
@@ -857,6 +890,12 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			}
 		}
 		planner, _ := e.snapshotFor(t)
+		if planner != previousPlanner {
+			if previousPlanner != nil {
+				previousPlanner.CloseEpoch(t.Store.ID())
+			}
+			previousPlanner = planner
+		}
 		if planner == nil {
 			nextRound = 2 * time.Second
 			return // recheck readiness without waiting the ten-minute heartbeat
@@ -897,6 +936,24 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			}
 			return // goalless 分支永不进入 planner.Plan
 		}
+		// Pure-Go planner coalescing gate: when only ordinary worker completions
+		// arrived recently and the frontier still has enough open intents to keep
+		// every worker slot busy, defer the LLM planning round until either the
+		// cooldown elapses, the frontier dips below the worker count, or a high-
+		// priority event (finding / goal / hint / cancel) arrives. Bypassed when
+		// e.debounce < 500ms (fast unit tests).
+		if src == "edge" && e.debounce >= 500*time.Millisecond && !lastPlanAt.IsZero() {
+			if rem := plannerSaturatedCooldown - time.Since(lastPlanAt); rem > 0 && onlyDoneTriggers(t.peekTriggers()) {
+				if openCount, err := t.Store.CountOpenIntents(); err == nil && openCount >= e.m.Workers() {
+					if rem < nextRound {
+						nextRound = rem
+					}
+					log.Printf("[planner] task %s 队列已饱和(open=%d>=workers=%d)，合并普通 done 触发，%s 后统一规划",
+						t.ID, openCount, e.m.Workers(), rem.Round(time.Second))
+					return
+				}
+			}
+		}
 		if !e.beginTaskOperation(t.ID) {
 			return
 		}
@@ -916,6 +973,11 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// what fired this round (worker done / finding; may be several — debounce
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
+		for _, ev := range triggers {
+			if ev.Kind == "goal" || ev.Kind == "goal_edited" || ev.Kind == "hint" {
+				e.gainCounter(t.ID).Store(0)
+			}
+		}
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		before, progressErr := t.Store.GraphProgress()
 		if progressErr != nil {
@@ -923,6 +985,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			return
 		}
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.lifecycleSnapshot().Goal, triggers, emit)
+		lastPlanAt = time.Now()
 		switch {
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
@@ -1030,6 +1093,12 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			}
 			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
 		}
+		if e.focusWorker(t.ID, name) {
+			if sleepCtx(ctx, 800*time.Millisecond) {
+				return
+			}
+			continue
+		}
 		if !e.beginTaskOperation(t.ID) {
 			return
 		}
@@ -1062,6 +1131,8 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 // must already hold one task-operation admission for the whole sequence so a delete
 // cannot observe quiescence between the LLM return and the final DB writes.
 func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, requestID, message string) bool {
+	leaseKey := laneKey{t.ID, agent.IntentLaneRoot(intent)}
+	defer e.releaseLane(leaseKey, intent.ID)
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
@@ -1077,6 +1148,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// per-work child context so the planner's kill_work can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
 	e.registerWork(intent.ID, workCancel)
+	if _, ok := e.awaitLane(workCtx, t.ID, intent); !ok {
+		action, complete := e.detachWork(intent.ID)
+		state := "open"
+		if action == "pause" || action == "cancel" || errors.Is(context.Cause(workCtx), agent.AbortWorkPausedByUser) || errors.Is(context.Cause(workCtx), agent.AbortWorkCancelledByUser) {
+			state = "paused"
+		}
+		err := settleIntent(e.phaseContext(ctx, t.ID), t.Store, intent.ID, state, "")
+		complete(err)
+		return true
+	}
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
 	// for THIS intent (drained before the worker's next tool call).
 	iid := intent.ID
@@ -1103,11 +1184,18 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	var reason harness.TerminalReason
 	var wrote agent.WriteCounts
 	var err error
-	if hasChatMessage {
-		reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
-	} else {
-		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+	totalWrites := agent.WriteCounts{}
+	execute := func() {
+		if hasChatMessage {
+			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
+		} else {
+			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+		}
+		totalWrites.Facts += wrote.Facts
+		totalWrites.Assets += wrote.Assets
+		totalWrites.Findings += wrote.Findings
 	}
+	execute()
 	// model_error 收场 → 额外重跑几次（退避后再试）。仅在意图仍属本 work、任务
 	// 未暂停/未终止/未取消【且未进入收尾】时重试；否则让位给对应分支处理(收尾期不
 	// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
@@ -1120,19 +1208,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		if sleepCtx(workCtx, retryBackoff) {
 			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
 		}
-		if hasChatMessage {
-			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
-		} else {
-			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
-		}
+		execute()
 	}
 	// Capture kill state before detachWork cancels workCtx. kill = this work's
 	// ctx was cancelled (planner kill_work) while the TASK ctx kept running; a
 	// pause cancels the task ctx (ectx) instead. Checking workCtx.Err() AFTER
 	// unregister would always be true (unregister cancels it) → every completed
 	// work would be wrongly marked stopped.
+	wrote = totalWrites
 	workCause := context.Cause(workCtx)
-	noProgress := errors.Is(workCause, agent.AbortRepeatedToolFailure)
+	noProgress := errors.Is(workCause, agent.AbortRepeatedToolFailure) || errors.Is(workCause, agent.AbortNoProgressStagnation)
 	killed := workCtx.Err() != nil && ectx.Err() == nil && !noProgress
 	action, completeWork := e.detachWork(intent.ID)
 	// A caller may stop waiting and release its in-memory reservation before the
@@ -1209,6 +1294,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		log.Printf("[worker %s] task %s 意图 #%d 状态 %s 未提交: %v", name, t.ID, intent.ID, state, settleErr)
 		return true
 	}
+	e.recordWorkerGain(t.ID, state, wrote)
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)
 	if state != "open" && state != "paused" {
@@ -1302,11 +1388,27 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 }
 
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
-	fr, _ := t.Store.Frontier(20)
+	busy := []int64{}
+	e.laneBusy.Range(func(k, v any) bool {
+		key := k.(laneKey)
+		if key.taskID == t.ID {
+			busy = append(busy, key.root)
+		}
+		return true
+	})
+	fr, err := t.Store.FrontierExcludingLanes(20, busy)
+	if err != nil {
+		return nil
+	}
 	for _, in := range fr {
-		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {
+		key, ok := e.leaseLane(t.ID, in)
+		if !ok {
+			continue
+		}
+		if claimed, err := t.Store.ClaimIntent(in.ID, name); err == nil && claimed {
 			return in
 		}
+		e.releaseLane(key, in.ID)
 	}
 	return nil
 }

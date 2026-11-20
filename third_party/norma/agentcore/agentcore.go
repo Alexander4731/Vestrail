@@ -25,6 +25,8 @@ import (
 
 // Options configures a Session (FR-07).
 type Options struct {
+	// PreserveReasoningHistory keeps completed reasoning in stable execution chains.
+	PreserveReasoningHistory bool
 	// Provider is the LLM backend (any Anthropic- or OpenAI-format endpoint, or
 	// a custom implementation).
 	Provider llm.Provider
@@ -229,12 +231,13 @@ type MemoryOptions struct {
 // (messages, usage) persists across calls (FR-07.1/2). Not safe for concurrent
 // Prompt calls on the same Session.
 type Session struct {
-	opts      Options
-	registry  *tool.Registry
-	compactor harness.Compactor
-	planCtrl  *plan.Controller
-	messages  []llm.Message
-	usage     llm.Usage
+	lastInputTokens int
+	opts            Options
+	registry        *tool.Registry
+	compactor       harness.Compactor
+	planCtrl        *plan.Controller
+	messages        []llm.Message
+	usage           llm.Usage
 
 	sessionID string
 	store     *transcript.Store
@@ -264,7 +267,11 @@ func NewSession(opts Options) *Session {
 		}
 		s.compactor = opts.Compactor
 	} else if opts.Compaction != nil {
-		s.compactor = compaction.New(*opts.Compaction, compaction.ProviderSummarizer(opts.Provider, opts.MaxTokens, opts.NonStreaming))
+		summarizer := compaction.ProviderSummarizer(opts.Provider, opts.MaxTokens, opts.NonStreaming)
+		if opts.Compaction.ConciseSummary {
+			summarizer = compaction.ConciseProviderSummarizer(opts.Provider, opts.MaxTokens, opts.NonStreaming)
+		}
+		s.compactor = compaction.New(*opts.Compaction, summarizer)
 	}
 	if opts.Plan != nil {
 		start := opts.PermissionMode
@@ -348,8 +355,12 @@ func (s *Session) Messages() []llm.Message { return s.messages }
 // Usage returns cumulative token usage.
 func (s *Session) Usage() llm.Usage { return s.usage }
 
+// LastInputTokens returns the most recent model turn's input token count,
+// not the cumulative input across turns or prompts.
+func (s *Session) LastInputTokens() int { return s.lastInputTokens }
+
 // Reset clears the conversation.
-func (s *Session) Reset() { s.messages = nil; s.usage = llm.Usage{} }
+func (s *Session) Reset() { s.messages = nil; s.usage = llm.Usage{}; s.SeedCompactionReference(0) }
 
 // SessionID returns the transcript session id (empty if persistence is off).
 func (s *Session) SessionID() string { return s.sessionID }
@@ -369,9 +380,18 @@ func (s *Session) Resume(sessionID string) error {
 	if err != nil {
 		return err
 	}
-	msgs, usage := transcript.Messages(recs)
+	_, usage := transcript.Messages(recs)
+	msgs, _, err := s.store.WorkingMessages(sessionID, recs)
+	if err != nil {
+		return err
+	}
 	s.messages = cleanResumed(msgs)
 	s.usage = usage
+	for _, r := range recs {
+		if r.Usage != nil && r.Usage.InputTokens > 0 {
+			s.lastInputTokens = r.Usage.InputTokens
+		}
+	}
 	s.sessionID = sessionID
 	s.writer = s.store.ResumeWriter(sessionID, transcript.LastUUID(recs))
 	return nil
@@ -483,34 +503,36 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		reminderExtra = s.opts.SystemReminderFunc()
 	}
 	in := harness.QueryInput{
-		Provider:           s.opts.Provider,
-		System:             s.system(),
-		DynamicBoundary:    s.opts.DynamicBoundary,
-		Messages:           s.messages,
-		SystemReminder:     buildSystemReminder(reminderExtra),
-		Tools:              s.registry,
-		DeferredTools:      s.opts.DeferredTools,
-		MaxTokens:          s.opts.MaxTokens,
-		Temperature:        s.opts.Temperature,
-		MaxTurns:           s.opts.MaxTurns,
-		MaxDuration:        s.opts.MaxDuration,
-		Settlement:         s.opts.Settlement,
-		MaxConcurrency:     s.opts.MaxConcurrency,
-		WorkingDir:         s.opts.WorkingDir,
-		Todos:              s.opts.Todos,
-		ToolOutputDir:      s.opts.ToolOutputDir,
-		MaxToolOutputChars: s.opts.MaxToolOutputChars,
-		Tasks:              s.tasks,
-		BashEnv:            s.opts.BashEnv,
-		PermissionMode:     s.opts.PermissionMode,
-		Allowed:            s.opts.AllowedTools,
-		Disallowed:         s.opts.DisallowedTools,
-		CanUseTool:         s.opts.CanUseTool,
-		Hooks:              s.opts.Hooks,
-		Compactor:          s.compactor,
-		TokenBudget:        s.opts.TokenBudget,
-		EscalateMaxTokens:  s.opts.EscalateMaxTokens,
-		NonStreaming:       s.opts.NonStreaming,
+		PreserveReasoningHistory: s.opts.PreserveReasoningHistory,
+		LastInputTokens:          s.lastInputTokens,
+		Provider:                 s.opts.Provider,
+		System:                   s.system(),
+		DynamicBoundary:          s.opts.DynamicBoundary,
+		Messages:                 s.messages,
+		SystemReminder:           buildSystemReminder(reminderExtra),
+		Tools:                    s.registry,
+		DeferredTools:            s.opts.DeferredTools,
+		MaxTokens:                s.opts.MaxTokens,
+		Temperature:              s.opts.Temperature,
+		MaxTurns:                 s.opts.MaxTurns,
+		MaxDuration:              s.opts.MaxDuration,
+		Settlement:               s.opts.Settlement,
+		MaxConcurrency:           s.opts.MaxConcurrency,
+		WorkingDir:               s.opts.WorkingDir,
+		Todos:                    s.opts.Todos,
+		ToolOutputDir:            s.opts.ToolOutputDir,
+		MaxToolOutputChars:       s.opts.MaxToolOutputChars,
+		Tasks:                    s.tasks,
+		BashEnv:                  s.opts.BashEnv,
+		PermissionMode:           s.opts.PermissionMode,
+		Allowed:                  s.opts.AllowedTools,
+		Disallowed:               s.opts.DisallowedTools,
+		CanUseTool:               s.opts.CanUseTool,
+		Hooks:                    s.opts.Hooks,
+		Compactor:                s.compactor,
+		TokenBudget:              s.opts.TokenBudget,
+		EscalateMaxTokens:        s.opts.EscalateMaxTokens,
+		NonStreaming:             s.opts.NonStreaming,
 	}
 	if s.writer != nil {
 		in.Recorder = s.writer
@@ -518,12 +540,24 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 	if s.planCtrl != nil {
 		in.PermissionModeFunc = s.planCtrl.Mode
 	}
+	baseUsage := s.usage
 	inner := harness.Query(ctx, in, s.opts.Deps)
 	return func(yield func(harness.Event, error) bool) {
+		var previousRunUsage llm.Usage
 		for ev, err := range inner {
+			if ev.Kind == harness.KindUsage && ev.Usage != nil {
+				runUsage := *ev.Usage
+				s.lastInputTokens = runUsage.InputTokens - previousRunUsage.InputTokens
+				previousRunUsage = runUsage
+				u := baseUsage
+				u.Add(runUsage)
+				ev.Usage = &u
+			}
 			if ev.Kind == harness.KindResult && ev.Terminal != nil {
 				s.messages = ev.Terminal.Messages
-				s.usage = ev.Terminal.Usage
+				s.usage = baseUsage
+				s.usage.Add(ev.Terminal.Usage)
+				ev.Terminal.Usage = s.usage
 			}
 			if !yield(ev, err) {
 				return

@@ -126,6 +126,8 @@ type ToolSchema struct {
 
 // CompletionRequest is a single, provider-neutral model invocation.
 type CompletionRequest struct {
+	// PreserveReasoningHistory keeps completed reasoning in stable execution chains.
+	PreserveReasoningHistory bool
 	// System is the host-controlled system prompt, in segments. The SDK injects
 	// no presets (design decision 1). Segments are joined with blank lines.
 	System []string

@@ -47,6 +47,7 @@ func TestBackgroundTaskEndToEnd(t *testing.T) {
 		Deps:           harness.QueryDeps{CallModel: callModel},
 	})
 
+	defer sess.Close()
 	// The task tools are auto-registered alongside Bash.
 	for _, name := range []string{"TaskOutput", "TaskStop", "TaskList", "Monitor"} {
 		if _, ok := sess.registry.Get(name); !ok {
@@ -72,7 +73,20 @@ func TestBackgroundTaskEndToEnd(t *testing.T) {
 	}
 
 	// Wait for the command to finish so its notification is queued.
-	time.Sleep(1500 * time.Millisecond)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		tasks := sess.tasks.List()
+		if len(tasks) == 1 && tasks[0].Status.Terminal() {
+			if tasks[0].Status != tool.TaskCompleted {
+				t.Fatalf("background task failed: %+v", tasks[0])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background task did not complete")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// Prompt #2: the completion notification is injected before the new turn.
 	for range mustEvents(t, sess, "anything new?") {

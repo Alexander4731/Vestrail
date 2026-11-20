@@ -438,6 +438,9 @@ func (m *Manager) RunForeground(ctx context.Context, spec SpawnSpec, timeout tim
 	}
 }
 
+// Done closes only after the managed process has exited and its output is closed.
+func (t *Task) Done() <-chan struct{} { return t.done }
+
 // Kill terminates a running task (process tree) and marks it killed.
 func (m *Manager) Kill(id string) bool {
 	m.mu.Lock()

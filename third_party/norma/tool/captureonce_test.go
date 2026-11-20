@@ -52,3 +52,23 @@ func TestCaptureOncePassesShortOutput(t *testing.T) {
 		t.Fatalf("short output changed: %q", got)
 	}
 }
+
+func TestCaptureSpillPreservesHeadAndTailAndStripsANSI(t *testing.T) {
+	dir := t.TempDir()
+	tc := &ToolContext{WorkingDir: dir, OutputDir: dir, MaxOutputChars: 200}
+	raw := "\x1b[32mOPENING_HEADER\x1b[0m\n" + strings.Repeat("middle-noise-line\n", 100) + "\x1b[31mFINAL_ERROR_SIGNAL\x1b[0m"
+
+	got := Capture(tc, raw)
+	if !strings.Contains(got, "OPENING_HEADER") {
+		t.Fatalf("expected head preserved, got: %q", got)
+	}
+	if !strings.Contains(got, "FINAL_ERROR_SIGNAL") {
+		t.Fatalf("expected tail preserved, got: %q", got)
+	}
+	if strings.Contains(got, "\x1b[") {
+		t.Fatalf("expected ANSI escape codes stripped from preview: %q", got)
+	}
+	if !strings.Contains(got, "<persisted-output>") {
+		t.Fatalf("expected persisted-output pointer: %q", got)
+	}
+}

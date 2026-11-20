@@ -1692,7 +1692,7 @@ func stageTaskFiles(dataDir, taskID string, explorationID int64) (*taskFileDelet
 	prefix := fmt.Sprintf("exp%d-", explorationID)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) || (!entry.IsDir() && !strings.HasSuffix(name, ".jsonl")) {
+		if !strings.HasPrefix(name, prefix) || (!entry.IsDir() && !taskTranscriptFile(name)) {
 			continue
 		}
 		targets = append(targets, filepath.Join(transcriptDir, name))
@@ -1950,4 +1950,21 @@ func (t *Task) drainTriggers() []agent.TriggerEvent {
 	ev := t.pendingTriggers
 	t.pendingTriggers = nil
 	return ev
+}
+
+// peekTriggers returns a snapshot copy of the pending triggers without clearing them.
+func (t *Task) peekTriggers() []agent.TriggerEvent {
+	t.trigMu.Lock()
+	defer t.trigMu.Unlock()
+	if len(t.pendingTriggers) == 0 {
+		return nil
+	}
+	cp := make([]agent.TriggerEvent, len(t.pendingTriggers))
+	copy(cp, t.pendingTriggers)
+	return cp
+}
+
+// Companions hold the exact working view and lane directory for task continuation.
+func taskTranscriptFile(name string) bool {
+	return strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.working.json") || strings.HasSuffix(name, ".jsonl.lane.json")
 }

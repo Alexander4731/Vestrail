@@ -1,6 +1,8 @@
 package compaction
 
 import (
+	"context"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -154,5 +156,100 @@ func TestMicroRecentWindowProtectsByToolNotMessage(t *testing.T) {
 	out, _ := c.microCompact(msgs)
 	if got := countCleared(out); got != 2 {
 		t.Fatalf("cleared=%d, want 2 (only the two oldest)", got)
+	}
+}
+
+func TestMicroExtraCompactableAndPersistedPathPreserved(t *testing.T) {
+	c := New(Config{
+		ContextWindow:    200000,
+		MicroKeepRecent:  2,
+		ExtraCompactable: []string{"traffic_get", "list_assets"},
+	}, nil)
+	var msgs []llm.Message
+	msgs = append(msgs, toolPair("traffic_get", "t0", strings.Repeat("a", 500)+"\n... <persisted-output>[Output too large: full 50000 bytes / 100 lines.Full output saved to  /work/cmd-output/out.txt </persisted-output>")...)
+	msgs = append(msgs, toolPair("list_assets", "t1", strings.Repeat("b", 500))...)
+	msgs = append(msgs, toolPair("traffic_get", "t2", "recent-1")...)
+	msgs = append(msgs, toolPair("list_assets", "t3", "recent-2")...)
+
+	out, changed := c.microCompact(msgs)
+	if !changed {
+		t.Fatal("expected extra compactable tools to be cleared")
+	}
+	if got := countCleared(out); got != 2 {
+		t.Fatalf("cleared=%d, want 2", got)
+	}
+	r0 := resultText(out[1].Content[0])
+	if !strings.Contains(r0, "/work/cmd-output/out.txt") {
+		t.Fatalf("expected persisted file path to survive microCompact, got: %q", r0)
+	}
+	// Idempotent on second sweep.
+	if _, changed2 := c.microCompact(out); changed2 {
+		t.Fatal("second microCompact pass should be idempotent for enriched placeholders")
+	}
+}
+
+func TestMicroBatchHysteresisPreservesPromptCache(t *testing.T) {
+	c := New(Config{
+		ContextWindow:    200000,
+		SoftWindow:       60000, // eff=52000, microThreshold=31200, autoThreshold=39000
+		MicroKeepRecent:  2,
+		MicroBatchGrowth: 15000,
+	}, nil)
+	// First sweep fires once tokens exceed microThreshold (31200).
+	msgs := manyReadPairs(5)
+	out1 := c.Pre(t.Context(), msgs, 33000)
+	if got := countCleared(out1); got != 3 {
+		t.Fatalf("first sweep cleared=%d, want 3", got)
+	}
+	// Next turn adds one more tool call; even if provider reports 32000 (> microThreshold),
+	// growth since lastMicroTokens is below MicroBatchGrowth (15000) and below autoThreshold,
+	// so Pre MUST NOT mutate older messages (keeps prompt cache intact).
+	msgs2 := append(out1, toolPair("Read", "r_new", strings.Repeat("z", 400))...)
+	out2 := c.Pre(t.Context(), msgs2, 32000)
+	if got := countCleared(out2); got != 3 {
+		t.Fatalf("hysteresis should skip intermediate sweep to protect prompt cache; cleared=%d want 3", got)
+	}
+	// Reaching AutoCompact's threshold overrides the growth delay.
+	out3 := c.Pre(t.Context(), msgs2, 41000)
+	if got := countCleared(out3); got != 4 {
+		t.Fatalf("expected batch sweep after growth threshold; cleared=%d want 4", got)
+	}
+}
+
+func offsetScaleHistory() []llm.Message {
+	msgs := toolPair("Read", "large-old", strings.Repeat("x", 15000))
+	msgs = append(msgs, manyReadPairs(4)...)
+	// Non-tool context plus system/tools overhead makes local estimates differ
+	// substantially from the provider's reported input size.
+	return append(msgs, llm.UserText(strings.Repeat("context", 7300)))
+}
+
+func TestMicroBatchHysteresisWithRealTokenScaleOffset(t *testing.T) {
+	c := New(Config{ContextWindow: 200000, SoftWindow: 90000, MicroKeepRecent: 2, MicroBatchGrowth: 20000}, nil)
+	first := c.Pre(t.Context(), offsetScaleHistory(), 55000)
+	if countCleared(first) != 3 {
+		t.Fatalf("first sweep did not clear old results: %d", countCleared(first))
+	}
+	if c.lastMicroTokens < 49000 || c.lastMicroTokens > 51500 {
+		t.Fatalf("provider scale was lost after clearing about 5k tokens: %d", c.lastMicroTokens)
+	}
+	next := append(first, toolPair("Read", "new-result", "keep this result")...)
+	before := append([]llm.Message(nil), next...)
+	out := c.Pre(t.Context(), next, 58000)
+	if !reflect.DeepEqual(out, before) || !reflect.DeepEqual(next, before) {
+		t.Fatal("a small increment rewrote the prompt despite the growth delay")
+	}
+}
+
+func TestMicroRealTokenOffsetDoesNotSuppressAutoCompact(t *testing.T) {
+	calls := 0
+	c := New(Config{ContextWindow: 200000, SoftWindow: 90000, MicroKeepRecent: 2, MicroBatchGrowth: 20000},
+		func(_ context.Context, _ []llm.Message) (string, error) {
+			calls++
+			return "complete summary", nil
+		})
+	out := c.Pre(t.Context(), offsetScaleHistory(), 80000)
+	if calls != 1 || boundaryCount(out) != 1 {
+		t.Fatalf("dropping provider overhead hid an actual compaction threshold: calls=%d", calls)
 	}
 }

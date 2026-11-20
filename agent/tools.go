@@ -24,6 +24,9 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 		var p map[string]any
 		_ = json.Unmarshal(n.Payload, &p)
 		m := map[string]any{"id": n.ID, "summary": p["summary"], "state": n.State}
+		if OptimizationEnabled("VESTRAIL_OPT_DATA_CONTRACT") {
+			m["summary"] = truncRuneSummary(p["summary"], 200)
+		}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
 			m["inherited"] = true
@@ -67,10 +70,11 @@ type ToolSet struct {
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
-	ownerNode int64
-	GoalMet   bool
-	Reason    string
-	writes    WriteCounts
+	ownerNode      int64
+	workerIntentID int64
+	GoalMet        bool
+	Reason         string
+	writes         WriteCounts
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(intentID int64) error
@@ -374,22 +378,30 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	out["goals"] = gsum
 	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
 	// planner reads them every round when generating intents (否则只写不读).
-	hints, err := t.ts.ListByKind(db.KindHint, 50)
-	if err != nil {
-		return map[string]any{"error": "图概览读取失败: " + err.Error()}
-	}
-	hsum := make([]map[string]any, 0, len(hints))
-	for _, h := range hints {
-		var p map[string]any
-		_ = json.Unmarshal(h.Payload, &p)
-		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
-		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
-			hint["traffic_refs"] = p["traffic_refs"]
+	if OptimizationEnabled("VESTRAIL_OPT_DATA_CONTRACT") {
+		views, resolved, active, err := t.hintViews(nil, 15)
+		if err != nil {
+			return map[string]any{"error": "提示读取失败: " + err.Error()}
 		}
-		hsum = append(hsum, hint)
+		out["hints"], out["hints_resolved_total"], out["hints_truncated"] = views, resolved, active > int64(len(views))
+	} else {
+		hints, err := t.ts.ListByKind(db.KindHint, 50)
+		if err != nil {
+			return map[string]any{"error": "图概览读取失败: " + err.Error()}
+		}
+		hsum := make([]map[string]any, 0, len(hints))
+		for _, h := range hints {
+			var p map[string]any
+			_ = json.Unmarshal(h.Payload, &p)
+			hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
+			if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
+				hint["traffic_refs"] = p["traffic_refs"]
+			}
+			hsum = append(hsum, hint)
+		}
+		out["hints"] = hsum
+		out["hints_truncated"] = counts[db.KindHint] > int64(len(hsum))
 	}
-	out["hints"] = hsum
-	out["hints_truncated"] = counts[db.KindHint] > int64(len(hsum))
 	// lineage from the exploration edges: an intent's parents (what it
 	// derived_from — possibly several facts combined) and its yields (the
 	// facts/findings it produced). factFrom maps a fact → the intent that
@@ -499,6 +511,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		var fp map[string]any
 		_ = json.Unmarshal(n.Payload, &fp)
 		m := map[string]any{"id": n.ID, "summary": fp["summary"], "verification": n.FindingVerification, "finding_status": n.FindingStatus}
+		if OptimizationEnabled("VESTRAIL_OPT_DATA_CONTRACT") {
+			m["summary"] = truncRuneSummary(fp["summary"], 180)
+		}
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本漏洞由哪个意图产生
 		}
@@ -543,7 +558,10 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
 	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
 	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
-	const coldDigestsCap = 15
+	coldDigestsCap := 15
+	if OptimizationEnabled("VESTRAIL_OPT_DATA_CONTRACT") {
+		coldDigestsCap = 8
+	}
 	if cds, more := coldDigestsRecent(t.ts, coldDigestsCap); len(cds) > 0 {
 		out["cold_digests"] = cds // [{id, body, member_count}] —— 直接读 body (§6.1)
 		if len(more) > 0 {
@@ -640,6 +658,158 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	return out
 }
 
+// workerOverviewData returns a compact, worker-focused situational snapshot for
+// the worker's launch user message. Unlike graphOverviewData (which carries up
+// to 42 intent objects, 15 cold digests, coverage ledgers, and multi-KB
+// inherited task blackboards for the planner), workers only need:
+//   - task root, goals, hints (human steering)
+//   - direct parent nodes of this intent (why this intent was spawned)
+//   - recent finding summaries (prevent duplicate reports)
+//   - up to 10 compact recent facts (140-rune cap) + lightweight counts
+//
+// Everything deeper remains one tool call away (node_detail / list_assets /
+// search_all_worker_traces / get_worker_trace), cutting per-worker launch
+// context by ~70-85% across every turn of the intent run.
+func (t *ToolSet) workerOverviewData(intent *db.Node) map[string]any {
+	out := map[string]any{}
+	if t.ts == nil {
+		return out
+	}
+	if description, goal, err := t.ts.Root(); err == nil {
+		out["task"] = map[string]any{"description": description, "goal": goal}
+	}
+	counts, err := t.ts.NodeCounts()
+	if err != nil {
+		return map[string]any{"error": "图概览读取失败: " + err.Error()}
+	}
+	if goals, _, err := t.ts.ListByKindPage(db.KindGoal, 0, 50); err == nil {
+		gsum := make([]map[string]any, 0, len(goals))
+		for _, g := range goals {
+			var p map[string]any
+			_ = json.Unmarshal(g.Payload, &p)
+			gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
+		}
+		out["goals"] = gsum
+	}
+	if OptimizationEnabled("VESTRAIL_OPT_DATA_CONTRACT") {
+		views, resolved, active, err := t.hintViews(intent, 10)
+		if err != nil {
+			return map[string]any{"error": "提示读取失败: " + err.Error()}
+		}
+		out["hints"], out["hints_resolved_total"], out["hints_truncated"] = views, resolved, active > int64(len(views))
+		if goals, ok := out["goals"].([]map[string]any); ok {
+			for _, g := range goals {
+				g["text"] = truncRuneSummary(g["text"], 240)
+			}
+		}
+	} else {
+		if hints, err := t.ts.ListByKind(db.KindHint, 30); err == nil && len(hints) > 0 {
+			hsum := make([]map[string]any, 0, len(hints))
+			for _, h := range hints {
+				var p map[string]any
+				_ = json.Unmarshal(h.Payload, &p)
+				hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
+				if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
+					hint["traffic_refs"] = p["traffic_refs"]
+				}
+				hsum = append(hsum, hint)
+			}
+			out["hints"] = hsum
+		}
+	}
+	edges, _ := t.ts.Edges(5000)
+	factFrom := map[int64]int64{}
+	var parentIDs []int64
+	for _, e := range edges {
+		if e.Rel == db.RelYields {
+			factFrom[e.To] = e.From
+		}
+		if intent != nil && e.To == intent.ID && (e.Rel == db.RelDerivedFrom || e.Rel == db.RelSpawns) {
+			parentIDs = append(parentIDs, e.From)
+		}
+	}
+	if len(parentIDs) > 0 {
+		parents := make([]map[string]any, 0, len(parentIDs))
+		for _, pidVal := range parentIDs {
+			if n, err := t.ts.GetNodeWithSources(pidVal); err == nil && n != nil {
+				item := compactFact(n)
+				item["kind"] = n.Kind
+				parents = append(parents, item)
+			}
+		}
+		if len(parents) > 0 {
+			out["parent_context"] = parents
+		}
+	}
+	const workerFindingCap = 10
+	if vulnNodes, err := t.ts.ListByKind(db.KindFinding, workerFindingCap); err == nil {
+		_ = t.ts.PopulateFindingTrafficIDs(vulnNodes)
+		fl := make([]map[string]any, 0, len(vulnNodes))
+		for _, n := range vulnNodes {
+			var fp map[string]any
+			_ = json.Unmarshal(n.Payload, &fp)
+			m := map[string]any{"id": n.ID, "summary": truncRuneSummary(fp["summary"], 160), "verification": n.FindingVerification, "finding_status": n.FindingStatus}
+			if from := factFrom[n.ID]; from > 0 {
+				m["from_intent"] = from
+			}
+			fl = append(fl, m)
+		}
+		out["finding_list"] = fl
+	}
+	covered, _ := t.ts.CoveredMembers()
+	const workerFactsCap = 10
+	if factNodes, err := t.ts.ListByKind(db.KindFact, 40); err == nil {
+		recentFacts := make([]map[string]any, 0, workerFactsCap)
+		for _, n := range factNodes {
+			if len(recentFacts) >= workerFactsCap {
+				break
+			}
+			if _, isCovered := covered[n.ID]; isCovered {
+				continue
+			}
+			m := compactNode(n)
+			if s, ok := m["summary"].(string); ok {
+				m["summary"] = truncRuneSummary(s, 140)
+			}
+			if from := factFrom[n.ID]; from > 0 {
+				m["from_intent"] = from
+			}
+			var fp map[string]any
+			if json.Unmarshal(n.Payload, &fp) == nil {
+				if c, ok := fp["confidence"].(string); ok && c != "" {
+					m["confidence"] = c
+				}
+			}
+			recentFacts = append(recentFacts, m)
+		}
+		out["recent_facts"] = recentFacts
+	}
+	out["facts_total"] = counts[db.KindFact]
+	out["findings_total"] = counts[db.KindFinding]
+	if fo, err := t.ts.CountOpenIntents(); err == nil {
+		out["frontier_open"] = fo
+	}
+	if dt, err := t.ts.CountFinishedIntents(); err == nil {
+		out["done_intents_total"] = dt
+	}
+	if sources, err := t.ts.DirectSourceStores(); err == nil && len(sources) > 0 {
+		out["related_tasks_count"] = len(sources)
+	}
+	return out
+}
+
+func truncRuneSummary(v any, maxRunes int) any {
+	s, ok := v.(string)
+	if !ok || maxRunes <= 0 {
+		return v
+	}
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes-1]) + "…"
+}
+
 func inheritedMap(m map[string]any, sourceTaskID int64) map[string]any {
 	m["source_task_id"] = sourceTaskID
 	m["inherited"] = true
@@ -647,8 +817,8 @@ func inheritedMap(m map[string]any, sourceTaskID int64) map[string]any {
 }
 
 const (
-	relatedOverviewTotalTextRunes      = 48_000
-	relatedOverviewMaxTextPerSource    = 8_000
+	relatedOverviewTotalTextRunes      = 12_000
+	relatedOverviewMaxTextPerSource    = 3_000
 	relatedOverviewMaxGoalsPerSource   = 8
 	relatedOverviewMaxHintsPerSource   = 6
 	relatedOverviewMaxFactsPerSource   = 12
@@ -1116,10 +1286,12 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-	Summary   string            `json:"summary"`
-	AssetIDs  []json.RawMessage `json:"asset_ids"`
-	ParentIDs []json.RawMessage `json:"parent_ids"`
-	Priority  int               `json:"priority"`
+	Summary          string            `json:"summary"`
+	Brief            string            `json:"brief,omitempty"`
+	ContinueIntentID json.RawMessage   `json:"continue_intent_id,omitempty"`
+	AssetIDs         []json.RawMessage `json:"asset_ids"`
+	ParentIDs        []json.RawMessage `json:"parent_ids"`
+	Priority         int               `json:"priority"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1127,6 +1299,12 @@ type intentItem struct {
 // 节点（不能挂在别的意图/目标/提示上）。顶层全新方向留空 parent_ids，兜底连 origin fact。
 // 这样"每个意图都连到 fact 节点、且是发现驱动而非凭空规划"从创建路径上被强制。
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
+	if t.ts == nil {
+		return 0, fmt.Errorf("add_intent 需要任务上下文")
+	}
+	lock := intentCreationLock(t.ts.ID())
+	lock.Lock()
+	defer lock.Unlock()
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
@@ -1162,8 +1340,23 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		}
 	}
 	payload := map[string]any{"summary": it.Summary}
+	if brief := strings.TrimSpace(it.Brief); brief != "" {
+		payload["brief"] = truncRuneSummary(brief, 3000)
+		if payload["brief"] != brief {
+			payload["brief_original"] = brief
+			payload["brief_truncated"] = true
+		}
+	}
+	if OptimizationEnabled("VESTRAIL_OPT_INTENT_DEDUP") {
+		if err := t.checkIntentDuplicate(it); err != nil {
+			return 0, err
+		}
+	}
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
+	}
+	if err := t.assignIntentLane(it, payload, anchors, parents); err != nil {
+		return 0, err
 	}
 	// a top-level intent (no explicit parent) connects to the origin fact, so every
 	// intent still traces back to a fact node — at task start the only fact is the
@@ -1181,21 +1374,54 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 }
 
 func (t *ToolSet) addIntent() actool.CoreTool {
+	intentProps := map[string]any{
+		"summary":            str("120–160 字的目标与核心方向索引；详细背景、参数、路径和验证信号放入 brief。"),
+		"brief":              str("完整执行交底：背景线索、凭据/路径、验证信号及止损边界；建议不超过 3000 字。"),
+		"continue_intent_id": intp("可选：本任务已 done/exhausted 的上游意图 id，沿同一执行线复用上下文与脚本目录。"),
+		"asset_ids": map[string]any{
+			"type": "array", "items": map[string]any{"type": "integer"},
+			"description": "本方向要测试的目标资产 id（尽量传，0/1/多个）；是 list_assets 返回的资产 id，不是探索节点 id。仅纯全局侦察无具体资产时留空。",
+		},
+		"parent_ids": map[string]any{
+			"type": "array", "items": map[string]any{"type": "integer"},
+			"description": "上游锚点 id（可选，0/1/多个）：只能填已存在的 fact/finding 节点 id；顶层全新方向留空。",
+		},
+		"priority": intp("优先级 0-10，默认 5"),
+	}
+	topProps := map[string]any{
+		"intents": map[string]any{
+			"type":        "array",
+			"description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素支持 summary/brief/continue_intent_id/asset_ids/parent_ids/priority。返回 ids 与数组等长、同序。",
+			"items":       obj(intentProps, "summary"),
+		},
+		"resolved_hint_ids": map[string]any{
+			"type":        "array",
+			"description": "可选：本轮已转化为意图或已处理的 hint 节点 id，顺手标为 resolved 避免重复注入。",
+			"items":       map[string]any{"type": "integer", "minimum": 1},
+		},
+	}
+	for key, value := range intentProps {
+		topProps[key] = value
+	}
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
-		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
-			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
-			"priority":   intp("优先级 0-10，默认5"),
-		}),
+		obj(topProps),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				Intents    []intentItem `json:"intents"`
-				intentItem              // 单条模式：顶层 summary/asset_ids/parent_ids/priority
+				Intents         []intentItem      `json:"intents"`
+				ResolvedHintIDs []json.RawMessage `json:"resolved_hint_ids"`
+				intentItem                        // 单条模式：顶层 summary/asset_ids/parent_ids/priority
 			}
 			_ = json.Unmarshal(in, &a)
+			var hintIDs []int64
+			for _, raw := range a.ResolvedHintIDs {
+				id := pid(raw)
+				n, err := t.ts.GetNode(id)
+				if id <= 0 || err != nil || n == nil || n.Kind != db.KindHint {
+					return actool.Errorf("resolved_hint_ids 必须是本任务的 hint 节点"), nil
+				}
+				hintIDs = append(hintIDs, id)
+			}
 			batch := len(a.Intents) > 0
 			items := a.Intents
 			if !batch {
@@ -1222,14 +1448,29 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			if createdAny && t.resumeTask != nil {
 				t.resumeTask()
 			}
+			hintError := ""
+			if createdAny && len(errs) == 0 && len(hintIDs) > 0 {
+				if err := t.ts.ResolveHints(hintIDs, "已转化为本轮创建的意图"); err != nil {
+					hintError = err.Error()
+				}
+			} else if len(hintIDs) > 0 {
+				hintError = "部分意图未创建，提示保持 active"
+			}
 
 			if !batch { // 单条：保持原返回
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
-				return actool.Text(fmt.Sprintf("intent created: %d", ids[0])), nil
+				result := fmt.Sprintf("intent created: %d", ids[0])
+				if hintError != "" {
+					result += "\n提示未关闭：" + hintError
+				}
+				return actool.Text(result), nil
 			}
 			out := map[string]any{"ids": ids}
+			if hintError != "" {
+				out["hints_not_resolved"] = hintError
+			}
 			if len(errs) > 0 {
 				out["errors"] = errs
 			}
@@ -1355,7 +1596,14 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		iid := pid(a.IntentID)
+		if t.workerIntentID > 0 {
+			if iid > 0 && iid != t.workerIntentID {
+				return actool.Errorf(fmt.Sprintf("写回 intent_id 必须为当前执行意图 #%d", t.workerIntentID)), nil
+			}
+			iid = t.workerIntentID
+		}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: iid, VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1433,6 +1681,12 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	intent := pid(it.IntentID)
 	if intent <= 0 {
 		intent = defaultIntent
+	}
+	if t.workerIntentID > 0 {
+		if intent > 0 && intent != t.workerIntentID {
+			return 0, fmt.Errorf("写回 intent_id 必须为当前执行意图 #%d", t.workerIntentID)
+		}
+		intent = t.workerIntentID
 	}
 	if intent > 0 {
 		node, err := t.ts.GetNode(intent)
@@ -2154,7 +2408,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
-		t.killWorkTool(), t.steerWorkTool(),
+		t.killWorkTool(), t.steerWorkTool(), t.resolveHint(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),
 		// list_companies：查看企业列表 + scope + 资产数（拿 company_id / 理解归属范围）。

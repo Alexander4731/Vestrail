@@ -61,7 +61,7 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 	// applyIntercept below. Other tools record an empty command.
 	var cmd string
 	switch ev.ToolName {
-	case "Bash", "shell_open":
+	case "Bash", "shell_open", "RunScript":
 		var in struct {
 			Command string `json:"command"`
 		}
@@ -177,7 +177,7 @@ var reBlocked = regexp.MustCompile(`(?i)\b(403|forbidden|waf|blocked|rate.?limit
 // results into blocked / error / ok so the planner can change strategy instead
 // of giving up at a WAF.
 func (g *Guard) postToolUse(_ context.Context, ev hook.Event) hook.Result {
-	if ev.ToolName != "Bash" {
+	if ev.ToolName != "Bash" && ev.ToolName != "RunScript" {
 		return hook.Result{}
 	}
 	class := "ok"

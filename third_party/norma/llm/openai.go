@@ -18,6 +18,7 @@ type oaMessage struct {
 	ReasoningContent string       `json:"reasoning_content,omitempty"`
 	ToolCalls        []oaToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string       `json:"tool_call_id,omitempty"`
+	OmitReasoning    bool         `json:"-"`
 }
 
 type oaToolCall struct {
@@ -88,14 +89,34 @@ type oaStreamOpts struct {
 // assistant tool_use → tool_calls; user-embedded tool_result → standalone
 // role:tool messages; system prompt → leading system message (FR-03.6).
 func toOpenAIMessages(system string, msgs []Message) []oaMessage {
+	return toOpenAIMessagesWithPolicy(system, msgs, false)
+}
+
+func toOpenAIMessagesWithPolicy(system string, msgs []Message, preserve bool) []oaMessage {
 	out := make([]oaMessage, 0, len(msgs)+1)
 	if system != "" {
 		out = append(out, oaMessage{Role: "system", Content: system})
 	}
-	for _, m := range msgs {
+	lastPlainUser := -1
+	for i, m := range msgs {
+		if m.Role != RoleUser {
+			continue
+		}
+		plain := true
+		for _, block := range m.Content {
+			if block.Type == BlockToolResult {
+				plain = false
+				break
+			}
+		}
+		if plain {
+			lastPlainUser = i
+		}
+	}
+	for i, m := range msgs {
 		switch m.Role {
 		case RoleAssistant:
-			om := oaMessage{Role: "assistant"}
+			om := oaMessage{Role: "assistant", OmitReasoning: !preserve && i <= lastPlainUser}
 			var text strings.Builder
 			var reasoning strings.Builder
 			for _, b := range m.Content {
@@ -127,7 +148,7 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 				}
 			}
 			om.Content = text.String()
-			if s := reasoning.String(); s != "" {
+			if s := reasoning.String(); s != "" && (preserve || i > lastPlainUser) {
 				om.ReasoningContent = s
 			}
 			// OpenAI requires every assistant message to carry content or
@@ -207,7 +228,7 @@ func sanitizeOpenAIMessages(msgs []oaMessage, thinking bool) []oaMessage {
 			}
 		}
 		msgs[i].ToolCalls = kept
-		if thinking && len(kept) > 0 && msgs[i].ReasoningContent == "" {
+		if thinking && len(kept) > 0 && msgs[i].ReasoningContent == "" && !msgs[i].OmitReasoning {
 			msgs[i].ReasoningContent = reasoningElidedPlaceholder
 		}
 		// An assistant message must carry content or tool_calls; a turn emptied by
@@ -256,7 +277,7 @@ func (p *openaiProvider) buildBody(req CompletionRequest, stream bool) ([]byte, 
 	// same providers that then demand reasoning_content be echoed back.
 	thinking := thinkingType != "" || p.cfg.ReasoningEffort != ""
 
-	msgs := toOpenAIMessages(joinSystem(req.System), req.Messages)
+	msgs := toOpenAIMessagesWithPolicy(joinSystem(req.System), req.Messages, req.PreserveReasoningHistory)
 	if p.cfg.OmitThoughtSignatures {
 		for i := range msgs {
 			for j := range msgs[i].ToolCalls {

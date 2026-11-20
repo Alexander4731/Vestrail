@@ -10,10 +10,24 @@ import (
 )
 
 func TestDeferredSystem_NoGlobal(t *testing.T) {
-	// No global MCP names → plain single-segment system, no cache boundary.
+	// No global deferred names → single static system segment, still cached (boundary=1).
 	sys, boundary := deferredSystem("SYS", DeferredInfo{})
-	if len(sys) != 1 || sys[0] != "SYS" || boundary != 0 {
-		t.Fatalf("expected [SYS],0 — got %v,%d", sys, boundary)
+	if len(sys) != 1 || sys[0] != "SYS" || boundary != 1 {
+		t.Fatalf("expected [SYS],1 — got %v,%d", sys, boundary)
+	}
+}
+
+func TestDeferredSystemWithDynamic(t *testing.T) {
+	def := DeferredInfo{
+		Deferred:    []string{"node_detail"},
+		GlobalNames: []string{"node_detail"},
+	}
+	sys, boundary := deferredSystemWithDynamic("STATIC", "DYNAMIC-INTENT", def)
+	if len(sys) != 3 || sys[0] != "STATIC" || sys[2] != "DYNAMIC-INTENT" {
+		t.Fatalf("unexpected segments: %v", sys)
+	}
+	if boundary != 2 {
+		t.Fatalf("boundary=%d want 2 (static + deferred block cached, dynamic tail uncached)", boundary)
 	}
 }
 

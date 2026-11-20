@@ -2,6 +2,8 @@ package compaction
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -10,16 +12,21 @@ import (
 
 // Summary generation constants (== claude-code).
 const (
-	compactMaxOutputTokens = 20000                                                   // COMPACT_MAX_OUTPUT_TOKENS
-	maxPTLRetries          = 3                                                       // MAX_PTL_RETRIES
-	maxStreamingRetries    = 2                                                       // MAX_COMPACT_STREAMING_RETRIES
-	ptlRetryMarker         = "[earlier conversation truncated for compaction retry]" // PTL_RETRY_MARKER
+	compactMaxOutputTokens        = 20000                                                   // COMPACT_MAX_OUTPUT_TOKENS
+	conciseCompactMaxOutputTokens = 4096                                                    // lean summary cap (no discarded <analysis>)
+	maxPTLRetries                 = 3                                                       // MAX_PTL_RETRIES
+	maxStreamingRetries           = 2                                                       // MAX_COMPACT_STREAMING_RETRIES
+	ptlRetryMarker                = "[earlier conversation truncated for compaction retry]" // PTL_RETRY_MARKER
 )
 
 // summarySystemPrompt is the summarizer's system prompt (== claude-code
 // streamCompactSummary fallback path). Thinking is disabled and no tools are
 // offered; the no-tools guardrails live in the user prompt (§7).
 const summarySystemPrompt = "You are a helpful AI assistant tasked with summarizing conversations."
+
+// ErrIncompleteSummary means the response cannot safely replace conversation
+// context. Retrying the same output cap does not repair an incomplete response.
+var ErrIncompleteSummary = errors.New("compaction: incomplete summary")
 
 // ProviderSummarizer builds a Summarizer backed by an llm.Provider. It replays
 // the real conversation messages (not a rendered text transcript) followed by the
@@ -28,7 +35,17 @@ const summarySystemPrompt = "You are a helpful AI assistant tasked with summariz
 // (MAX_COMPACT_STREAMING_RETRIES) and, if the summary request itself overflows,
 // drops the oldest API-round groups and retries (MAX_PTL_RETRIES).
 func ProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) Summarizer {
-	maxOut := compactMaxOutputTokens
+	return buildProviderSummarizer(p, maxOutputTokens, compactMaxOutputTokens, compactPrompt, nonStreaming)
+}
+
+// ConciseProviderSummarizer is a token-efficient Summarizer variant that omits
+// the discarded <analysis> scratchpad and caps output at 4096 tokens.
+func ConciseProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) Summarizer {
+	return buildProviderSummarizer(p, maxOutputTokens, conciseCompactMaxOutputTokens, conciseCompactPrompt, nonStreaming)
+}
+
+func buildProviderSummarizer(p llm.Provider, maxOutputTokens, defaultCap int, prompt string, nonStreaming bool) Summarizer {
+	maxOut := defaultCap
 	if maxOutputTokens > 0 && maxOutputTokens < maxOut {
 		maxOut = maxOutputTokens
 	}
@@ -36,7 +53,7 @@ func ProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) 
 		work := pairForReplay(msgs)
 		var lastErr error
 		for attempt := 0; attempt <= maxPTLRetries; attempt++ {
-			raw, err := streamSummary(ctx, p, maxOut, work, nonStreaming)
+			raw, err := streamSummaryWithPrompt(ctx, p, maxOut, work, prompt, nonStreaming)
 			if err == nil {
 				return formatCompactSummary(raw), nil
 			}
@@ -58,40 +75,61 @@ func ProviderSummarizer(p llm.Provider, maxOutputTokens int, nonStreaming bool) 
 // retrying transient (non-overflow) stream failures. Overflow is returned
 // immediately so the caller can truncate and retry at a coarser granularity.
 func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message, nonStreaming bool) (string, error) {
+	return streamSummaryWithPrompt(ctx, p, maxOut, head, compactPrompt, nonStreaming)
+}
+
+func streamSummaryWithPrompt(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message, prompt string, nonStreaming bool) (string, error) {
 	reqMsgs := make([]llm.Message, 0, len(head)+1)
 	reqMsgs = append(reqMsgs, head...)
-	reqMsgs = append(reqMsgs, llm.UserText(compactPrompt))
+	reqMsgs = append(reqMsgs, llm.UserText(prompt))
 	req := llm.CompletionRequest{
-		System:    []string{summarySystemPrompt},
-		Messages:  reqMsgs,
-		MaxTokens: maxOut,
-		Thinking:  "disabled",
+		System:          []string{summarySystemPrompt},
+		DynamicBoundary: 1,
+		Messages:        reqMsgs,
+		MaxTokens:       maxOut,
+		Thinking:        "disabled",
 	}
 	var lastErr error
 	for range maxStreamingRetries {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		var text string
+		var msg llm.Message
+		var stop string
 		var callErr error
 		if nonStreaming {
-			msg, _, _, err := p.Complete(ctx, req)
-			text, callErr = msg.Text(), err
+			msg, stop, _, callErr = p.Complete(ctx, req)
 		} else {
 			acc := llm.NewAccumulator()
+			finished := false
 			for ev, err := range p.Stream(ctx, req) {
 				if err != nil {
 					callErr = err
 					break
 				}
 				acc.Add(ev)
+				if ev.Type == llm.SEMessageStop {
+					finished = true
+				}
 			}
 			if callErr == nil {
-				text = acc.Message().Text()
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
+				if !finished {
+					return "", fmt.Errorf("%w: stream ended without message_stop", ErrIncompleteSummary)
+				}
+				msg, stop = acc.Message(), acc.StopReason
 			}
 		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		if callErr == nil {
-			return text, nil
+			if err := validateSummary(msg, stop); err != nil {
+				return "", err
+			}
+			return msg.Text(), nil
 		}
 		if IsOverflow(callErr) {
 			return "", callErr // PTL — let the caller truncate, don't burn streaming retries
@@ -99,6 +137,25 @@ func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.M
 		lastErr = callErr // transient — retry
 	}
 	return "", lastErr
+}
+
+func validateSummary(msg llm.Message, stop string) error {
+	switch stop {
+	case "end_turn", "stop_sequence", "stop":
+	default:
+		return fmt.Errorf("%w: unexpected stop reason %q", ErrIncompleteSummary, stop)
+	}
+	if len(msg.ToolUses()) > 0 {
+		return fmt.Errorf("%w: response contains tool calls", ErrIncompleteSummary)
+	}
+	raw := msg.Text()
+	body := summaryRe.FindStringSubmatch(analysisRe.ReplaceAllString(raw, ""))
+	if strings.Count(raw, "<summary>") != 1 || strings.Count(raw, "</summary>") != 1 ||
+		len(body) != 2 || strings.TrimSpace(body[1]) == "" ||
+		strings.Count(raw, "<analysis>") != strings.Count(raw, "</analysis>") {
+		return fmt.Errorf("%w: expected one closed, non-empty summary block", ErrIncompleteSummary)
+	}
+	return nil
 }
 
 // pairForReplay drops dangling tool_use / tool_result blocks so the replayed head
@@ -219,6 +276,19 @@ func formatCompactSummary(raw string) string {
 // compactPrompt is the full summary-request user message:
 // NO_TOOLS_PREAMBLE + BASE_COMPACT_PROMPT + NO_TOOLS_TRAILER (§7).
 var compactPrompt = noToolsPreamble + baseCompactPrompt + noToolsTrailer
+
+// conciseCompactPrompt outputs only <summary> directly (no discarded <analysis>
+// scratchpad), cutting summary output tokens by ~60-75% while preserving every
+// actionable fact, path, credential, dead-end, and next step.
+const conciseCompactPrompt = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+Summarize the conversation concisely inside a single <summary>...</summary> block (do NOT write an <analysis> section or preamble). Preserve every concrete technical fact needed to resume seamlessly without repeating work:
+1. Primary Task & Constraints: user requests, scope/constraints, exact target URLs/hosts/IDs.
+2. Verified Findings & Evidence: observed responses, confirmed endpoints/parameters/versions/credentials, saved file paths (including cmd-output/ paths), node/asset/finding IDs already recorded.
+3. Failed / Ruled-Out Paths: exact payloads, endpoints, or hypotheses already tested and why they failed (so they are not retried).
+4. Current Work & Pending Next Steps: exact hypothesis in progress, unrecorded discoveries that still need write-back, and the immediate next action.
+
+Be dense, exact, and factual. Omit prose filler and redundant raw logs.`
 
 // noToolsPreamble == claude-code NO_TOOLS_PREAMBLE (prompt.ts:19-26).
 const noToolsPreamble = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.

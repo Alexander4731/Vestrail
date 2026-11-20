@@ -16,10 +16,13 @@ import (
 
 // QueryInput is a fully-resolved request to run the loop.
 type QueryInput struct {
-	Provider        llm.Provider
-	System          []string
-	DynamicBoundary int
-	Messages        []llm.Message // conversation including the latest user turn
+	// PreserveReasoningHistory keeps completed reasoning in stable execution chains.
+	PreserveReasoningHistory bool
+	LastInputTokens          int
+	Provider                 llm.Provider
+	System                   []string
+	DynamicBoundary          int
+	Messages                 []llm.Message // conversation including the latest user turn
 	// SystemReminder, when non-empty, is prepended as the first message on each
 	// model call. It is not stored in conversation history — the host builds it
 	// fresh per Prompt call so it never accumulates across turns.
@@ -106,9 +109,10 @@ type QueryInput struct {
 
 // Settlement configures the wrap-up phase that runs when a budget is hit.
 type Settlement struct {
-	Prompt        string   // wrap-up instruction injected as a user turn (empty = settlement off)
-	MaxTurns      int      // turn budget for the wrap-up phase itself (0 = default 2)
-	DisabledTools []string // tool names hidden from the model during wrap-up (e.g. ["Bash"])
+	PreserveThinking bool     // opt out of disabling thinking during wrap-up
+	Prompt           string   // wrap-up instruction injected as a user turn (empty = settlement off)
+	MaxTurns         int      // turn budget for the wrap-up phase itself (0 = default 2)
+	DisabledTools    []string // tool names hidden from the model during wrap-up (e.g. ["Bash"])
 	// PromptByReason optionally overrides Prompt based on WHY the run settled
 	// (keyed by the terminal reason, e.g. ReasonTimeout / ReasonMaxTurns). When the
 	// settling reason has a non-empty entry here it is used; otherwise Prompt is used.
@@ -206,6 +210,7 @@ func Query(ctx context.Context, in QueryInput, deps QueryDeps) iter.Seq2[Event, 
 	}
 	return func(yield func(Event, error) bool) {
 		l := &loop{ctx: ctx, in: in, deps: deps, yield: yield, sem: make(chan struct{}, conc)}
+		l.lastInputTokens = in.LastInputTokens
 		l.messages = append([]llm.Message(nil), in.Messages...)
 		l.run()
 	}
@@ -789,12 +794,16 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		msgs = append([]llm.Message{llm.UserText(l.in.SystemReminder)}, msgs...)
 	}
 	req := llm.CompletionRequest{
-		System:          l.in.System,
-		DynamicBoundary: l.in.DynamicBoundary,
-		Messages:        msgs,
-		Tools:           schemas,
-		MaxTokens:       l.maxTokens(),
-		Temperature:     l.in.Temperature,
+		PreserveReasoningHistory: l.in.PreserveReasoningHistory,
+		System:                   l.in.System,
+		DynamicBoundary:          l.in.DynamicBoundary,
+		Messages:                 msgs,
+		Tools:                    schemas,
+		MaxTokens:                l.maxTokens(),
+		Temperature:              l.in.Temperature,
+	}
+	if l.settling && !l.in.Settlement.PreserveThinking {
+		req.Thinking = "disabled"
 	}
 	if l.in.NonStreaming {
 		return l.completeAndExecute(req)

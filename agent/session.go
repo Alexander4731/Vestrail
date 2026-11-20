@@ -15,6 +15,9 @@ import (
 )
 
 func newAgentSession(opts agentcore.Options) *agentcore.Session {
+	if !OptimizationEnabled("VESTRAIL_OPT_REASONING_HISTORY") {
+		opts.PreserveReasoningHistory = true
+	}
 	if opts.Tools == nil {
 		opts.Tools = tool.DefaultTools()
 	}

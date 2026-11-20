@@ -23,6 +23,9 @@ import (
 // assets, judges whether the task goal is met, and emits 0..N exploration intents
 // into the frontier. It is the sole intent generator.
 type Planner struct {
+	epochMu           sync.Mutex
+	epochs            map[int64]*plannerEpochState
+	bootTag           string
 	guard             *guard.Guard
 	runTimeout        time.Duration
 	findingRecorder   FindingRecorder
@@ -349,6 +352,9 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
+	if OptimizationEnabled("VESTRAIL_OPT_DATA_CONTRACT") {
+		body += "\nadd_intent 的 summary 只写120–160字的目标与核心方向；背景、参数、路径、验证信号和停止边界放入 brief。已转化或排除的提示用 resolved_hint_ids 或 resolve_hint 标记。"
+	}
 	return body + plannerFocusContract + artifactSpec(workDir)
 }
 
@@ -361,6 +367,15 @@ func plannerSystem(goal, dataDir, workDir string) string {
 // for time/heartbeat wakes). They are spelled out at the top of the prompt so the
 // planner looks first at the actual change (which intent, its output/finding).
 func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, goal string, triggers []TriggerEvent, emit func(db.Activity)) (met bool, reason string, err error) {
+	st := p.epochFor(ts.ID())
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	epochCtx := ctx
+	defer func() {
+		if err != nil || epochCtx.Err() != nil {
+			st.close()
+		}
+	}()
 	ctx = intercept.WithTaskContext(ctx, fmt.Sprint(taskID), "planner", emit)
 	// cold-digest §2.3/§7: advance this task's planner-round counter, maintain the
 	// cold_since_round stamps, and (if a threshold is hit) kick off background
@@ -381,22 +396,49 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}
-	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
-	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
-	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
+	// 领域工具 + 精简只读/探测基础工具（规划者不写/改文件也不 sleep，剔除 Write/Edit/MultiEdit/sleep）。
+	// 资产覆盖度功能关闭时剔除 list_untested_assets（不入 prompt）。
+	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), defaultToolsExcept("Write", "Edit", "MultiEdit", "sleep")...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(ctx, "planner", base)
-	defer cleanup()
-	if taskClockFrom(ctx).Final {
-		tools = finalPlannerTools(tools)
-		def = DeferredInfo{}
-	}
+	keepCleanup := false
+	defer func() {
+		if !keepCleanup {
+			cleanup()
+		}
+	}()
 	// 关键态势（刚完成的意图 + 预取的完整图）改放【本轮 user 输入】(见下方 input)，system
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
 	// 被 compaction 压缩（planner 单轮通常短，风险低）。situational 会拼进下方 input。
 	overview := tsx.graphOverviewData()
 	if problem, ok := overview["error"]; ok {
 		return false, "", fmt.Errorf("%v", problem)
+	}
+	hasFacts := false
+	switch fc := overview["facts"].(type) {
+	case int64:
+		hasFacts = fc > 0
+	case int:
+		hasFacts = fc > 0
+	}
+	if taskClockFrom(ctx).Final {
+		tools = finalPlannerTools(tools)
+		def = DeferredInfo{}
+	} else {
+		// Low-frequency planner management tools are deferred (schema withheld,
+		// callable on demand via SearchExtraTools / ExecuteExtraTool). Once facts
+		// already exist, probing tools (Bash/Read/LS/Glob/Grep) are also deferred
+		// in lockstep with the planner's "no self-probing once facts exist" rule.
+		deferNames := []string{
+			"add_company_scope", "list_companies", "expand_digest",
+			"search_all_worker_traces", "list_goals",
+			"list_coverage_checks", "record_coverage_check", "resolve_hint",
+		}
+		if hasFacts && OptimizationEnabled("VESTRAIL_OPT_PLANNER_SLIM") {
+			tools = plannerToolsWithoutBash(tools)
+			deferNames = append(deferNames, "Read", "LS", "Glob", "Grep")
+		}
+		def = deferBuiltinTools(tools, def, deferNames...)
 	}
 	situational := renderTriggers(ts, triggers) + renderGraphOverview(overview)
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
@@ -412,6 +454,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	sysBody := plannerSystem(goal, p.workDir, taskDir)
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
+	}
+	if OptimizationEnabled("VESTRAIL_OPT_STICKY_PLANNER") {
+		tools, def = stableSessionTools(tools, def)
 	}
 	system, boundary := deferredSystem(sysBody, def)
 	roundLimit := p.runTimeout
@@ -433,25 +478,27 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
-		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
+		EnableWebFetch:  !hasFacts, // 仅开局无事实时开放轻量探测；已有 fact 后关闭以省 schema
 		WebFetchProxy:   p.proxyAddr,
 		WebFetchCACert:  p.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
-		EnableWebSearch:       p.webSearch.Enabled,
-		WebSearchBackend:      p.webSearch.Backend,
-		BraveSearchAPIKey:     p.webSearch.BraveKey,
-		TavilySearchAPIKey:    p.webSearch.TavilyKey,
-		DeepSeekSearchBaseURL: p.webSearch.DeepSeekBaseURL,
-		DeepSeekSearchAPIKey:  p.webSearch.DeepSeekAPIKey,
-		DeepSeekSearchModel:   p.webSearch.DeepSeekModel,
-		WebSearchProxy:        p.webSearch.Proxy,
-		BashEnv:               proxyEnv(p.proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
-		WorkingDir:            taskDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
-		ToolOutputDir:         cmdOutDir(taskDir),
-		MaxTurns:              p.maxTurns, // 0 = unlimited (configurable in agent management)
-		MaxDuration:           maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
-		Compaction:            compactionConfig(p.compactionWindow()),
+		EnableWebSearch:        p.webSearch.Enabled,
+		WebSearchBackend:       p.webSearch.Backend,
+		BraveSearchAPIKey:      p.webSearch.BraveKey,
+		TavilySearchAPIKey:     p.webSearch.TavilyKey,
+		DeepSeekSearchBaseURL:  p.webSearch.DeepSeekBaseURL,
+		DeepSeekSearchAPIKey:   p.webSearch.DeepSeekAPIKey,
+		DeepSeekSearchModel:    p.webSearch.DeepSeekModel,
+		WebSearchProxy:         p.webSearch.Proxy,
+		BashEnv:                proxyEnv(p.proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
+		WorkingDir:             taskDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
+		ToolOutputDir:          cmdOutDir(taskDir),
+		MaxToolOutputChars:     defaultToolOutputChars,
+		DisableBackgroundTasks: true,       // planner 不运行后台长任务，省去 4 个后台工具 schema
+		MaxTurns:               p.maxTurns, // 0 = unlimited (configurable in agent management)
+		MaxDuration:            maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
+		Compaction:             compactionConfig(p.compactionWindow()),
 		// 跨唤醒共享的规划待办：让串行链在多轮之间保留（session 是新的，store 不是）。
 		Todos: p.todoFor(ts.ID()),
 		// 命中【本轮】步数预算→ SDK 跑收尾:把本轮已想清楚的结论落地(该派的 add_intent、
@@ -493,6 +540,25 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	input := lead + situational + "\n\n根据证据判断目标，已达成时用 prove_goal 确认。仍有 open/running 意图时可以等待结果；没有有效的新方向时说明缺少的证据或用户输入，不要重复派发已经完成的动作。" +
 		renderPlannerTodos(opts.Todos.List())
 
+	sticky := OptimizationEnabled("VESTRAIL_OPT_STICKY_PLANNER") && (p.noaEnabledFn == nil || !p.noaEnabledFn())
+	if sticky {
+		opts.PreserveReasoningHistory = true
+		// The top-level goal is already in SystemPrompt; subgoal state travels in the delta.
+		digest := plannerOptionsDigest(opts, def, p.model+providerCacheIdentity(p.prov))
+		// Review hooks must use the bound tools retained by this epoch.
+		reviewTools := tools
+		if !st.rollover(digest, tc.Final) {
+			reviewTools = st.sessionTools()
+		}
+		opts.Hooks = guard.WithToolReview(opts.Hooks, reviewTools)
+		end := "\n\n根据证据判断目标，已达成时用 prove_goal 确认。仍有 open/running 意图时可以等待结果；没有有效的新方向时说明缺少的证据或用户输入，不要重复派发已经完成的动作。" + renderPlannerTodos(opts.Todos.List())
+		if tc.Final {
+			end += "\n\n【任务终局收尾】：" + resolveTaskTimeoutWrapup("planner")
+		}
+		met, reason, err, keepCleanup = p.runEpoch(ctx, st, ts, tsx, opts, def, cleanup, digest, lead, end, overview, triggers, emit)
+		return met, reason, err
+	}
+	st.close()
 	_, _, err = captureRun(ctx, opts, input,
 		func(r db.Activity) {
 			if emit != nil {

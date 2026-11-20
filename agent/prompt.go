@@ -21,10 +21,9 @@ type MainVars struct{ Goal, AssetSummary, FindingsSummary, DataDir, Now string }
 type GoalsVars struct{ EngagementDescription, DataDir, Now string }
 
 // nowStr is the server-local wall-clock string exposed as the universal {{.Now}}
-// prompt variable. renderSystem runs on every agent turn/round, so this is fresh
-// each run — a prompt can subtract it from a fixed start stamp to reason about
-// elapsed time (e.g. a timed benchmark's "last N hours" window).
-func nowStr() string { return time.Now().Format("2006-01-02 15:04:05 MST") }
+// prompt variable. Rounded to hour granularity so custom prompts referencing
+// {{.Now}} do not bust prompt caches on every turn/round.
+func nowStr() string { return time.Now().Format("2006-01-02 15:00 MST") }
 
 // renderSystem returns the rendered system-prompt BODY (段 [A]) for agentKey.
 // Precedence: the DB-stored template (if any) over the built-in default template

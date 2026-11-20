@@ -21,9 +21,11 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 	transcriptFile := filepath.Join(dataDir, "transcripts", "exp73-worker-1.jsonl")
 	unrelatedTranscript := filepath.Join(dataDir, "transcripts", "exp74-worker-1.jsonl")
 	for path, body := range map[string]string{
-		taskFile:            "task evidence",
-		transcriptFile:      "transcript",
-		unrelatedTranscript: "leave me hot",
+		taskFile:                         "task evidence",
+		transcriptFile:                   "transcript",
+		transcriptFile + ".working.json": "working snapshot",
+		transcriptFile + ".lane.json":    "lane metadata",
+		unrelatedTranscript:              "leave me hot",
 	} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)

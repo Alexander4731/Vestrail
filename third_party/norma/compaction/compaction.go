@@ -36,12 +36,32 @@ type Summarizer func(ctx context.Context, msgs []llm.Message) (string, error)
 type Config struct {
 	// ContextWindow is the model's total context window in tokens (default 200000).
 	ContextWindow int
+	// SoftWindow optionally caps the effective context window used to derive
+	// MicroCompact and AutoCompact thresholds (0 = use ContextWindow). Keeps
+	// multi-turn tool loops compact on 200K/1M models without changing hard limits.
+	SoftWindow int
 	// MaxOutputTokens is the model's max output capability; the summary reservation
 	// is min(MaxOutputTokens, 20000) (default 8000).
 	MaxOutputTokens int
 	// KeepRecent is the number of recent messages AutoCompact always preserves as
-	// the un-summarized tail (default 8). MicroCompact uses its own microKeepRecent.
+	// the un-summarized tail (default 8). MicroCompact uses MicroKeepRecent.
 	KeepRecent int
+	// MicroKeepRecent overrides microKeepRecent (0 = default 5).
+	MicroKeepRecent int
+	// MicroBatchGrowth enables cache-friendly hysteresis for MicroCompact: after
+	// a MicroCompact sweep, further sweeps are deferred until tokens grow by at
+	// least MicroBatchGrowth (unless AutoCompact is reached), keeping the prompt
+	// prefix byte-stable across intermediate turns so prompt caches hit.
+	MicroBatchGrowth int
+	// ExtraCompactable lists additional host/domain tool names eligible for
+	// MicroCompact beyond the built-in SDK tools.
+	ExtraCompactable []string
+	// ConciseSummary enables leaner AutoCompact summarization (skips discarded
+	// <analysis> scratchpad and uses tighter post-compact skill re-injection caps).
+	ConciseSummary bool
+	// Re-surface the latest current-task handoff when it falls behind a boundary.
+	PinnedUserPrefix    string
+	PinnedUserEndMarker string
 }
 
 func (c *Config) defaults() {
@@ -65,6 +85,7 @@ var compactableTools = map[string]bool{
 }
 
 const (
+	microClearedPrefix    = "[Old tool result content cleared"
 	microClearedMessage   = "[Old tool result content cleared]" // == claude-code TIME_BASED_MC_CLEARED_MESSAGE
 	microKeepRecent       = 5                                   // == claude-code KEEP_RECENT (compactable results kept)
 	toolResultGrowthGuess = 15000                               // == claude-code TOOL_RESULT_GROWTH_ESTIMATE
@@ -73,16 +94,27 @@ const (
 
 // Compactor applies the strategy. Construct with New.
 type Compactor struct {
-	cfg       Config
-	summarize Summarizer
-	failures  int
-	tripped   bool
+	cfg              Config
+	summarize        Summarizer
+	extraCompactable map[string]bool
+	lastMicroTokens  int
+	failures         int
+	tripped          bool
 }
 
 // New builds a Compactor. summarize may be nil to disable AutoCompact.
 func New(cfg Config, summarize Summarizer) *Compactor {
 	cfg.defaults()
-	return &Compactor{cfg: cfg, summarize: summarize}
+	var extra map[string]bool
+	if len(cfg.ExtraCompactable) > 0 {
+		extra = make(map[string]bool, len(cfg.ExtraCompactable))
+		for _, name := range cfg.ExtraCompactable {
+			if name != "" {
+				extra[name] = true
+			}
+		}
+	}
+	return &Compactor{cfg: cfg, summarize: summarize, extraCompactable: extra}
 }
 
 // --- threshold math ---
@@ -96,7 +128,13 @@ func (c *Compactor) reservedForSummary() int {
 	}
 	return r
 }
-func (c *Compactor) effectiveWindow() int { return c.cfg.ContextWindow - c.reservedForSummary() }
+func (c *Compactor) effectiveWindow() int {
+	cw := c.cfg.ContextWindow
+	if c.cfg.SoftWindow > 0 && c.cfg.SoftWindow < cw {
+		cw = c.cfg.SoftWindow
+	}
+	return cw - c.reservedForSummary()
+}
 
 // buffer tiers off the EFFECTIVE window (== claude-code getAutocompactBufferTokens).
 func (c *Compactor) buffer() int {
@@ -114,8 +152,11 @@ func (c *Compactor) microThreshold() int { return c.effectiveWindow() * 6 / 10 }
 
 // maxTurnGrowth == claude-code estimateMaxTurnGrowth: min(maxOutput,20000)+15000.
 func (c *Compactor) maxTurnGrowth() int { return c.reservedForSummary() + toolResultGrowthGuess }
+func (c *Compactor) hardEffectiveWindow() int {
+	return c.cfg.ContextWindow - c.reservedForSummary()
+}
 func (c *Compactor) predictiveOver(tok int) bool {
-	return tok+c.maxTurnGrowth() > c.effectiveWindow()
+	return tok+c.maxTurnGrowth() > c.hardEffectiveWindow()
 }
 
 // count returns the token count of the API view (post-boundary). When
@@ -178,17 +219,33 @@ func (c *Compactor) Pre(ctx context.Context, msgs []llm.Message, lastInputTokens
 	if tok <= c.microThreshold() {
 		return msgs
 	}
-	// MicroCompact: clear old COMPACTABLE tool results (non-destructive). Only
-	// re-estimate when it actually changed the array; otherwise the gate count
-	// (which prefers the accurate last-response size) still holds.
-	if out, changed := c.microCompact(msgs); changed {
-		msgs = out
-		tok = c.count(msgs, 0)
+	// MicroCompact: clear old COMPACTABLE tool results (non-destructive). When
+	// MicroBatchGrowth > 0, defer repeated sweeps until tokens grow by that batch
+	// step (unless AutoCompact is imminent) so intermediate turns preserve their
+	// prompt-cache prefix.
+	allowMicro := true
+	if c.cfg.MicroBatchGrowth > 0 && c.lastMicroTokens > 0 &&
+		tok < c.lastMicroTokens+c.cfg.MicroBatchGrowth &&
+		tok < c.autoThreshold() && !c.predictiveOver(tok) {
+		allowMicro = false
+	}
+	if allowMicro {
+		beforeEst := c.count(msgs, 0)
+		if out, changed := c.microCompact(msgs); changed {
+			msgs = out
+			afterEst := c.count(msgs, 0)
+			// Subtract only the estimated savings from the original gate count.
+			// Replacing provider usage with a message-only estimate loses system,
+			// tool-schema and tokenizer overhead, resetting the growth delay.
+			tok = max(afterEst, tok-max(0, beforeEst-afterEst))
+			c.lastMicroTokens = tok
+		}
 	}
 	// AutoCompact: at the threshold, or predictively if the next turn would overflow.
 	if tok >= c.autoThreshold() || c.predictiveOver(tok) {
 		if out, ok := c.autoCompact(ctx, msgs, tok, "auto"); ok {
 			msgs = out
+			c.lastMicroTokens = 0
 		}
 	}
 	return msgs
@@ -243,24 +300,32 @@ func lastNNonMarkerStart(msgs []llm.Message, keep int) int {
 
 // --- MicroCompact: keep the most recent N compactable results, clear the rest ---
 
+func (c *Compactor) isCompactableTool(name string) bool {
+	return compactableTools[name] || c.extraCompactable[name]
+}
+
 // microCompact clears the bodies of all COMPACTABLE tool results except the most
-// recent microKeepRecent, returning the (possibly new) message slice and whether
+// recent keep window, returning the (possibly new) message slice and whether
 // anything changed. It is non-destructive: a cleared result can be re-read.
 func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
+	keep := microKeepRecent
+	if c.cfg.MicroKeepRecent > 0 {
+		keep = c.cfg.MicroKeepRecent
+	}
 	// Collect compactable tool_use ids in encounter order.
 	var ids []string
 	for _, m := range msgs {
 		for _, b := range m.Content {
-			if b.Type == llm.BlockToolUse && compactableTools[b.Name] {
+			if b.Type == llm.BlockToolUse && c.isCompactableTool(b.Name) {
 				ids = append(ids, b.ID)
 			}
 		}
 	}
-	if len(ids) <= microKeepRecent {
+	if len(ids) <= keep {
 		return msgs, false // nothing old enough to clear
 	}
-	clearSet := make(map[string]bool, len(ids)-microKeepRecent)
-	for _, id := range ids[:len(ids)-microKeepRecent] {
+	clearSet := make(map[string]bool, len(ids)-keep)
+	for _, id := range ids[:len(ids)-keep] {
 		clearSet[id] = true
 	}
 	changed := false
@@ -272,7 +337,7 @@ func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
 				if nc == nil {
 					nc = append([]llm.ContentBlock(nil), out[i].Content...)
 				}
-				nc[j].Content = []llm.ContentBlock{llm.TextBlock(microClearedMessage)}
+				nc[j].Content = []llm.ContentBlock{llm.TextBlock(clearedPlaceholder(b.Content))}
 				changed = true
 			}
 		}
@@ -286,8 +351,23 @@ func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
 	return out, true
 }
 
+func clearedPlaceholder(orig []llm.ContentBlock) string {
+	for _, cb := range orig {
+		if cb.Type == llm.BlockText {
+			if idx := strings.Index(cb.Text, "Full output saved to"); idx >= 0 {
+				tail := strings.TrimSpace(cb.Text[idx:])
+				if end := strings.Index(tail, "</persisted-output>"); end >= 0 {
+					tail = strings.TrimSpace(tail[:end])
+				}
+				return microClearedPrefix + "; " + tail + "]"
+			}
+		}
+	}
+	return microClearedMessage
+}
+
 func isCleared(blocks []llm.ContentBlock) bool {
-	return len(blocks) == 1 && blocks[0].Type == llm.BlockText && blocks[0].Text == microClearedMessage
+	return len(blocks) == 1 && blocks[0].Type == llm.BlockText && strings.HasPrefix(blocks[0].Text, microClearedPrefix)
 }
 
 // --- AutoCompact: non-destructive boundary + summary ---
@@ -305,7 +385,7 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 		return msgs, false
 	}
 	summary, err := c.summarize(ctx, toSummarize)
-	if err != nil {
+	if err != nil || strings.TrimSpace(summary) == "" || ctx.Err() != nil {
 		c.failures++
 		if c.failures >= maxAutoCompactFails {
 			c.tripped = true
@@ -318,7 +398,8 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 	// re-inject the latest invocation of each skill verbatim just after the summary
 	// (post-boundary → sent to the model). Retained history keeps the originals; we
 	// only re-surface skills that fell behind the new boundary.
-	reinjected := reinjectSkills(msgs, tailStart)
+	perSkillCap, totalCap := c.skillReinjectCaps()
+	reinjected := reinjectSkillsWithCaps(msgs, tailStart, perSkillCap, totalCap)
 	boundary := llm.BoundaryMessage(llm.BoundaryMeta{
 		Trigger:            trigger,
 		PreTokens:          preTok,
@@ -334,6 +415,9 @@ func (c *Compactor) autoCompact(ctx context.Context, msgs []llm.Message, preTok 
 	out = append(out, msgs[:tailStart]...)
 	out = append(out, boundary, summaryMsg)
 	out = append(out, reinjected...)
+	if pinned := c.pinnedUser(msgs, tailStart); pinned != "" {
+		out = append(out, llm.UserText(pinned))
+	}
 	out = append(out, msgs[tailStart:]...)
 	return out, true
 }
@@ -347,9 +431,18 @@ const compactContinuationPreamble = "This session is being continued from a prev
 // instructions re-surfaced after a compaction boundary (mirrors claude-code's
 // 5K/25K policy). Most-recently-invoked skills win when the total is exceeded.
 const (
-	maxSkillReinjectTokens      = 5000
-	maxSkillReinjectTotalTokens = 25000
+	maxSkillReinjectTokens          = 5000
+	maxSkillReinjectTotalTokens     = 25000
+	conciseSkillReinjectTokens      = 2000
+	conciseSkillReinjectTotalTokens = 6000
 )
+
+func (c *Compactor) skillReinjectCaps() (perSkill, total int) {
+	if c.cfg.ConciseSummary {
+		return conciseSkillReinjectTokens, conciseSkillReinjectTotalTokens
+	}
+	return maxSkillReinjectTokens, maxSkillReinjectTotalTokens
+}
 
 // skillNames returns the invoked-skill names of the given re-injected messages.
 func skillNames(msgs []llm.Message) []string {
@@ -368,6 +461,10 @@ func skillNames(msgs []llm.Message) []string {
 // whose latest invocation is already in the preserved tail (index >= tailStart)
 // is skipped — it is still in the model's view.
 func reinjectSkills(msgs []llm.Message, tailStart int) []llm.Message {
+	return reinjectSkillsWithCaps(msgs, tailStart, maxSkillReinjectTokens, maxSkillReinjectTotalTokens)
+}
+
+func reinjectSkillsWithCaps(msgs []llm.Message, tailStart, perSkillCap, totalCap int) []llm.Message {
 	type entry struct {
 		msg llm.Message
 		idx int
@@ -401,9 +498,9 @@ func reinjectSkills(msgs []llm.Message, tailStart int) []llm.Message {
 	kept := make([]*entry, 0, len(cands))
 	total := 0
 	for _, e := range cands {
-		m := llm.TruncateSkillMessage(e.msg, maxSkillReinjectTokens*4)
+		m := llm.TruncateSkillMessage(e.msg, perSkillCap*4)
 		t := EstimateTokens([]llm.Message{m})
-		if total+t > maxSkillReinjectTotalTokens {
+		if total+t > totalCap {
 			continue // drop this one; a smaller, older skill may still fit
 		}
 		total += t
@@ -428,4 +525,29 @@ func contentOnly(msgs []llm.Message) []llm.Message {
 		}
 	}
 	return out
+}
+
+func (c *Compactor) SeedMicroReference(tokens int) { c.lastMicroTokens = tokens }
+
+func (c *Compactor) pinnedUser(msgs []llm.Message, tailStart int) string {
+	if c.cfg.PinnedUserPrefix == "" {
+		return ""
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != llm.RoleUser {
+			continue
+		}
+		text := msgs[i].Text()
+		if !strings.HasPrefix(text, c.cfg.PinnedUserPrefix) {
+			continue
+		}
+		if i >= tailStart {
+			return ""
+		}
+		if c.cfg.PinnedUserEndMarker != "" {
+			text, _, _ = strings.Cut(text, c.cfg.PinnedUserEndMarker)
+		}
+		return text
+	}
+	return ""
 }

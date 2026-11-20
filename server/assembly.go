@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -177,6 +179,11 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 			GlobalNames: globalNames,
 			Unlock:      unlock,
 			UnlockSkill: unlockSkill,
+		}
+		if reg != nil {
+			data, _ := json.Marshal(reg.List())
+			sum := sha256.Sum256(data)
+			def.ContextRevision = hex.EncodeToString(sum[:])
 		}
 		return extra, def, cleanup
 	}

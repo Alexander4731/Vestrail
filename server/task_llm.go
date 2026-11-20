@@ -747,3 +747,12 @@ func (s *Server) emitManualTaskLLMSwitch(t *Task, previousID, nextID *int64) db.
 	}})
 	return s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "llm_switch", Summary: summary, Detail: summary, Metadata: metadata})
 }
+
+// CacheIdentity detects a task/profile route change without exposing credentials.
+func (r *taskLLMRuntime) CacheIdentity() string {
+	sel, err := r.current()
+	if err != nil {
+		return "unavailable"
+	}
+	return fmt.Sprintf("%d:%d:%T:%p", sel.profileID, sel.revision, sel.provider, sel.provider)
+}

@@ -131,7 +131,7 @@ func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID string, explo
 	prefix := fmt.Sprintf("exp%d-", explorationID)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) || (!entry.IsDir() && !strings.HasSuffix(name, ".jsonl")) {
+		if !strings.HasPrefix(name, prefix) || (!entry.IsDir() && !taskTranscriptFile(name)) {
 			continue
 		}
 		targets = append(targets, archiveFileMove{

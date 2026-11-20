@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -247,3 +248,46 @@ func NewSessionID() string { return newID() }
 
 // NewAgentID returns a fresh subagent identifier.
 func NewAgentID() string { return newID() }
+
+// SeedSession publishes a complete new transcript without overwriting a file.
+// Seeded messages carry no usage: only the new session's real requests are billed.
+func (s *Store) SeedSession(sessionID string, msgs []llm.Message) (string, error) {
+	if sessionID == "" || sessionID == "." || sessionID == ".." || strings.ContainsAny(sessionID, "/\\") || filepath.VolumeName(sessionID) != "" {
+		return "", fmt.Errorf("transcript: invalid session id")
+	}
+	if len(msgs) == 0 {
+		return "", fmt.Errorf("transcript: no history to seed")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.MainPath(sessionID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".seed-*.jsonl")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	encoder := json.NewEncoder(f)
+	last := ""
+	for _, m := range msgs {
+		id := newID()
+		if err := encoder.Encode(Record{UUID: id, ParentUUID: last, SessionID: sessionID, Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Type: "message", Message: &m}); err != nil {
+			return "", err
+		}
+		last = id
+	}
+	if err := f.Sync(); err != nil {
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	// A hard-link publication is atomic and fails if the destination exists.
+	if err := os.Link(f.Name(), path); err != nil {
+		return "", err
+	}
+	return last, nil
+}

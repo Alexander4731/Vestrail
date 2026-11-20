@@ -930,6 +930,48 @@ export interface ModelTokenStat {
   cache_write_tokens: number;
 }
 
+export interface UsageAuditStat {
+  rows: number;
+  known_call_ids: number;
+  missing_call_ids: number;
+  repeated_attempt_rows: number;
+  error_rows: number;
+  zero_usage_rows: number;
+  missing_purpose: number;
+  missing_session: number;
+  missing_worker: number;
+  invalid_cache_rows: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  uncached_input_tokens: number;
+  total_tokens: number;
+  nonzero_input_rows: number;
+  input_p50: number;
+  input_p95: number;
+  distinct_sessions?: number;
+  first_turn_input_p50?: number;
+  first_turn_input_rows?: number;
+  first_seen?: string;
+  last_seen?: string;
+}
+
+export interface UsageAuditGroup extends UsageAuditStat {
+  key: string;
+}
+
+export interface TaskUsageAudit {
+  task_id: string;
+  source: "llm_usage";
+  since?: string;
+  generated_at: string;
+  total: UsageAuditStat;
+  by_worker: UsageAuditGroup[];
+  by_purpose: UsageAuditGroup[];
+  by_model: UsageAuditGroup[];
+}
+
 export interface Session {
   id: string;
   role: SessionRole;

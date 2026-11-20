@@ -38,6 +38,7 @@ func captureRun(ctx context.Context, opts agentcore.Options, input string, emit 
 // multiple prompts on the SAME conversation (e.g. a settlement round that reuses
 // the worker's accumulated context after the main run hit max_turns).
 func captureRunSession(ctx context.Context, s *agentcore.Session, store *transcript.Store, input string, emit func(db.Activity)) (string, harness.TerminalReason, error) {
+	baseUsage := s.Usage()
 	ctx, auditTrace := intercept.WithTrace(ctx, input, approvalHistory(s.Messages()))
 	auditTrace.UseTranscript(store)
 	defer auditTrace.Finish()
@@ -124,7 +125,7 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, store *transcr
 			// one for a running session's live token count. Don't flush() here — the
 			// buffered final-answer text must stay for the KindResult de-dup.
 			if ev.Usage != nil {
-				u := *ev.Usage
+				u := runUsageDelta(baseUsage, *ev.Usage)
 				lastUsage = &u
 				rec(db.Activity{Kind: "usage",
 					InputTokens: &u.InputTokens, OutputTokens: &u.OutputTokens,
@@ -148,7 +149,7 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, store *transcr
 				if sum == "" || ev.Terminal.Reason == harness.ReasonAbortedTools || ev.Terminal.Reason == harness.ReasonAbortedStreaming {
 					sum, detail = terminalText(ctx, ev.Terminal, lastTool)
 				}
-				u := ev.Terminal.Usage // cumulative token usage for this session
+				u := runUsageDelta(baseUsage, ev.Terminal.Usage)
 				rec(db.Activity{Kind: "result", IsError: ev.Terminal.Err != nil,
 					Summary: firstLine(sum, 400), Detail: detail,
 					InputTokens: &u.InputTokens, OutputTokens: &u.OutputTokens,
@@ -223,4 +224,8 @@ func approvalHistory(messages []llm.Message) []db.InterceptContextEntry {
 		}
 	}
 	return entries
+}
+
+func runUsageDelta(base, total llm.Usage) llm.Usage {
+	return llm.Usage{InputTokens: max(0, total.InputTokens-base.InputTokens), OutputTokens: max(0, total.OutputTokens-base.OutputTokens), CacheReadTokens: max(0, total.CacheReadTokens-base.CacheReadTokens), CacheWriteTokens: max(0, total.CacheWriteTokens-base.CacheWriteTokens)}
 }

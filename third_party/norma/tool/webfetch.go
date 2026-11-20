@@ -165,7 +165,7 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 	if cfg.Proxy != "" {
 		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS})
 	}
-	return func(ctx context.Context, input json.RawMessage, _ *ToolContext) (Result, error) {
+	return func(ctx context.Context, input json.RawMessage, tc *ToolContext) (Result, error) {
 		var in struct {
 			URL     string `json:"url"`
 			Extract bool   `json:"extract"`
@@ -231,7 +231,7 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 		} else {
 			out = string(body)
 		}
-		return Text(truncate(header+strings.TrimSpace(out), 50000)), nil
+		return Text(Capture(tc, header+strings.TrimSpace(out))), nil
 	}
 }
 

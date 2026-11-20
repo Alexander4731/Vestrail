@@ -222,9 +222,9 @@ func TestToOpenAIMessagesKeepsThinkingOnlyAssistant(t *testing.T) {
 	if oa[1].Content == "" && len(oa[1].ToolCalls) == 0 {
 		t.Fatalf("assistant must carry content or tool_calls: %+v", oa[1])
 	}
-	// The reasoning must be passed back verbatim (from b.Thinking, not b.Text).
-	if oa[1].ReasoningContent != "pondering, no answer emitted" {
-		t.Fatalf("reasoning_content not passed back: %+v", oa[1])
+	// A new user question closes this turn; the old scratchpad is not replayed.
+	if oa[1].ReasoningContent != "" {
+		t.Fatalf("completed-turn reasoning was replayed: %+v", oa[1])
 	}
 }
 
@@ -238,7 +238,6 @@ func TestToOpenAIMessagesPassesReasoningWithText(t *testing.T) {
 			{Type: BlockThinking, Thinking: "reasoning trace"},
 			{Type: BlockText, Text: "the answer"},
 		}},
-		UserText("next"),
 	}
 	oa := toOpenAIMessages("", msgs)
 	if oa[1].Role != "assistant" || oa[1].Content != "the answer" {
