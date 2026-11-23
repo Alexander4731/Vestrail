@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -174,8 +175,23 @@ func runScript(ctx context.Context, raw json.RawMessage, tc *actool.ToolContext)
 		}
 	}
 	info, _ := tc.Tasks.Get(task.ID)
+	// RunForeground returns only a tail. Read the closed output file before
+	// Forget removes it so batch coverage and the archive include every record.
+	fullOutput, err := os.ReadFile(info.OutputPath)
+	if err != nil {
+		return actool.Errorf("脚本已退出，但完整输出读取失败：" + err.Error()), nil
+	}
+	output = string(fullOutput)
 	tc.Tasks.Forget(task.ID)
-	output = actool.Capture(tc, output)
+	if runErr == nil && info.Status != actool.TaskFailed {
+		if preview, merged := kernel.CompactBatchOutput(output); len(output) > 4096 && merged {
+			output = actool.CapturePreview(tc, output, preview)
+		} else {
+			output = actool.Capture(tc, output)
+		}
+	} else {
+		output = actool.Capture(tc, output)
+	}
 	if runErr != nil {
 		return actool.Errorf(output + "\n" + runErr.Error()), nil
 	}

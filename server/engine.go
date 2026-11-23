@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -93,8 +94,8 @@ func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
 // but idle until an LLM is set.
 type Engine struct {
 	laneBusy         sync.Map // laneKey -> intent id
-	noGainStreak     sync.Map // task id -> *atomic.Int64
 	channelPool      *channelPoolTracker
+	resources        *intentResourceTracker
 	recoverExecution func(context.Context, *Task)
 	phases           sync.Map
 	stopping         bool // guarded by deleteMu
@@ -150,6 +151,7 @@ type Engine struct {
 	deadline     sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
 	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
 	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
+	runDeadlines sync.Map // *activeRunDeadline -> time.Time, current run's configured hard deadline
 	coordStarted sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
 
 	// resolve returns a task's dedicated planner/worker (wired by the server as the
@@ -187,6 +189,7 @@ func (e *Engine) nextPlannerRound(taskID string) int {
 // for it (a long worker.Execute would otherwise keep going until it finishes).
 func (e *Engine) Pause(taskID string, cause error) {
 	e.paused.Store(taskID, true)
+	e.resources.forgetWaitingTask(taskID)
 	e.cancelExec(taskID, cause)
 }
 
@@ -204,6 +207,7 @@ func (e *Engine) BeginDelete(taskID string) bool {
 	e.deleteMu.Unlock()
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
 	e.cancelAdHoc(taskID, agent.AbortTaskDeleted)
+	e.resources.forgetWaitingTask(taskID)
 	return true
 }
 
@@ -296,7 +300,6 @@ func (e *Engine) StopTask(taskID string) {
 	e.llmCalls.Delete(taskID)
 	e.phases.Delete(taskID)
 	e.paused.Delete(taskID)
-	e.noGainStreak.Delete(taskID)
 	e.laneBusy.Range(func(k, v any) bool {
 		if k.(laneKey).taskID == taskID {
 			e.laneBusy.Delete(k)
@@ -448,6 +451,7 @@ func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix(
 func NewEngine(m *Manager) *Engine {
 	return &Engine{m: m, debounce: 2500 * time.Millisecond, bc: NewBroadcaster(),
 		channelPool: newChannelPoolTracker(),
+		resources:   newIntentResourceTracker(),
 		execCancel:  map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		adHocCancel: map[string]context.CancelCauseFunc{}, adHocCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
@@ -914,6 +918,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	failures, emptyRounds := 0, 0
 	var retryAt time.Time
 	var lastPlanAt time.Time
+	var lastGraphState string
 	endBackoff := func() {}
 	defer func() { endBackoff() }()
 
@@ -969,6 +974,16 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.isSettling(t.ID) {
 			return
 		}
+		graphState, graphErr := t.Store.GraphProgress()
+		if graphErr != nil {
+			return
+		}
+		if src == "heartbeat" && !lastPlanAt.IsZero() && graphState == lastGraphState {
+			pending, pendingErr := t.Store.IntentsInState("running")
+			if pendingErr == nil && (len(pending) == 0 || time.Since(lastPlanAt) < interval) {
+				return
+			}
+		}
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
 		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
@@ -1013,6 +1028,8 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		e.touch(t.ID)
 		emit := func(r db.Activity) { e.emitActivity(t, r) }
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
+		ectx, releaseBudget := e.observeRunBudget(ectx, t.ID)
+		defer releaseBudget()
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
@@ -1024,11 +1041,6 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// what fired this round (worker done / finding; may be several — debounce
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
-		for _, ev := range triggers {
-			if ev.Kind == "goal" || ev.Kind == "goal_edited" || ev.Kind == "hint" {
-				e.gainCounter(t.ID).Store(0)
-			}
-		}
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		before, progressErr := t.Store.GraphProgress()
 		if progressErr != nil {
@@ -1037,6 +1049,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.lifecycleSnapshot().Goal, triggers, emit)
 		lastPlanAt = time.Now()
+		if err == nil {
+			lastGraphState = graphState
+		}
 		switch {
 		case err != nil && ectx.Err() == nil && (errors.Is(err, agent.ErrLocalRunBudgetExceeded) || errors.Is(err, agent.AbortRunHardTimeout)):
 			// Local per-round budget ended cleanly (F01): do NOT misclassify as transient
@@ -1085,6 +1100,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				nextRound = 5 * time.Second
 				return
 			}
+			lastGraphState = after
 			if before == after && !active && ectx.Err() == nil {
 				emptyRounds++
 				if emptyRounds >= 3 {
@@ -1149,12 +1165,6 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			}
 			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
 		}
-		if e.focusWorker(t.ID, name) {
-			if sleepCtx(ctx, 800*time.Millisecond) {
-				return
-			}
-			continue
-		}
 		if !e.beginTaskOperation(t.ID) {
 			return
 		}
@@ -1170,7 +1180,7 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 // runIntent. Returns false when nothing was claimable. The pool worker loop is its
 // only caller.
 func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker *agent.Worker) bool {
-	intent := e.claimNext(t, name)
+	intent := e.claimNextContext(ctx, t, name)
 	if intent == nil {
 		return false
 	}
@@ -1191,8 +1201,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 }
 
 func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, requestID, message string, adHoc bool) bool {
-	leaseKey := laneKey{t.ID, agent.IntentLaneRoot(intent)}
-	defer e.releaseLane(leaseKey, intent.ID)
+	defer e.releaseIntentResources(t, intent)
 	hasChatMessage := message != ""
 	if !adHoc {
 		e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
@@ -1205,7 +1214,12 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	} else {
 		baseExec = e.execContextFor(ctx, t.ID)
 	}
-	ectx := e.clockCtx(baseExec, t, false)
+	ectx := e.phaseContext(baseExec, t.ID)
+	if !adHoc {
+		ectx = e.clockCtx(ectx, t, false)
+	}
+	ectx, releaseBudget := e.observeRunBudget(ectx, t.ID)
+	defer releaseBudget()
 	ectx = agent.WithTaskObjective(ectx, t.lifecycleSnapshot().Goal) // cancellable by Pause (or Delete for adHoc); 带任务 deadline
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		rollbackState := "open"
@@ -1257,6 +1271,52 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
 	failureGuard := newWorkerFailureGuardWithBudget(workCancel, intentMaxToolCalls(intent))
+	var contract kernel.IntentContract
+	_ = json.Unmarshal(intent.Payload, &contract)
+	coverageScope := contract.Scope
+	if strings.TrimSpace(coverageScope) == "" {
+		coverageScope = fmt.Sprintf("intent:%d", intent.ID)
+	}
+	baselineBatches := []kernel.EvidenceBatch{}
+	if prior, err := t.Store.LatestIntentReceipt(workCtx, intent.ID); err == nil && prior != nil {
+		baselineBatches = append(baselineBatches, prior.ValidBatches...)
+	}
+	var linkage struct {
+		Continue int64 `json:"continue_intent_id"`
+		Handoff  int64 `json:"handoff_from_intent_id"`
+	}
+	_ = json.Unmarshal(intent.Payload, &linkage)
+	sourceID := linkage.Continue
+	if sourceID == 0 {
+		sourceID = linkage.Handoff
+	}
+	sourceScopeMatches := false
+	if sourceID > 0 {
+		if source, err := t.Store.GetNode(sourceID); err == nil && source != nil {
+			var upstreamContract kernel.IntentContract
+			if json.Unmarshal(source.Payload, &upstreamContract) == nil {
+				sourceScopeMatches = sameCoverageScope(contract.Scope, upstreamContract.Scope)
+			}
+		}
+		if sourceScopeMatches {
+			if prior, err := t.Store.LatestIntentReceipt(workCtx, sourceID); err == nil && prior != nil {
+				baselineBatches = append(baselineBatches, prior.ValidBatches...)
+			}
+		}
+	}
+	failureGuard.seedCoverage(coverageScope, baselineBatches)
+	workCtx, requestSettlement := harness.WithSettlementRequest(workCtx)
+	failureGuard.setSettlementRequester(func(kernel.TerminationCode) { requestSettlement(harness.ReasonMaxTurns) })
+	workCtx = agent.WithRunEvidence(workCtx, func() []kernel.EvidenceBatch { return failureGuard.evidenceBatches(false) }, func(batches []kernel.EvidenceBatch) {
+		accepted := []kernel.EvidenceBatch{}
+		for _, batch := range batches {
+			if contract.Scope == "" || sameCoverageScope(contract.Scope, batch.Scope) || (batch.Scope == "" && sourceScopeMatches) {
+				accepted = append(accepted, batch)
+			}
+		}
+		failureGuard.addInputCoverage(accepted)
+	})
+	inputVersions, _ := t.Store.IntentInputEvidenceVersions(workCtx, intent.ID)
 	hooks := steerHooks{
 		inner:    t.Guard.Hooks(),
 		failures: failureGuard,
@@ -1270,6 +1330,7 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	var wrote agent.WriteCounts
 	var err error
 	totalWrites := agent.WriteCounts{}
+	totalWrites.ConsumedEvidenceVersions = map[int64]int{}
 	execute := func() {
 		if hasChatMessage {
 			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
@@ -1279,9 +1340,16 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 		totalWrites.Facts += wrote.Facts
 		totalWrites.Assets += wrote.Assets
 		totalWrites.Findings += wrote.Findings
+		totalWrites.ResearchGain.Evidence += wrote.ResearchGain.Evidence
+		totalWrites.ResearchGain.Artifacts = max(totalWrites.ResearchGain.Artifacts, wrote.ResearchGain.Artifacts)
+		totalWrites.EvidenceIDs = append(totalWrites.EvidenceIDs, wrote.EvidenceIDs...)
+		for id, version := range wrote.ConsumedEvidenceVersions {
+			totalWrites.ConsumedEvidenceVersions[id] = version
+		}
 		if wrote.DeliveryStatus != "" {
 			totalWrites.DeliveryStatus = wrote.DeliveryStatus
 		}
+		totalWrites.DeliveryFinalized = totalWrites.DeliveryFinalized || wrote.DeliveryFinalized
 		if wrote.Checkpoint != nil {
 			totalWrites.Checkpoint = wrote.Checkpoint
 		}
@@ -1302,6 +1370,7 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	for attempt := 1; attempt <= maxRetries &&
 		retryableWorkerModelError(reason, err) &&
 		!errors.Is(err, agent.ErrLocalRunBudgetExceeded) &&
+		!totalWrites.DeliveryFinalized &&
 		workCtx.Err() == nil && ectx.Err() == nil && (adHoc || !e.IsPaused(t.ID)) && !e.isSettling(t.ID); attempt++ {
 		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
 			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
@@ -1312,6 +1381,9 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	}
 	// Capture workCause BEFORE detachWork cancels workCtx.
 	wrote = totalWrites
+	if code := failureGuard.requestedTerminationCode(); code != "" {
+		wrote.AbortCode = code
+	}
 	workCause := context.Cause(workCtx)
 	noProgress := errors.Is(workCause, agent.AbortRepeatedToolFailure) || errors.Is(workCause, agent.AbortNoProgressStagnation)
 	// Explicit allow-list for planner kill so local hard timeout can NEVER be misclassified as stopped (F01).
@@ -1374,17 +1446,18 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	}
 	// Distinguish genuine delivery completion from explicit partial/incomplete handback (F25).
 	delivery := wrote.DeliveryStatus
+	if state == "exhausted" && wrote.DeliveryFinalized && delivery == kernel.DeliveryComplete && (termCode.IsBudgetTerm() || termCode == kernel.TermNoProgress || termCode == kernel.TermRepeatedToolFailure) {
+		state = "done"
+	}
 	if state == "done" {
 		switch delivery {
 		case kernel.DeliveryPartialCheckpoint, kernel.DeliveryHandedBack:
 			state = "exhausted"
+		case kernel.DeliveryPreconditionBlocked:
+			state = "blocked"
 		case "":
-			if wrote.Total() == 0 && kernel.LooksLikeIncompleteHandback(wrote.FinalText) {
-				delivery = kernel.DeliveryHandedBack
-				state = "exhausted"
-			} else {
-				delivery = kernel.DeliveryComplete
-			}
+			delivery = kernel.DeliveryHandedBack
+			state = "exhausted"
 		}
 	} else if delivery == "" {
 		if state == "exhausted" && (wrote.Total() > 0 || wrote.Checkpoint != nil) {
@@ -1431,36 +1504,49 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 		}
 		break
 	}
-	settleErr := settleIntent(e.phaseContext(ctx, t.ID), t.Store, intent.ID, state, blockedReason)
+	toolCalls, guardBatches := failureGuard.stats()
+	mergedBatches := append([]kernel.EvidenceBatch(nil), wrote.ValidBatches...)
+	mergedBatches = append(mergedBatches, guardBatches...)
+	tracker := kernel.NewCoverageTracker(coverageScope)
+	baselineBatches = failureGuard.evidenceBatches(true)
+	tracker.Seed(baselineBatches)
+	gain := wrote.ResearchGain
+	acceptedBatches := append([]kernel.EvidenceBatch(nil), baselineBatches...)
+	for _, batch := range mergedBatches {
+		if delta := tracker.Add(batch); delta > 0 {
+			gain.Coverage += delta
+			acceptedBatches = append(acceptedBatches, batch)
+		}
+	}
+	if inputVersions == nil {
+		inputVersions = map[int64]int{}
+	}
+	for id, version := range wrote.ConsumedEvidenceVersions {
+		inputVersions[id] = version
+	}
+	receipt := kernel.RunReceipt{
+		TaskID:                wTaskID,
+		ExplorationID:         t.Store.ID(),
+		IntentID:              intent.ID,
+		TerminationCode:       termCode,
+		DeliveryStatus:        delivery,
+		SettledState:          state,
+		ToolCalls:             toolCalls,
+		FactsWritten:          wrote.Facts,
+		AssetsWritten:         wrote.Assets,
+		FindingsWritten:       wrote.Findings,
+		ValidBatches:          acceptedBatches,
+		Checkpoint:            wrote.Checkpoint,
+		Summary:               preview(wrote.FinalText, 240),
+		ResearchGain:          &gain,
+		InputEvidenceVersions: inputVersions,
+	}
+	settleErr := settleIntent(e.phaseContext(ctx, t.ID), t.Store, intent.ID, state, blockedReason, receipt)
 	completeWork(settleErr)
 	if settleErr != nil {
 		log.Printf("[worker %s] task %s 意图 #%d 状态 %s 未提交: %v", name, t.ID, intent.ID, state, settleErr)
 		return true
 	}
-	toolCalls, guardBatches := failureGuard.stats()
-	mergedBatches := append([]kernel.EvidenceBatch(nil), wrote.ValidBatches...)
-	mergedBatches = append(mergedBatches, guardBatches...)
-	receipt := kernel.RunReceipt{
-		TaskID:          wTaskID,
-		ExplorationID:   t.Store.ID(),
-		IntentID:        intent.ID,
-		TerminationCode: termCode,
-		DeliveryStatus:  delivery,
-		SettledState:    state,
-		ToolCalls:       toolCalls,
-		FactsWritten:    wrote.Facts,
-		AssetsWritten:   wrote.Assets,
-		FindingsWritten: wrote.Findings,
-		ValidBatches:    mergedBatches,
-		Checkpoint:      wrote.Checkpoint,
-		Summary:         preview(wrote.FinalText, 240),
-	}
-	if e.m != nil && e.m.pg != nil {
-		if rerr := e.m.pg.SaveIntentReceipt(context.WithoutCancel(ctx), receipt); rerr != nil {
-			log.Printf("[worker %s] task %s 意图 #%d RunReceipt 保存失败: %v", name, t.ID, intent.ID, rerr)
-		}
-	}
-	e.recordWorkerGainReceipt(t.ID, receipt)
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)
 	skipNotify := adHoc && (e.IsPaused(t.ID) || isTerminalStatus(e.m.TaskStatus(t.ID)))
@@ -1494,29 +1580,28 @@ func (e *Engine) RunAdHocIntent(ctx context.Context, t *Task, intentID int64) er
 	if err != nil {
 		return err
 	}
-	if node == nil || node.Kind != db.KindIntent {
+	if node == nil || node.Kind != db.KindIntent || node.State != "open" || node.Owner != "adhoc" {
 		return fmt.Errorf("intent not found")
 	}
 	release = false
 	go func() {
 		defer e.decInflight(t.ID)
-		e.runIntentWithMode(ctx, t, "adhoc", worker, node, "", "", true)
+		base := e.adHocContextFor(ctx, t.ID)
+		admitted, err := e.awaitIntentAdmission(base, t, node, "open", "adhoc")
+		if err != nil {
+			_, _ = t.Store.CompareAndSetIntentState(node.ID, "open", "paused")
+			log.Printf("[adhoc] task %s 意图 #%d 未启动: %v", t.ID, node.ID, err)
+			return
+		}
+		e.runIntentWithMode(ctx, t, "adhoc", worker, admitted, "", "", true)
 	}()
 	return nil
 }
 
-// runDetachedIntent runs one paused intent OUTSIDE the worker pool in its own
-// goroutine — the human-message path. It transitions the intent paused->running
-// itself (never through 'open'), so the pool, which only claims 'open', can never
-// race it; the "at most one run per intent" invariant still holds because winning
-// the CAS is the sole entry and work[intentID] was cleared when the pause settled.
-// Because it does not compete for a frontier slot, a user message continues the
-// worker immediately even when all pool slots are busy (mirroring how the
-// main-agent chat handler starts its run directly). The spawned goroutine owns one
-// task-operation admission for the whole run and roots its context at ctx (pass the
-// server root, never the HTTP request, so a disconnect cannot strand the run while
-// task pause/delete/shutdown still stops it). Returns an error if the run could not
-// be started; the intent is left untouched in that case.
+// runDetachedIntent reserves one paused intent as open/adhoc, waits for its
+// resources, then runs it outside the worker pool. The database CAS excludes
+// ordinary pool claims. The goroutine owns a task-operation admission until the
+// final receipt commits and uses the server root context for pause/delete/shutdown.
 func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64, requestID, message, agentMessage string) error {
 	if unknown, err := e.m.executionBlocksIntent(ctx, t.ID, intentID); err != nil {
 		return err
@@ -1543,14 +1628,14 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	if node == nil || node.Kind != db.KindIntent {
 		return fmt.Errorf("intent not found")
 	}
-	changed, err := t.Store.CompareAndSetIntentState(intentID, "paused", "running")
+	changed, err := t.Store.QueueIntentSnapshot(ctx, node)
 	if err != nil {
 		return err
 	}
 	if !changed {
 		return fmt.Errorf("%w: 意图不再是 paused 状态", db.ErrIntentStateConflict)
 	}
-	node.State, node.Owner = "running", "chat"
+	node.State, node.Owner = "open", "adhoc"
 	// Record the human turn as a visible activity BEFORE the run starts, so it is
 	// ordered ahead of any worker step and never appears without the run happening.
 	// Keep the UI copy concise; ExecuteWithMessage writes the server-resolved
@@ -1560,7 +1645,14 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	release = false // ownership of the admission passes to the goroutine
 	go func() {
 		defer e.decInflight(t.ID)
-		e.runIntent(ctx, t, "chat", worker, node, requestID, agentMessage)
+		base := e.execContextFor(ctx, t.ID)
+		admitted, err := e.awaitIntentAdmission(base, t, node, "open", "adhoc")
+		if err != nil {
+			_, _ = t.Store.CompareAndSetIntentState(node.ID, "open", "paused")
+			log.Printf("[chat] task %s 意图 #%d 未启动: %v", t.ID, node.ID, err)
+			return
+		}
+		e.runIntent(ctx, t, "chat", worker, admitted, requestID, agentMessage)
 	}()
 	return nil
 }
@@ -1589,6 +1681,14 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 }
 
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
+	return e.claimNextContext(context.Background(), t, name)
+}
+
+func (e *Engine) claimNextContext(ctx context.Context, t *Task, name string) *db.Node {
+	e.pruneResourceWaiters(t)
+	if deadline := e.taskDeadline(t); deadline > 0 && time.Now().Unix() >= deadline {
+		return nil
+	}
 	busy := []int64{}
 	e.laneBusy.Range(func(k, v any) bool {
 		key := k.(laneKey)
@@ -1597,46 +1697,37 @@ func (e *Engine) claimNext(t *Task, name string) *db.Node {
 		}
 		return true
 	})
-	fr, err := t.Store.FrontierExcludingLanes(20, busy)
-	if err != nil {
-		return nil
-	}
-	if len(fr) == 0 {
-		return nil
-	}
-	// Preload active intents & prerequisite terminal status once for RW resource-lock
-	// and after_intents DAG checks (F22).
-	running, _ := t.Store.IntentsInState("running")
-	activeInfos := make([]kernel.IntentScheduleInfo, 0, len(fr)+len(running))
-	var depIDs []int64
-	depSeen := map[int64]bool{}
-	for _, n := range running {
-		activeInfos = append(activeInfos, intentScheduleInfoFromNode(n))
-	}
-	for _, n := range fr {
-		info := intentScheduleInfoFromNode(n)
-		activeInfos = append(activeInfos, info)
-		for _, dep := range info.AfterIntents {
-			if dep > 0 && !depSeen[dep] {
-				depSeen[dep] = true
-				depIDs = append(depIDs, dep)
+	const pageSize = 32
+	priority, after := 0, int64(0)
+	for ctx.Err() == nil {
+		fr, err := t.Store.FrontierExcludingLanesAfter(pageSize, busy, priority, after)
+		if err != nil || len(fr) == 0 {
+			return nil
+		}
+		var depIDs []int64
+		seen := map[int64]bool{}
+		for _, n := range fr {
+			for _, dep := range intentScheduleInfoFromNode(n).AfterIntents {
+				if dep > 0 && !seen[dep] {
+					seen[dep] = true
+					depIDs = append(depIDs, dep)
+				}
 			}
 		}
-	}
-	terminalDeps, _ := t.Store.TerminalIntentIDs(depIDs)
-
-	for _, in := range fr {
-		if ok, _ := kernel.CanClaimIntent(intentScheduleInfoFromNode(in), activeInfos, terminalDeps); !ok {
-			continue
+		terminal, err := t.Store.TerminalIntentIDs(depIDs)
+		if err != nil {
+			return nil
 		}
-		key, ok := e.leaseLane(t.ID, in)
-		if !ok {
-			continue
+		for _, in := range fr {
+			if claimed, err := e.tryClaimIntent(ctx, t, in, "open", name, terminal); err == nil && claimed {
+				return in
+			}
 		}
-		if claimed, err := t.Store.ClaimIntent(in.ID, name); err == nil && claimed {
-			return in
+		if len(fr) < pageSize {
+			return nil
 		}
-		e.releaseLane(key, in.ID)
+		last := fr[len(fr)-1]
+		priority, after = last.Priority, last.ID
 	}
 	return nil
 }

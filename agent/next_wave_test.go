@@ -256,7 +256,14 @@ func TestPlannerHardDropsBashWhenFactsExist(t *testing.T) {
 func TestWorkerLaneForkPreservesCachePrefixAndRollsOver(t *testing.T) {
 	t.Setenv("VESTRAIL_OPT_LANE_WORKER", "1")
 	_, ts, id := waveGraph(t)
-	prov := &waveProvider{}
+	prov := &waveProvider{run: func(_ llm.CompletionRequest, call int) []llm.StreamEvent {
+		return []llm.StreamEvent{
+			{Type: llm.SEMessageStart, Usage: llm.Usage{InputTokens: 1200, CacheReadTokens: 900}},
+			{Type: llm.SEToolUseStart, ToolID: fmt.Sprint(call), ToolName: "finish_work"},
+			{Type: llm.SEToolInputJSON, Text: `{"delivery_status":"partial_checkpoint","summary":"fixture checkpoint"}`},
+			{Type: llm.SEMessageDelta, StopReason: "tool_use", Usage: llm.Usage{OutputTokens: 20}},
+		}
+	}}
 	store := transcript.NewStore(t.TempDir())
 	w := NewWorker(prov, "fixture", t.TempDir(), store, 200000, 5)
 	root := waveIntent(t, ts, map[string]any{"summary": "read fixture", "brief": "only inspect generated data"})
@@ -602,7 +609,7 @@ func TestAddIntentBatchSchemaExposesBriefAndContinue(t *testing.T) {
 		}
 	}
 	required, ok := items["required"].([]string)
-	if !ok || !reflect.DeepEqual(required, []string{"summary"}) {
+	if !ok || !reflect.DeepEqual(required, []string{"summary", "scope", "deliverable", "max_tool_calls"}) {
 		t.Fatalf("batch summary not required: %v", items["required"])
 	}
 }

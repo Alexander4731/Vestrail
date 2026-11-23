@@ -53,6 +53,8 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const [preview, setPreview] = React.useState("");
   const [maxTurns, setMaxTurns] = React.useState("0");
   const [runSecs, setRunSecs] = React.useState("600");
+  const [settleSecs, setSettleSecs] = React.useState("0");
+  const [hardBufferSecs, setHardBufferSecs] = React.useState("");
   // "" = 跟随(未绑定)；否则为 profile id 字符串
   const [llmProfileId, setLlmProfileId] = React.useState("");
   const [llmProfiles, setLlmProfiles] = React.useState<NonNullable<AgentDetail["llm_profiles"]>>([]);
@@ -92,6 +94,8 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
         setSkillVisible(d.visibility?.skill ?? []);
         setMaxTurns(String(d.agent?.max_turns ?? 0));
         setRunSecs(String(d.agent?.run_seconds ?? 600));
+        setSettleSecs(String(d.agent?.settle_seconds ?? 0));
+        setHardBufferSecs(d.agent?.hard_buffer_seconds == null ? "" : String(d.agent.hard_buffer_seconds));
         setLlmProfileId(d.agent?.llm_profile_id != null ? String(d.agent.llm_profile_id) : "");
         setLlmProfiles(d.llm_profiles ?? []);
         setWebSearch(!!d.agent?.web_search);
@@ -187,11 +191,20 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
       if (showConfig) {
         patch.max_turns = Math.max(0, Math.floor(Number(maxTurns) || 0));
         patch.run_seconds = Math.max(0, Math.floor(Number(runSecs) || 0));
+        if (showBudget) {
+          const settle = Number(settleSecs || 0);
+          const hard = hardBufferSecs.trim() === "" ? null : Number(hardBufferSecs);
+          if (!Number.isSafeInteger(settle) || settle < 0 || (hard !== null && (!Number.isSafeInteger(hard) || hard < 0))) {
+            throw new Error("收尾预留和硬宽限必须为非负整数秒");
+          }
+          patch.settle_seconds = settle;
+          patch.hard_buffer_seconds = hard;
+        }
       }
       if (showWebSearch) patch.web_search = webSearch;
       if (showInteractiveShell) patch.interactive_shell = interactiveShell;
       await api.saveAgentConfig(agentKey, patch);
-      toast.success("已保存运行配置（立即生效）");
+      toast.success("已保存运行配置，下次执行生效");
       reload();
     } catch (e) {
       toast.error("保存失败：" + (e as Error).message);
@@ -258,6 +271,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   // config applies to all interactive/loop agents (worker, planner, mainagent, custom);
   // only the fixed-budget one-shot goals decomposer hides it (F02).
   const showConfig = agentKey !== "goals";
+  const showBudget = ["worker", "planner", "mainagent"].includes(agentKey);
   // web search applies to every conversational/executing agent except the one-shot
   // goals decomposer; it's gated by the global master switch.
   const showWebSearch = agentKey !== "goals";
@@ -327,8 +341,22 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                 </Button>
                 {showConfig && (
                   <p className="text-muted-foreground w-full text-xs">
-                    0 表示该角色自身不限时；修改在下一轮执行生效。任务设置了总超时时取二者较小值，并自动预留收尾写回窗口。
+                    0 表示该角色自身不限时；修改在下一次执行生效。{agentKey === "mainagent" ? "人机会话使用自身预算。" : "普通队列同时受任务总超时约束；独立投递使用新的运行预算。"}
                   </p>
+                )}
+                {showBudget && (
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="agent-settle-seconds">收尾预留（秒）</Label>
+                      <Input id="agent-settle-seconds" type="number" min={0} step={1} value={settleSecs} onChange={(e) => setSettleSecs(e.target.value)} />
+                      <p className="text-muted-foreground text-xs">0 为自动；从运行总预算中预留，按实际剩余时间调整。</p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="agent-hard-buffer-seconds">硬宽限（秒）</Label>
+                      <Input id="agent-hard-buffer-seconds" type="number" min={0} step={1} placeholder="默认 15" value={hardBufferSecs} onChange={(e) => setHardBufferSecs(e.target.value)} />
+                      <p className="text-muted-foreground text-xs">留空采用默认值；0 无额外宽限。用于最终清理。</p>
+                    </div>
+                  </div>
                 )}
               </div>
               {showWebSearch && (

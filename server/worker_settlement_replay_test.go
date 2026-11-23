@@ -74,6 +74,9 @@ func TestWorkerSettlesAfterPendingProcessReceipt(t *testing.T) {
 				} else if calls == 1 {
 					input, _ := json.Marshal(map[string]any{"summary": "fixture verified", "intent_id": id, "evidence": "local synthetic fixture", "confidence": "observed"})
 					return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "record", Name: "record_fact", Input: input}}}, "tool_use", llm.Usage{}, nil
+				} else if calls == 2 {
+					input, _ := json.Marshal(map[string]any{"delivery_status": "complete", "summary": "execution receipt verified"})
+					return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "finish", Name: "finish_work", Input: input}}}, "tool_use", llm.Usage{}, nil
 				}
 				return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("Fixture finished.")}}, "end_turn", llm.Usage{}, nil
 			}}

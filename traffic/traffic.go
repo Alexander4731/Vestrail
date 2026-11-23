@@ -31,6 +31,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
@@ -135,12 +136,13 @@ const TrafficSearchDescription = "查询记录代理已抓取的目标流量（�
 
 // Traffic runs the recording proxy and owns the file tree + index.
 type Traffic struct {
-	dir   string
-	addr  string
-	db    *sql.DB
-	wmu   sync.Mutex // serializes record() vs DeleteHost (incl. blob GC)
-	seq   atomic.Int64
-	proxy *mproxy.Proxy
+	dir          string
+	addr         string
+	db           *sql.DB
+	wmu          sync.Mutex // serializes record() vs DeleteHost (incl. blob GC)
+	seq          atomic.Int64
+	proxy        *mproxy.Proxy
+	requestSlots chan struct{}
 	// fts reports whether the full-text index is available. False on a driver
 	// build without FTS5: recording and metadata search still work, body search
 	// degrades to unsupported rather than erroring.
@@ -195,7 +197,11 @@ func Open(dir, addr string) (*Traffic, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{})}
+	capTotal := kernel.DefaultSharedChannelCap
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("VESTRAIL_SHARED_CHANNEL_CAP"))); err == nil && n > 0 {
+		capTotal = n
+	}
+	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{}), requestSlots: make(chan struct{}, capTotal)}
 	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
@@ -368,7 +374,11 @@ func (t *Traffic) Close() error {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}
 	t.reaping.Wait()
-	return t.db.Close()
+	var proxyErr error
+	if t.proxy != nil {
+		proxyErr = t.proxy.Close()
+	}
+	return errors.Join(proxyErr, t.db.Close())
 }
 
 // stopping reports whether Close has been called. A nil channel (the zero value)
@@ -387,6 +397,43 @@ func (t *Traffic) DB() *sql.DB { return t.db }
 type sink struct {
 	mproxy.BaseAddon
 	t *Traffic
+}
+
+// Requestheaders reserves capacity before forwarding. Intercepted CONNECT is
+// only a TLS envelope; its inner HTTP flows acquire their own slots. Passthrough
+// CONNECT holds one slot until the tunnel closes.
+func (s *sink) Requestheaders(f *mproxy.Flow) {
+	if s.t.requestSlots == nil || f.Request == nil || f.Request.Raw() == nil {
+		return
+	}
+	if f.Request.Method == http.MethodConnect && f.ConnContext != nil && f.ConnContext.Intercept {
+		return
+	}
+	if !s.t.acquireRequest(f.Request.Raw().Context()) {
+		if f.Request.Method != http.MethodConnect {
+			f.Response = &mproxy.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{"X-Vestrail-Resource-Wait": []string{"cancelled"}}, Body: []byte("shared channel admission cancelled")}
+		}
+		return
+	}
+	go func() {
+		<-f.Done()
+		<-s.t.requestSlots
+	}()
+}
+
+func (t *Traffic) acquireRequest(ctx context.Context) bool {
+	select {
+	case t.requestSlots <- struct{}{}:
+		if ctx.Err() != nil {
+			<-t.requestSlots
+			return false
+		}
+		return true
+	case <-ctx.Done():
+		return false
+	case <-t.closed:
+		return false
+	}
 }
 
 func (s *sink) Response(f *mproxy.Flow) {

@@ -45,7 +45,7 @@ func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {
 			t.Fatalf("lost non-HTTP evidence: %+v %v", f, err)
 		}
 	}
-	if notices != 3 {
+	if notices != 1 {
 		t.Fatalf("successful reports notified %d times", notices)
 	}
 }

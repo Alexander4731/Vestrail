@@ -3,6 +3,7 @@ package kernel
 import (
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -13,6 +14,8 @@ type ArtifactRef struct {
 	Provenance string `json:"provenance"` // target_response | source_code | derived_diff | guess_wordlist | history_log
 	Valid      bool   `json:"valid"`
 	Note       string `json:"note,omitempty"`
+	Digest     string `json:"digest,omitempty"`
+	Size       int64  `json:"size,omitempty"`
 }
 
 // ResourceLock expresses reader-writer coordination across intents (F22).
@@ -33,6 +36,28 @@ type IntentContract struct {
 	MaxToolCalls   int            `json:"max_tool_calls,omitempty"`
 	AfterIntents   []int64        `json:"after_intents,omitempty"`
 	ResourceLocks  []ResourceLock `json:"resource_locks,omitempty"`
+}
+
+var portScopeRange = regexp.MustCompile(`(?i)(?:端口(?:段|范围)?|ports?(?:\s+range)?)\s*[:：]?\s*(\d{1,5})\s*[-–—]\s*(\d{1,5})`)
+
+func PortScopeBounds(scope string) (start, end int64, ok bool) {
+	m := portScopeRange.FindStringSubmatch(scope)
+	if len(m) == 0 {
+		return 0, 0, false
+	}
+	start, _ = strconv.ParseInt(m[1], 10, 64)
+	end, _ = strconv.ParseInt(m[2], 10, 64)
+	return start, end, start <= end && end <= 65535
+}
+
+// PortScopeContext preserves target/method text while comparing range slices.
+func PortScopeContext(scope string) (string, bool) {
+	matches := portScopeRange.FindAllStringIndex(scope, -1)
+	if len(matches) != 1 {
+		return "", false
+	}
+	m := matches[0]
+	return strings.Join(strings.Fields(scope[:m[0]]+"ports"+scope[m[1]:]), " "), true
 }
 
 const (

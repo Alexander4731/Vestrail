@@ -10,6 +10,7 @@ import (
 
 	"github.com/Alexander4731/Vestrail/agent"
 	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/kernel"
 )
 
 // 任务级超时协调器(见 docs/任务级超时与收尾设计.md §4/§8.5)。
@@ -18,10 +19,32 @@ import (
 //   ④ 等在跑 worker drain(受 grace) → ⑤ 终局一轮 planner 判定 → ⑥ 定终态(带守卫)
 
 const (
-	settleDrainGrace     = 90 * time.Second // 等在跑 worker 优雅收尾的上限;超过则硬 cancel
+	settleDrainGrace     = 90 * time.Second // 无在跑预算信息时的协调器看门狗
 	deadlinePollInterval = 2 * time.Second  // deadline 未盖章/LLM 未就绪时的轮询间隔
 	deadlineMaxSleep     = 30 * time.Second // 单次最长睡眠(便于周期复查终态)
 )
+
+type activeRunDeadline struct{ taskID string }
+
+func (e *Engine) observeRunBudget(ctx context.Context, taskID string) (context.Context, func()) {
+	key := &activeRunDeadline{taskID: taskID}
+	ctx = agent.WithRunBudgetObserver(ctx, func(deadline time.Time) { e.runDeadlines.Store(key, deadline) })
+	return ctx, func() { e.runDeadlines.Delete(key) }
+}
+
+func (e *Engine) taskDrainDeadline(taskID string, watchdog time.Time) time.Time {
+	e.runDeadlines.Range(func(key, value any) bool {
+		if key.(*activeRunDeadline).taskID == taskID {
+			// Final state/receipt commit has its own five-second write context.
+			deadline := value.(time.Time).Add(5 * time.Second)
+			if deadline.After(watchdog) {
+				watchdog = deadline
+			}
+		}
+		return true
+	})
+	return watchdog
+}
 
 // ---------- settling 状态 ----------
 
@@ -192,8 +215,9 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	// 超过 grace 仍未清空 → 硬 cancel 该任务 exec ctx(settling-aware 分支正确归类)。
 	hardStop := time.Now().Add(settleDrainGrace)
 	for e.inflightCount(t.ID) > 0 {
+		hardStop = e.taskDrainDeadline(t.ID, hardStop)
 		if time.Now().After(hardStop) {
-			log.Printf("[deadline] task %s drain 超时(%s),硬取消在跑 run", t.ID, settleDrainGrace)
+			log.Printf("[deadline] task %s 超过在跑 run 的收尾截止时间,硬取消", t.ID)
 			e.cancelExec(t.ID, agent.AbortSettleDrainTimeout)
 			_ = sleepCtx(ctx, 3*time.Second) // 给 worker 分支一点时间落库/归类
 			break
@@ -206,7 +230,16 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	// ⑤ 终局一轮 planner(任务超时词,最后目标判定,不产新意图)。
 	met := false
 	if e.inflightCount(t.ID) == 0 && ctx.Err() == nil {
-		finalCtx, cancel := context.WithTimeout(ctx, settleDrainGrace)
+		finalBudget := settleDrainGrace
+		if planner, _ := e.snapshotFor(t); planner != nil {
+			plan := planner.BudgetPlan(agent.TaskClock{Final: true})
+			if hard := plan.HardDuration(); hard > 0 {
+				finalBudget = hard
+			} else {
+				finalBudget = plan.SettleReserve + kernel.DefaultHardBuffer
+			}
+		}
+		finalCtx, cancel := context.WithTimeout(ctx, finalBudget)
 		met = e.runFinalPlannerRound(finalCtx, t)
 		cancel()
 	}

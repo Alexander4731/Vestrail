@@ -26,6 +26,9 @@ type EvidenceBatch struct {
 	ArtifactPath   string `json:"artifact_path,omitempty"`
 	ArtifactDigest string `json:"artifact_digest,omitempty"`
 	Provenance     string `json:"provenance,omitempty"`
+	Target         string `json:"target,omitempty"`
+	Method         string `json:"method,omitempty"`
+	Precondition   string `json:"precondition,omitempty"`
 }
 
 // CanonicalKey identifies the covered slice so distinct valid negative batches
@@ -51,8 +54,11 @@ func ValidateBatch(b EvidenceBatch) error {
 	if b.Attempted < 0 || b.UniqueCovered < 0 || b.Positive < 0 {
 		return fmt.Errorf("批次计数不能为负数")
 	}
-	if b.Positive > b.UniqueCovered && b.UniqueCovered > 0 {
+	if b.Positive > b.UniqueCovered {
 		return fmt.Errorf("批次阳性数 %d 不能大于唯一覆盖数 %d", b.Positive, b.UniqueCovered)
+	}
+	if b.UniqueCovered > b.Attempted {
+		return fmt.Errorf("唯一覆盖数不能大于尝试数")
 	}
 	if b.RangeStart != 0 || b.RangeEnd != 0 {
 		if b.RangeStart > b.RangeEnd {

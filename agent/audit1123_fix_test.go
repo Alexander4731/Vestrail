@@ -13,7 +13,7 @@ import (
 
 // F02/F03: Unified budget resolution for Worker, Planner, MainAgent (0 = truly unlimited).
 func TestAuditFix_RoleRunSecondsContract(t *testing.T) {
-	if plan := resolveBudgetPlan(0, TaskClock{}); plan.Total != 0 || plan.Explore != 0 || plan.SettleReserve != 0 {
+	if plan := resolveBudgetPlan(0, TaskClock{}); plan.Total != 0 || plan.Explore != 0 || plan.SettleReserve <= 0 {
 		t.Fatalf("run_seconds=0 must stay unlimited, got %+v", plan)
 	}
 	plan := resolveBudgetPlan(1200*time.Second, TaskClock{})

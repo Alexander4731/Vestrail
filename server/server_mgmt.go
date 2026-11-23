@@ -357,10 +357,12 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	// only trigger_* fields) leaves the untouched settings alone instead of resetting
 	// max_turns/run_seconds to 0.
 	var req struct {
-		MaxTurns         *int  `json:"max_turns"`
-		RunSeconds       *int  `json:"run_seconds"`
-		WebSearch        *bool `json:"web_search"`
-		InteractiveShell *bool `json:"interactive_shell"`
+		MaxTurns          *int            `json:"max_turns"`
+		RunSeconds        *int            `json:"run_seconds"`
+		SettleSeconds     *int            `json:"settle_seconds"`
+		HardBufferSeconds json.RawMessage `json:"hard_buffer_seconds"`
+		WebSearch         *bool           `json:"web_search"`
+		InteractiveShell  *bool           `json:"interactive_shell"`
 		// llm_profile_id 三态:字段缺省=不动;显式 null=解绑(跟随任务/全局);数字=绑定该 profile。
 		LLMProfileID json.RawMessage `json:"llm_profile_id"`
 		// P3 触发后处理策略(三者一起可选,提供任一即整体写入;未提供则不动)。
@@ -369,6 +371,21 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	budget := a.BudgetPolicy
+	budgetChanged := req.SettleSeconds != nil || req.HardBufferSeconds != nil
+	if req.SettleSeconds != nil {
+		budget.SettleSeconds = *req.SettleSeconds
+	}
+	if req.HardBufferSeconds != nil {
+		if err := json.Unmarshal(req.HardBufferSeconds, &budget.HardBufferSeconds); err != nil {
+			writeErr(w, 400, "hard_buffer_seconds 必须为非负秒数或 null")
+			return
+		}
+	}
+	if err := db.ValidateAgentBudget(budget); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -401,12 +418,8 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.RunSeconds != nil {
-		rs := *req.RunSeconds
-		if rs < 0 {
-			rs = 0
-		}
-		if err := pg.SetAgentRunSeconds(a.Key, rs); err != nil {
+	if req.RunSeconds != nil || budgetChanged {
+		if err := pg.SetAgentRunBudget(a.Key, req.RunSeconds, &budget); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -462,6 +475,10 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RunSeconds != nil {
 		resp["run_seconds"] = *req.RunSeconds
+	}
+	if budgetChanged {
+		resp["settle_seconds"] = budget.SettleSeconds
+		resp["hard_buffer_seconds"] = budget.HardBufferSeconds
 	}
 	writeJSON(w, 200, resp)
 }

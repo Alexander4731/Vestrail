@@ -20,11 +20,11 @@ const (
 )
 
 const (
-	DefaultHardBuffer   = 15 * time.Second
-	MinSettleReserve    = 20 * time.Second
-	MaxSettleReserve    = 90 * time.Second
-	MinShortRunReserve  = 5 * time.Second
-	ShortRunThreshold   = 30 * time.Second
+	DefaultHardBuffer  = 15 * time.Second
+	MinSettleReserve   = 20 * time.Second
+	MaxSettleReserve   = 90 * time.Second
+	MinShortRunReserve = 5 * time.Second
+	ShortRunThreshold  = 30 * time.Second
 )
 
 // BudgetPlan splits a run's wall-clock budget into an exploration window,
@@ -35,12 +35,22 @@ type BudgetPlan struct {
 	SettleReserve time.Duration // bounded wrap-up window after explore ends
 	HardBuffer    time.Duration // final hard-kill cushion after Total
 	ClampedByTask bool
+	TaskExpired   bool
+}
+
+type BudgetPolicy struct {
+	SettleSeconds     int  `json:"settle_seconds"`
+	HardBufferSeconds *int `json:"hard_buffer_seconds"`
 }
 
 // ComputeBudgetPlan derives a unified two-phase budget for Worker, Planner,
 // and MainAgent. ownSeconds <= 0 means the agent itself has no time cap
 // (never silently rewritten to 5 minutes).
 func ComputeBudgetPlan(ownSeconds int, taskDeadlineUnix int64, now time.Time) BudgetPlan {
+	return ComputeBudgetPlanWithPolicy(ownSeconds, taskDeadlineUnix, now, BudgetPolicy{})
+}
+
+func ComputeBudgetPlanWithPolicy(ownSeconds int, taskDeadlineUnix int64, now time.Time, policy BudgetPolicy) BudgetPlan {
 	var own time.Duration
 	if ownSeconds > 0 {
 		own = time.Duration(ownSeconds) * time.Second
@@ -49,8 +59,8 @@ func ComputeBudgetPlan(ownSeconds int, taskDeadlineUnix int64, now time.Time) Bu
 	var clamped bool
 	if taskDeadlineUnix > 0 {
 		rem := time.Unix(taskDeadlineUnix, 0).Sub(now)
-		if rem < time.Second {
-			rem = time.Second
+		if rem <= 0 {
+			return BudgetPlan{TaskExpired: true, ClampedByTask: true}
 		}
 		if own <= 0 || rem <= own {
 			total = rem
@@ -62,10 +72,16 @@ func ComputeBudgetPlan(ownSeconds int, taskDeadlineUnix int64, now time.Time) Bu
 		total = own
 	}
 	if total <= 0 {
-		return BudgetPlan{}
+		reserve := MinSettleReserve
+		if policy.SettleSeconds > 0 {
+			reserve = time.Duration(policy.SettleSeconds) * time.Second
+		}
+		return BudgetPlan{SettleReserve: reserve}
 	}
 	var reserve time.Duration
-	if total <= ShortRunThreshold {
+	if policy.SettleSeconds > 0 {
+		reserve = min(time.Duration(policy.SettleSeconds)*time.Second, total/2)
+	} else if total <= ShortRunThreshold {
 		reserve = total / 3
 		if reserve < MinShortRunReserve && total > MinShortRunReserve {
 			reserve = MinShortRunReserve
@@ -82,15 +98,15 @@ func ComputeBudgetPlan(ownSeconds int, taskDeadlineUnix int64, now time.Time) Bu
 			reserve = MaxSettleReserve
 		}
 	}
-	explore := total - reserve
-	if explore < time.Second {
-		explore = time.Second
+	hard := DefaultHardBuffer
+	if policy.HardBufferSeconds != nil {
+		hard = time.Duration(max(0, *policy.HardBufferSeconds)) * time.Second
 	}
 	return BudgetPlan{
 		Total:         total,
-		Explore:       explore,
+		Explore:       total - reserve,
 		SettleReserve: reserve,
-		HardBuffer:    DefaultHardBuffer,
+		HardBuffer:    hard,
 		ClampedByTask: clamped,
 	}
 }

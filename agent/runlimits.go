@@ -39,6 +39,12 @@ func (e *BudgetTimeoutError) Unwrap() []error {
 }
 
 type extraBashEnvKey struct{}
+type runBudgetObserverKey struct{}
+
+// WithRunBudgetObserver reports the hard deadline computed for an actual run.
+func WithRunBudgetObserver(ctx context.Context, observe func(time.Time)) context.Context {
+	return context.WithValue(ctx, runBudgetObserverKey{}, observe)
+}
 
 // WithExtraBashEnv appends extra KEY=VALUE pairs (e.g. shared channel concurrency budget)
 // to a worker's subprocess environment without mutating shared Worker state (F21).
@@ -60,22 +66,38 @@ func extraBashEnvFrom(ctx context.Context) []string {
 // resolveBudgetPlan computes the unified Explore/Settle/Hard budget plan for any
 // role (Worker, Planner, MainAgent). ownTimeout <= 0 means unlimited (F02/F03).
 func resolveBudgetPlan(ownTimeout time.Duration, tc TaskClock) kernel.BudgetPlan {
+	return resolveBudgetPlanWithPolicy(ownTimeout, tc, kernel.BudgetPolicy{})
+}
+
+func resolveBudgetPlanWithPolicy(ownTimeout time.Duration, tc TaskClock, policy kernel.BudgetPolicy) kernel.BudgetPlan {
 	ownSec := int(ownTimeout / time.Second)
 	if ownTimeout > 0 && ownSec <= 0 {
 		ownSec = 1
 	}
-	return kernel.ComputeBudgetPlan(ownSec, tc.DeadlineUnix, time.Now())
+	deadline := tc.DeadlineUnix
+	if tc.Final {
+		deadline = 0
+	}
+	return kernel.ComputeBudgetPlanWithPolicy(ownSec, deadline, time.Now(), policy)
 }
 
 // runBudgetDeadline attaches the exploration approval deadline and final hard backstop
 // (Total + HardBuffer) using the unified two-phase BudgetPlan (F01/F03).
 func runBudgetDeadline(ctx context.Context, plan kernel.BudgetPlan) (context.Context, context.CancelFunc) {
+	if plan.TaskExpired {
+		return context.WithDeadlineCause(ctx, time.Now().Add(-time.Second), AbortRunHardTimeout)
+	}
 	if plan.Total <= 0 {
 		return ctx, func() {}
 	}
 	now := time.Now()
+	hardDeadline := now.Add(plan.HardDuration())
+	if observe, ok := ctx.Value(runBudgetObserverKey{}).(func(time.Time)); ok {
+		observe(hardDeadline)
+	}
 	ctx = intercept.WithApprovalDeadline(ctx, now.Add(plan.Explore))
-	return context.WithDeadlineCause(ctx, now.Add(plan.HardDuration()), AbortRunHardTimeout)
+	ctx = harness.WithPhaseDeadlines(ctx, now.Add(plan.Explore), now.Add(plan.Total))
+	return context.WithDeadlineCause(ctx, hardDeadline, AbortRunHardTimeout)
 }
 
 // runDeadline is retained for existing internal tests/callers.

@@ -26,16 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_intent_run_receipts_lookup
     ON intent_run_receipts (exploration_id, intent_id, id DESC);
 `
 
-// SaveIntentReceipt persists one authoritative RunReceipt for an intent execution.
-func (d *DB) SaveIntentReceipt(ctx context.Context, r kernel.RunReceipt) error {
-	if d == nil || r.IntentID <= 0 || r.ExplorationID <= 0 {
-		return nil
-	}
-	raw, err := json.Marshal(r)
-	if err != nil {
-		return err
-	}
-	_, err = d.ExecContext(ctx, `
+const intentReceiptInsertSQL = `
 INSERT INTO intent_run_receipts(
     task_id, exploration_id, intent_id, run_seq,
     termination_code, delivery_status, settled_state, has_net_gain, receipt_json
@@ -44,9 +35,23 @@ VALUES (
     $1, $2, $3,
     COALESCE((SELECT MAX(run_seq)+1 FROM intent_run_receipts WHERE exploration_id=$2 AND intent_id=$3), 1),
     $4, $5, $6, $7, $8::jsonb
-)`,
-		r.TaskID, r.ExplorationID, r.IntentID,
-		string(r.TerminationCode), string(r.DeliveryStatus), r.SettledState, r.HasNetGain(), string(jsonbClean(raw)))
+)`
+
+func receiptArguments(r kernel.RunReceipt, raw []byte) []any {
+	return []any{r.TaskID, r.ExplorationID, r.IntentID,
+		string(r.TerminationCode), string(r.DeliveryStatus), r.SettledState, r.HasNetGain(), string(jsonbClean(raw))}
+}
+
+// SaveIntentReceipt persists a receipt independently of a state transition.
+func (d *DB) SaveIntentReceipt(ctx context.Context, r kernel.RunReceipt) error {
+	if d == nil || r.IntentID <= 0 || r.ExplorationID <= 0 {
+		return nil
+	}
+	raw, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	_, err = d.ExecContext(ctx, intentReceiptInsertSQL, receiptArguments(r, raw)...)
 	return err
 }
 

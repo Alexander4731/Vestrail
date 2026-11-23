@@ -11,6 +11,7 @@ import (
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/guard"
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -28,6 +29,7 @@ type Planner struct {
 	bootTag           string
 	guard             *guard.Guard
 	runTimeout        time.Duration
+	budgetPolicy      kernel.BudgetPolicy
 	findingRecorder   FindingRecorder
 	prov              llm.Provider
 	model             string
@@ -58,6 +60,12 @@ type Planner struct {
 func (p *Planner) SetGuard(g *guard.Guard) { p.guard = g }
 
 func (p *Planner) SetRunTimeout(d time.Duration) { p.runTimeout = d }
+
+func (p *Planner) BudgetPlan(clock TaskClock) kernel.BudgetPlan {
+	return resolveBudgetPlanWithPolicy(p.runTimeout, clock, p.budgetPolicy)
+}
+
+func (p *Planner) SetBudgetPolicy(policy kernel.BudgetPolicy) { p.budgetPolicy = policy }
 
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
 	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}}
@@ -337,7 +345,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
      · **done（正常跑完）**：已覆盖 → 不原样重派；是否死路看它 yields 出的 fact 结论、而非 state；仅出现【材料性新机理】（新事实/资产/参数/明显不同的打法）才重派，且 summary 写清与上次的不同；换措辞、"再试一次说不定行"不算，禁止重试。
      · **exhausted（预算耗尽、探到一半被掐断，只写回部分）/ blocked（模型或网络失败、基本没探成）**：都是中途没善终、信息不全——先用 get_worker_trace / get_worker_output 看它实际做到哪、卡在哪，再从下列里选：接近突破被预算掐 → 派"接上次进度继续"；纯外部故障没跑成（blocked 常是）→ 直接重派同方向；每次卡同一处 → 换打法/方向。依据永远是 trace 里的真实进度，不是 state 本身。
    - 完全无任何意图覆盖的全新方向 → 生成。
-   - 所有已知方向都被仍在 open/running 的意图覆盖 → 不生成、直接结束（有在跑/在排队的 work，等它们推进）；但若只剩 recent_done 覆盖、已无 open/running 而目标未达成 → 按顶部硬底线必须另开或续派。
+   - 已知方向正被 open/running 意图覆盖时等待推进；队列为空时检查新证据、剩余范围和前提变化。依据不足就说明阻塞条件并结束本轮；有可验证的变化才另开或接力。
    - **深度优先于覆盖度**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口（可能通向 RCE/提权/数据外泄）后，优先派意图把那条路【往深打穿】，而不是为拉平覆盖度去铺广、逐个资产浅测。
    - **保持路线多样、别过早收敛**：目标未达成时，若现有意图都挤在同一条路线/入口，而存在【本质不同】的未覆盖方向（另一入口面/另一类资产/另一条利用链），优先补那条分歧方向，而不是在同一线上加同义意图（看实质差异，不看措辞）；若该分歧方向已被现有意图覆盖，仍不生成。理想是 2–3 条机理不同的路线并存（如"从上传链打"与"从认证绕过打"），某条交出【目标逼近】的证据后才把资源集中过去。**但多样性永远服从顶部【操作约束】**：被约束排除的入口面/端口/主机/操作，即使本质不同也绝不生成意图。
 
@@ -345,6 +353,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 5. **提交**：用【一次】add_intent 批量提交筛出的新方向（intents 数组，最多 4 个最高价值的，不要逐条多次调）：
    - **summary**：≤160 字的紧凑索引（目标 + 核心方向 + 为什么）；详细背景、参数、产物路径、验收与止损边界放 **brief** 或结构化字段（scope/hypothesis/inputs/max_tool_calls）。
+   - 每条意图必须给出 scope、deliverable、max_tool_calls（0 明确不限），并按需提供前提、输入产物与 after_intents。接力从 checkpoint.remaining_scope 和已核验产物开始；工具报缺项时汇总补齐，不能把检查缺项交给 Worker 猜。
    - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——纯全局侦察无具体资产才留空。
    - **parent_ids**：**严格只填已存在的 fact/finding 证据节点 id**（禁止填 intent/goal/hint 节点 id）；顶层全新方向留空。
    - **continue_intent_id**：需要接力本任务已 done/exhausted 上游意图的执行线、工作目录与断点时传其 intent id（不要错填进 parent_ids）。
@@ -462,7 +471,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	system, boundary := deferredSystem(sysBody, def)
 	// run_seconds=0 表示真正不限时（不再静默回落 5 分钟），两阶段预算预留收尾窗 (F01/F02/F03)。
-	plan := resolveBudgetPlan(p.runTimeout, tc)
+	plan := resolveBudgetPlanWithPolicy(p.runTimeout, tc, p.budgetPolicy)
 	ctx, cancelRun := runBudgetDeadline(ctx, plan)
 	defer cancelRun()
 	settle := wrapupSettlement("planner", nil)

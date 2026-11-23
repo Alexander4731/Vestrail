@@ -30,8 +30,12 @@ type workerFailureGuard struct {
 	probeTurns, stagnantTurns, settleGrace int
 	steered                                bool
 	recentFPs                              [][32]byte
-	seenBatchKeys                          map[string]bool
+	coverage                               *kernel.CoverageTracker
+	coveredDelta                           int64
+	baselineBatches                        []kernel.EvidenceBatch
 	validBatches                           []kernel.EvidenceBatch
+	settlementRequester                    func(kernel.TerminationCode)
+	requestedCode                          kernel.TerminationCode
 
 	// Per-intent tool budget (F17): 0 = unlimited. Write-back tools are never counted or blocked.
 	maxProbeTools  int
@@ -46,10 +50,78 @@ func newWorkerFailureGuard(cancel context.CancelCauseFunc) *workerFailureGuard {
 func newWorkerFailureGuardWithBudget(cancel context.CancelCauseFunc, maxProbeTools int) *workerFailureGuard {
 	return &workerFailureGuard{
 		entries:       map[[32]byte]failedToolAttempt{},
-		seenBatchKeys: map[string]bool{},
+		coverage:      kernel.NewCoverageTracker(""),
 		cancel:        cancel,
 		progress:      agent.OptimizationEnabled("VESTRAIL_OPT_PROGRESS_GUARD"),
 		maxProbeTools: max(0, maxProbeTools),
+	}
+}
+
+func (g *workerFailureGuard) seedCoverage(scope string, batches []kernel.EvidenceBatch) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.coverage = kernel.NewCoverageTracker(scope)
+	g.coverage.Seed(batches)
+	g.baselineBatches = append([]kernel.EvidenceBatch(nil), batches...)
+	g.coveredDelta = 0
+}
+
+func (g *workerFailureGuard) addInputCoverage(batches []kernel.EvidenceBatch) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, batch := range batches {
+		if g.coverage.Add(batch) > 0 {
+			g.baselineBatches = append(g.baselineBatches, batch)
+		}
+	}
+}
+
+func (g *workerFailureGuard) evidenceBatches(baselineOnly bool) []kernel.EvidenceBatch {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	batches := append([]kernel.EvidenceBatch(nil), g.baselineBatches...)
+	if !baselineOnly {
+		batches = append(batches, g.validBatches...)
+	}
+	return batches
+}
+
+func (g *workerFailureGuard) coverageDelta() int64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.coveredDelta
+}
+
+func (g *workerFailureGuard) setSettlementRequester(fn func(kernel.TerminationCode)) {
+	g.mu.Lock()
+	g.settlementRequester = fn
+	g.mu.Unlock()
+}
+
+func (g *workerFailureGuard) requestedTerminationCode() kernel.TerminationCode {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.requestedCode
+}
+
+func (g *workerFailureGuard) requestSettlement(code kernel.TerminationCode) {
+	g.mu.Lock()
+	if g.requestedCode != "" {
+		g.mu.Unlock()
+		return
+	}
+	g.requestedCode = code
+	fn := g.settlementRequester
+	g.mu.Unlock()
+	if fn != nil {
+		fn(code)
+	} else if g.cancel != nil {
+		switch code {
+		case kernel.TermNoProgress:
+			g.cancel(agent.AbortNoProgressStagnation)
+		case kernel.TermRepeatedToolFailure:
+			g.cancel(agent.AbortRepeatedToolFailure)
+		}
 	}
 }
 
@@ -99,6 +171,7 @@ func (g *workerFailureGuard) before(name string, input []byte) (bool, string) {
 	// Track C: per-intent explicit tool budget (F17).
 	if g.maxProbeTools > 0 && g.probeToolCount >= g.maxProbeTools {
 		g.mu.Unlock()
+		g.requestSettlement(kernel.TermBudgetRun)
 		return true, fmt.Sprintf("【工具预算已达上限】本意图限定最多 %d 次探测/操作工具调用，当前已用完。请立即使用 record_fact / report_finding / insert_assets 写回已有结论与断点并总结结束。", g.maxProbeTools)
 	}
 	// Track B: semantic stagnation guard.
@@ -107,8 +180,8 @@ func (g *workerFailureGuard) before(name string, input []byte) (bool, string) {
 			g.settleGrace++
 			stop := g.settleGrace >= 3
 			g.mu.Unlock()
-			if stop && g.cancel != nil {
-				g.cancel(agent.AbortNoProgressStagnation)
+			if stop {
+				g.requestSettlement(kernel.TermNoProgress)
 			}
 			return true, "【无进展收尾】探测持续没有新信息，请立即写回已验证结论并总结结束。写回工具仍然开放。"
 		}
@@ -121,6 +194,7 @@ func (g *workerFailureGuard) before(name string, input []byte) (bool, string) {
 	// Track A: repeated identical tool failure guard.
 	entry := g.entries[key]
 	if entry.failures < 3 {
+		g.probeToolCount++
 		g.mu.Unlock()
 		return false, ""
 	}
@@ -128,26 +202,35 @@ func (g *workerFailureGuard) before(name string, input []byte) (bool, string) {
 	g.entries[key] = entry
 	stop := entry.warnings >= 3
 	g.mu.Unlock()
-	if stop && g.cancel != nil {
-		g.cancel(agent.AbortRepeatedToolFailure)
+	if stop {
+		g.requestSettlement(kernel.TermRepeatedToolFailure)
 	}
 	return true, "【重复失败纠偏】同一工具及参数已经失败三次，本次未执行。请读取已有结果、验证缺失前提、采用不同方法，或写回真实失败依据并交回规划者；不要重复同一操作。"
 }
 
 func (g *workerFailureGuard) after(name string, input []byte, isError bool, result ...[]byte) {
 	key := toolAttemptKey(name, input)
+	request := false
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	defer func() {
+		g.mu.Unlock()
+		if request {
+			g.requestSettlement(kernel.TermNoProgress)
+		}
+	}()
 	g.totalToolCalls++
-	if !progressWrite(name) {
-		g.probeToolCount++
-	}
-	if g.progress && len(result) > 0 {
+	if len(result) > 0 {
 		unwrapped := unwrapToolResult(result[0])
-		if progressWrite(name) && !isError && meaningfulWrite(unwrapped) {
+		if g.progress && progressWrite(name) && !isError && meaningfulWrite(unwrapped) {
 			g.stagnantTurns = 0
 			g.steered = false
 			g.settleGrace = 0
+		}
+		if g.progress && progressWrite(name) && name != "finish_work" && (isError || !meaningfulWrite(unwrapped)) {
+			g.stagnantTurns++
+			if g.stagnantTurns >= 23 && g.requestedCode == "" {
+				request = true
+			}
 		}
 		if progressProbe(name) {
 			g.probeTurns++
@@ -160,26 +243,23 @@ func (g *workerFailureGuard) after(name string, input []byte, isError bool, resu
 					if err := kernel.ValidateBatch(b); err != nil {
 						continue
 					}
-					if b.Valid && b.PreconditionOK && b.UniqueCovered > 0 {
-						bk := b.CanonicalKey()
-						if bk == "" || !g.seenBatchKeys[bk] {
-							if bk != "" {
-								g.seenBatchKeys[bk] = true
-							}
+					if !isError {
+						if delta := g.coverage.Add(b); delta > 0 {
+							g.coveredDelta += delta
 							g.validBatches = append(g.validBatches, b)
 							newValidCoverage = true
 						}
 					}
 				}
-				if !isError && newValidCoverage {
+				if g.progress && !isError && newValidCoverage {
 					g.stagnantTurns = 0
 					g.steered = false
 					g.settleGrace = 0
-				} else if g.probeTurns > 25 {
+				} else if g.progress && g.probeTurns > 25 {
 					g.stagnantTurns++
 				}
-			} else {
-				fp := responseFingerprintWithInput(name, input, unwrapped, isError)
+			} else if g.progress {
+				fp := responseFingerprint(name, unwrapped, isError)
 				seen := false
 				for _, old := range g.recentFPs {
 					if old == fp {
@@ -228,7 +308,7 @@ func progressProbe(name string) bool {
 	return name == "Bash" || name == "RunScript" || name == "WebFetch"
 }
 func progressWrite(name string) bool {
-	return name == "record_fact" || name == "report_finding" || name == "insert_assets"
+	return name == "record_fact" || name == "report_finding" || name == "insert_assets" || name == "finish_work"
 }
 
 // unwrapToolResult unwraps the JSON string wrapper added by norma/harness PostToolUse
@@ -249,6 +329,23 @@ func meaningfulWrite(result []byte) bool {
 	raw := bytes.TrimSpace(unwrapToolResult(result))
 	if len(raw) == 0 {
 		return false
+	}
+	jsonRaw := raw
+	if index := bytes.IndexByte(raw, '{'); index > 0 {
+		jsonRaw = raw[index:]
+	}
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(jsonRaw, &envelope) == nil {
+		if value, ok := envelope["first_written_this_run"]; ok {
+			var ids []int64
+			return json.Unmarshal(value, &ids) == nil && len(ids) > 0
+		}
+		for _, key := range []string{"research_gain", "gain"} {
+			if value, ok := envelope[key]; ok {
+				var gain kernel.ResearchGain
+				return json.Unmarshal(value, &gain) == nil && (gain.Evidence > 0 || gain.Coverage > 0 || gain.Artifacts > 0)
+			}
+		}
 	}
 	if recordedTextIDRE.Match(raw) {
 		return true
@@ -283,21 +380,11 @@ func meaningfulWrite(result []byte) bool {
 	return false
 }
 
-var fpUUID = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-var fpTime = regexp.MustCompile(`\b(?:[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]|)[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?`)
-var fpHex = regexp.MustCompile(`(?i)\b[0-9a-f]{16,}\b`)
-var fpDuration = regexp.MustCompile(`\b[0-9]+(?:\.[0-9]+)?(?:ms|us|µs|ns|s)\b`)
-var fpLongDigits = regexp.MustCompile(`\b[0-9]{8,}\b`)
-
 // normalizedResponse strips volatile timestamps, UUIDs, long hex tokens, latency jitter,
 // and >=8-digit nonces/epoch numbers while PRESERVING 1–7 digit numbers (ports, ranges,
 // batch offsets, counts) so distinct negative coverage slices never collide (F19).
 func normalizedResponse(data []byte) []byte {
-	data = fpUUID.ReplaceAll(data, []byte("<uuid>"))
-	data = fpTime.ReplaceAll(data, []byte("<time>"))
-	data = fpHex.ReplaceAll(data, []byte("<hex>"))
-	data = fpDuration.ReplaceAll(data, []byte("<dur>"))
-	return fpLongDigits.ReplaceAll(data, []byte("<bignum>"))
+	return kernel.NormalizeObservation(data)
 }
 
 func responseFingerprint(name string, result []byte, isError bool) [32]byte {

@@ -13,8 +13,8 @@ import (
 // AddAdHocIntentLinked atomically creates a single intent for MainAgent direct
 // dispatch (F23/F24). When the task is actively running and not paused, it enters
 // state='open' (standalone=false). When the task is paused or terminal (done /
-// timeout / failed) — and not deleted or archived — it enters state='running'
-// with owner='adhoc' (standalone=true) so the worker pool never sees it and the
+// timeout / failed) — and not deleted or archived — it enters state='open'
+// with owner='adhoc' (standalone=true) for scoped resource admission, so the pool never sees it and the
 // old queue is never disturbed.
 func (s *ExplorationStore) AddAdHocIntentLinked(payload map[string]any, priority int, origin string, anchors, parents []int64, relation string) (id int64, standalone bool, err error) {
 	raw, err := json.Marshal(payload)
@@ -34,7 +34,6 @@ func (s *ExplorationStore) AddAdHocIntentLinked(payload map[string]any, priority
 	owner := ""
 	if paused || IsTerminal(status) {
 		standalone = true
-		state = "running"
 		owner = "adhoc"
 	}
 	if err := tx.QueryRow(`
@@ -261,11 +260,11 @@ func (s *ExplorationStore) ActivityTraceWindowWithSources(q ActivityTraceQuery) 
 
 // RunningIntentDigest summarizes live execution progress for one running worker (F16).
 type RunningIntentDigest struct {
-	Steps         int       `json:"steps"`
-	RecentErrors  int       `json:"recent_errors"`
-	StartedAt     time.Time `json:"-"`
-	ElapsedSec    int64     `json:"elapsed_s"`
-	LatestAction  string    `json:"latest_action,omitempty"`
+	Steps        int       `json:"steps"`
+	RecentErrors int       `json:"recent_errors"`
+	StartedAt    time.Time `json:"-"`
+	ElapsedSec   int64     `json:"elapsed_s"`
+	LatestAction string    `json:"latest_action,omitempty"`
 }
 
 // LatestRunningDigests returns compact 1-line live execution summaries for a batch

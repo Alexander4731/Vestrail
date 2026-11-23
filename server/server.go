@@ -23,6 +23,7 @@ import (
 	"github.com/Alexander4731/Vestrail/agent"
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Alexander4731/Vestrail/llmpool"
 	"github.com/Alexander4731/Vestrail/llmrec"
 	"github.com/Alexander4731/Vestrail/report"
@@ -334,6 +335,15 @@ func (s *Server) agentRunSeconds(key string) int {
 		return 1200
 	}
 	return a.RunSecs
+}
+
+func (s *Server) agentRunBudget(key string) (int, kernel.BudgetPolicy) {
+	if s.m.pg != nil {
+		if a, err := s.m.pg.GetAgentByKey(key); err == nil && a != nil {
+			return a.RunSecs, a.BudgetPolicy
+		}
+	}
+	return 1200, kernel.BudgetPolicy{}
 }
 
 // loadLLMConfig reads the active LLM profile from PG (llm_profiles).

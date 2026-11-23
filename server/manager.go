@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1729,8 +1730,22 @@ func (s *taskFileDeleteStage) commit() error {
 	if s == nil || s.done {
 		return nil
 	}
-	err := os.RemoveAll(s.stageDir)
+	err := removeTaskFileStage(s.stageDir)
 	s.done = true
+	return err
+}
+
+// Windows can retain pending directory entries briefly after files are closed.
+func removeTaskFileStage(path string) error {
+	err := os.RemoveAll(path)
+	if runtime.GOOS != "windows" || !os.IsExist(err) {
+		return err
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for os.IsExist(err) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		err = os.RemoveAll(path)
+	}
 	return err
 }
 
@@ -1757,7 +1772,7 @@ func (s *taskFileDeleteStage) rollback() error {
 		}
 	}
 	if len(errs) == 0 && s.stageDir != "" {
-		if err := os.RemoveAll(s.stageDir); err != nil {
+		if err := removeTaskFileStage(s.stageDir); err != nil {
 			errs = append(errs, fmt.Errorf("remove task file stage: %w", err))
 		}
 	}

@@ -31,10 +31,8 @@ func validWorkerMessageRequestID(id string) bool {
 // resume-from-transcript path the worker uses on a normal resume (ExecuteWithMessage),
 // so this reuses the existing pause/resume machinery rather than a bespoke protocol.
 // The run happens in a dedicated goroutine outside the worker pool (runDetachedIntent),
-// so the message is picked up immediately even when every pool slot is busy — the same
-// way the main-agent chat handler starts its run directly. In-memory only: a process
-// restart re-runs the intent from its transcript without the message, which is
-// acceptable for this rare interrupt-then-continue action.
+// after the intent's resources are available. A restart pauses unclaimed messages;
+// messages already injected into the transcript are deduplicated by request_id.
 func (s *Server) sendWorkerMessage(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.m.Task(r.PathValue("id"))
 	if !ok {
@@ -124,8 +122,8 @@ func (s *Server) sendWorkerMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// runDetachedIntent transitions paused->running, emits the user turn and starts a
-	// dedicated run. Root the run at s.ctx so a disconnected browser cannot strand it
+	// runDetachedIntent reserves the paused intent, emits the user turn and starts a
+	// resource admission wait. Root it at s.ctx so a disconnected browser cannot strand it
 	// while task pause/delete/shutdown still stop it.
 	if err := s.engine.runDetachedIntent(s.ctx, t, iid, requestID, message, agentMessage); err != nil {
 		switch {
@@ -139,7 +137,7 @@ func (s *Server) sendWorkerMessage(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":         iid,
-		"state":      "running",
+		"state":      "open",
 		"accepted":   true,
 		"request_id": requestID,
 	})

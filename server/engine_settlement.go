@@ -9,6 +9,7 @@ import (
 	"github.com/Alexander4731/Vestrail/agent"
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 )
 
 func (e *Engine) pauseForInput(t *Task, reason string) {
@@ -21,12 +22,12 @@ func (e *Engine) pauseForInput(t *Task, reason string) {
 
 // Keep the worker admission and its result until PostgreSQL acknowledges it.
 // Shutdown gets one bounded final write; it never starts another Execute.
-func settleIntent(ctx context.Context, store *db.ExplorationStore, id int64, state, reason string) error {
+func settleIntent(ctx context.Context, store *db.ExplorationStore, id int64, state, reason string, receipts ...kernel.RunReceipt) error {
 	finish := intercept.BeginPhase(ctx, "settling")
 	defer finish()
 	for {
 		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		err := store.SettleIntent(writeCtx, id, state, reason)
+		err := store.SettleIntent(writeCtx, id, state, reason, receipts...)
 		cancel()
 		if err == nil || errors.Is(err, db.ErrIntentStateConflict) {
 			return err

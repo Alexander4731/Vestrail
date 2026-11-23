@@ -236,9 +236,9 @@ type loop struct {
 	settleCtx  context.Context
 	stopSettle context.CancelFunc
 	in         QueryInput
-	deps    QueryDeps
-	yield   func(Event, error) bool
-	sem     chan struct{} // bounds concurrent tool execution
+	deps       QueryDeps
+	yield      func(Event, error) bool
+	sem        chan struct{} // bounds concurrent tool execution
 
 	messages        []llm.Message
 	usage           llm.Usage
@@ -392,7 +392,11 @@ func (l *loop) initSettleCtx() {
 		l.stopSettle = nil
 	}
 	if l.in.SettleDuration > 0 {
-		l.settleCtx, l.stopSettle = context.WithTimeout(l.ctx, l.in.SettleDuration)
+		deadline := time.Now().Add(l.in.SettleDuration)
+		if phases, ok := l.ctx.Value(phaseDeadlinesKey{}).(phaseDeadlines); ok && !phases.settle.IsZero() && phases.settle.Before(deadline) {
+			deadline = phases.settle
+		}
+		l.settleCtx, l.stopSettle = context.WithDeadline(l.ctx, deadline)
 	} else {
 		l.settleCtx = l.ctx
 	}
@@ -424,7 +428,11 @@ func (l *loop) run() {
 	l.toolCtx = l.ctx
 	if l.in.MaxDuration > 0 {
 		var stopExplore context.CancelFunc
-		l.exploreCtx, stopExplore = context.WithDeadline(l.ctx, l.startTime.Add(l.in.MaxDuration))
+		deadline := l.startTime.Add(l.in.MaxDuration)
+		if phases, ok := l.ctx.Value(phaseDeadlinesKey{}).(phaseDeadlines); ok && !phases.explore.IsZero() && phases.explore.Before(deadline) {
+			deadline = phases.explore
+		}
+		l.exploreCtx, stopExplore = context.WithDeadline(l.ctx, deadline)
 		defer stopExplore()
 		l.toolCtx = l.exploreCtx
 	}
@@ -432,6 +440,9 @@ func (l *loop) run() {
 	for {
 		if l.ctx.Err() != nil {
 			l.finish(ReasonAbortedStreaming, l.ctx.Err(), "")
+			return
+		}
+		if l.finishRequested() {
 			return
 		}
 		// Defensive backstop against a pathological recovery/continuation loop.
@@ -442,15 +453,45 @@ func (l *loop) run() {
 			l.finish(ReasonMaxTurns, nil, "")
 			return
 		}
+		if !l.settling {
+			if reason, requested := takeSettlementRequest(l.ctx); requested {
+				if !l.beginSettlement(reason, &schemas) {
+					l.finish(reason, nil, "")
+					return
+				}
+				l.initSettleCtx()
+			}
+		}
+		if l.settling && l.settleCtx != nil && l.settleCtx.Err() != nil {
+			l.finish(l.settleReason, nil, "")
+			return
+		}
 
 		// Non-destructive proactive compaction (MicroCompact → AutoCompact).
 		if l.in.Compactor != nil {
-			l.messages = l.in.Compactor.Pre(l.ctx, l.messages, l.lastInputTokens)
+			l.messages = l.in.Compactor.Pre(l.modelCallContext(), l.messages, l.lastInputTokens)
 			l.recordNewBoundary()
+		}
+		if !l.settling && l.exploreCtx != nil && l.exploreCtx.Err() != nil {
+			if l.beginSettlement(ReasonTimeout, &schemas) {
+				l.initSettleCtx()
+				continue
+			}
+			l.finish(ReasonTimeout, nil, "")
+			return
+		}
+		if l.settling && l.settleCtx != nil && l.settleCtx.Err() != nil {
+			l.finish(l.settleReason, nil, "")
+			return
 		}
 
 		usageBefore := l.usage
 		asst, exec, stopReason, streamErr, consumerStopped, aborted := l.streamAndExecute(schemas)
+		if _, requested := requestedCompletion(l.ctx); requested && l.ctx.Err() == nil {
+			// A host-validated delivery survives a late transport failure. Keep
+			// recording the assistant/tool results before ending the run.
+			streamErr, aborted = nil, false
+		}
 		if consumerStopped {
 			return
 		}
@@ -477,11 +518,19 @@ func (l *loop) run() {
 			// Reactive recovery from prompt-too-long: one forced AutoCompact, then retry.
 			if l.in.Compactor != nil && l.in.Compactor.IsOverflow(streamErr) && !l.hasAttemptedReactiveCompact {
 				l.hasAttemptedReactiveCompact = true
-				if msgs, ok := l.in.Compactor.Reactive(l.ctx, l.messages); ok {
+				if msgs, ok := l.in.Compactor.Reactive(l.modelCallContext(), l.messages); ok {
 					l.messages = msgs
 					l.recordNewBoundary()
 					l.lastContinue = ContinueReactiveCompactRetry
 					continue
+				}
+				if !l.settling && l.exploreCtx != nil && l.exploreCtx.Err() != nil && l.beginSettlement(ReasonTimeout, &schemas) {
+					l.initSettleCtx()
+					continue
+				}
+				if l.settling && l.settleCtx != nil && l.settleCtx.Err() != nil {
+					l.finish(l.settleReason, nil, "")
+					return
 				}
 				l.finish(ReasonPromptTooLong, streamErr, "")
 				return
@@ -587,6 +636,9 @@ func (l *loop) run() {
 			l.finish(ReasonAbortedTools, l.ctx.Err(), "")
 			return
 		}
+		if l.finishRequested() {
+			return
+		}
 		// aborted with the parent still alive ⇒ the run's own MaxDuration deadline (on
 		// toolCtx) interrupted an in-flight tool. Enter the wrap-up phase on the live
 		// parent ctx instead of dying, so a run whose tool overran the wall-clock budget
@@ -641,6 +693,21 @@ func (l *loop) run() {
 		l.turnCount = nextTurn
 		l.lastContinue = ContinueNextTurn
 	}
+}
+
+func (l *loop) finishRequested() bool {
+	if l.ctx.Err() != nil {
+		return false
+	}
+	if summary, requested := requestedCompletion(l.ctx); requested {
+		reason := ReasonCompleted
+		if l.settling {
+			reason = l.settleReason
+		}
+		l.finish(reason, nil, summary)
+		return true
+	}
+	return false
 }
 
 // settleMaxTurns is the wrap-up phase's own turn budget (default 2).

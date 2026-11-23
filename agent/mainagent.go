@@ -8,6 +8,7 @@ import (
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/guard"
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -24,11 +25,12 @@ type MainAgent struct {
 	findingRecorder FindingRecorder
 	prov            llm.Provider
 	model           string
-	tx              *transcript.Store                      // raw LLM conversation persistence (nil = off)
-	window          int                                    // context window in tokens (for compaction)
-	windowFn        func() int                             // optional dynamic task-chain minimum
-	maxTurns        int                                    // max agent turns per run (0 = unlimited)
-	runTimeout      time.Duration                          // per-interaction wall-clock budget (0 = unlimited, F02)
+	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
+	window          int               // context window in tokens (for compaction)
+	windowFn        func() int        // optional dynamic task-chain minimum
+	maxTurns        int               // max agent turns per run (0 = unlimited)
+	runTimeout      time.Duration     // per-interaction wall-clock budget (0 = unlimited, F02)
+	budgetPolicy    kernel.BudgetPolicy
 	proxyAddr       string                                 // recording proxy for WebFetch (empty = direct)
 	proxyCACert     string                                 // recording proxy's CA cert path (HTTPS verify)
 	webSearch       WebSearchOpts                          // web_search tool backend selection (off by default)
@@ -44,6 +46,8 @@ func (m *MainAgent) SetGuard(g *guard.Guard) { m.guard = g }
 
 // SetRunTimeout configures MainAgent's per-interaction wall-clock budget (0 = unlimited, F02).
 func (m *MainAgent) SetRunTimeout(d time.Duration) { m.runTimeout = d }
+
+func (m *MainAgent) SetBudgetPolicy(p kernel.BudgetPolicy) { m.budgetPolicy = p }
 
 // SetDispatchAdHoc wires scoped single-intent execution on paused/done tasks (F23/F24).
 func (m *MainAgent) SetDispatchAdHoc(fn func(intentID int64) error) { m.dispatchAdHoc = fn }
@@ -101,7 +105,7 @@ const mainAgentDefaultTmpl = `你是一个授权渗透测试系统的"主 agent"
 1. 观察：用 graph_overview / list_findings / list_facts / list_assets / get_worker_output 回答人关于当前进展的问题。
 2. 操舵（把人的意图落到系统）：
    - 人想"改方向/强调某类漏洞/重点某区域" → 用 add_hint 写提示（规划者下次会读到）。
-   - 人想"立刻测某个具体目标" → 用 add_intent 直接注入一条高优先级意图（priority 8-10）。系统会自动把已完成的任务拉回运行态、让 worker 领这条意图执行，跑完即回到已完成状态。
+   - 人想"立刻测某个具体目标" → 用 add_intent 投递高优先级意图（priority 8-10），明确 scope、deliverable 和 max_tool_calls（0 明确不限）。暂停/终态任务中的单条工作独立等待资源并执行，使用新的运行预算；运行状态在该 Worker 上展示。
      **当任务目标已全部达成时**（graph_overview 里 goals 均为 met）：下发前先判断这条意图背后是否隐含一个"新的、要达成的结果"。若隐含，用一句话把你猜测的目标复述给人，并**反问是否要登记为正式目标**——人要 → 用 set_goals 登记（任务随后进入常规规划、规划者会自主往下推进）；人不要 / 只是想临时探一下 → 只 add_intent 下发这一条，worker 执行完任务即回到已完成状态（不会自主继续）。若这条意图明显只是一次性查证、不隐含新目标，直接 add_intent 即可，不必每次都问。
    - 人想"对某条正在运行的意图(work)实时纠偏（别再走 X、聚焦 Y）" → 用 steer_work（不打断、不丢已有进展，worker 下一步动作前生效）；先用 get_worker_output 看它在干嘛。方向整个错了则改用 add_intent 另下新意图。
    - 人想"新增一个要达成的最终目标" → 用 set_goals 增补目标。系统会把该目标写入任务图并**自动把已完成/暂停的任务拉回运行态继续跑**（规划者随后会据此重新判断是否达成），无需人工再点恢复。
@@ -130,12 +134,12 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	}
 	tsx.SetTaskID(taskID)
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
-	tsx.SetNotify(notify)         // 通用唤醒（无专用回调的写操作走它，debounced）
-	tsx.SetResumeTask(resume)     // set_goals 新增目标 → 把已完成/暂停的任务拉回 running
+	tsx.SetNotify(notify)                 // 通用唤醒（无专用回调的写操作走它，debounced）
+	tsx.SetResumeTask(resume)             // set_goals 新增目标 → 把已完成/暂停的任务拉回 running
 	tsx.SetDispatchAdHoc(m.dispatchAdHoc) // add_intent 单条直投 → 仅执行该意图，不唤醒旧队列 (F23/F24)
-	tsx.SetNotifyGoal(notifyGoal) // set_goals 新增目标 → 给 planner 记一条「人新增了目标：…」触发
-	tsx.SetNotifyHint(notifyHint) // add_hint 新增提示 → 给 planner 记一条「人新增了 N 条战略提示：…」触发
-	tsx.steerWork = m.steerWork   // enable steer_work tool (nil = unavailable)
+	tsx.SetNotifyGoal(notifyGoal)         // set_goals 新增目标 → 给 planner 记一条「人新增了目标：…」触发
+	tsx.SetNotifyHint(notifyHint)         // add_hint 新增提示 → 给 planner 记一条「人新增了 N 条战略提示：…」触发
+	tsx.steerWork = m.steerWork           // enable steer_work tool (nil = unavailable)
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.MainAgentTools()), actool.DefaultTools()...)
@@ -146,7 +150,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	system, boundary := deferredSystem(mainAgentSystem(goal, m.workDir, mainDir), def)
-	plan := resolveBudgetPlan(m.runTimeout, TaskClock{})
+	plan := resolveBudgetPlanWithPolicy(m.runTimeout, TaskClock{}, m.budgetPolicy)
 	ctx, cancelRun := runBudgetDeadline(ctx, plan)
 	defer cancelRun()
 	opts := agentcore.Options{
@@ -174,11 +178,11 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		WorkingDir:            mainDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:         cmdOutDir(mainDir),
 		MaxToolOutputChars:    toolOutputCharsForRole("mainagent"),
-		MaxTurns:              m.maxTurns,         // 0 = unlimited (configurable in agent management)
-		MaxDuration:           plan.Explore,       // 0 = unlimited (F02)
-		SettleDuration:        plan.SettleReserve, // deterministic wrap-up window (F03)
+		MaxTurns:              m.maxTurns,                                                 // 0 = unlimited (configurable in agent management)
+		MaxDuration:           plan.Explore,                                               // 0 = unlimited (F02)
+		SettleDuration:        plan.SettleReserve,                                         // deterministic wrap-up window (F03)
 		Compaction:            compactionConfigForRole("mainagent", m.compactionWindow()), // long chats stay within the window
-		Todos:                 actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		Todos:                 actool.NewTodoStore(),                                      // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		// 命中预算(步数)→ SDK 跑收尾:向用户输出一句进展总结。Prompt 与收尾轮数可后台编辑(默认 10 轮)。
 		Settlement:   wrapupSettlement("mainagent", nil),
 		NonStreaming: m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete

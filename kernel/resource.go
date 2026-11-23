@@ -15,8 +15,8 @@ type IntentScheduleInfo struct {
 
 // CanClaimIntent enforces prerequisite intent completion and reader-writer resource locks (F22).
 // - AfterIntents: every listed intent ID must be in terminalIntentIDs.
-// - exclusive lock: blocked while any other active (open/running) intent holds shared or exclusive lock on the same resource.
-// - shared lock: blocked while any other active (open/running) intent holds exclusive lock on the same resource.
+// Resource ownership belongs to running/reserved work. Queue ordering is
+// expressed by AfterIntents, not by treating open intents as lock holders.
 func CanClaimIntent(candidate IntentScheduleInfo, active []IntentScheduleInfo, terminalIntentIDs map[int64]bool) (bool, string) {
 	for _, depID := range candidate.AfterIntents {
 		if depID <= 0 || depID == candidate.ID {
@@ -39,9 +39,7 @@ func CanClaimIntent(candidate IntentScheduleInfo, active []IntentScheduleInfo, t
 			if other.ID == candidate.ID {
 				continue
 			}
-			// Only block against currently open/running holders (for exclusive, both open
-			// and running consumers must finish; for shared, running exclusive blocks).
-			if other.State != "running" && other.State != "open" {
+			if other.State != "running" {
 				continue
 			}
 			for _, held := range other.ResourceLocks {

@@ -68,7 +68,8 @@ type Worker struct {
 	// runTimeout is the wall-clock budget for the main exploration of one intent
 	// (0 = unlimited). When it fires, the run is cut and a settlement round is
 	// forced so already-identified facts get written back instead of being lost.
-	runTimeout time.Duration
+	runTimeout   time.Duration
+	budgetPolicy kernel.BudgetPolicy
 	// extraTools are host-provided tools (e.g. traffic query, oast) appended to
 	// the worker's graph write-back tools.
 	extraTools []actool.CoreTool
@@ -149,6 +150,8 @@ func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w
 func (w *Worker) SetRunTimeout(run time.Duration) {
 	w.runTimeout = run
 }
+
+func (w *Worker) SetBudgetPolicy(p kernel.BudgetPolicy) { w.budgetPolicy = p }
 
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
@@ -394,6 +397,10 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 }
 
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
+	var contract kernel.IntentContract
+	if err := json.Unmarshal(intent.Payload, &contract); err != nil {
+		return harness.ReasonModelError, WriteCounts{}, err
+	}
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
@@ -451,6 +458,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		runDir = ensureRunDir(w.workDir, taskID, intent.ID)
 	}
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
+	tsx.SetExecutionContract(runDir, contract)
 	var overview string
 	if lane.Source == "" {
 		overview = renderWorkerGraphOverview(tsx.workerOverviewData(intent))
@@ -483,9 +491,47 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	// 统一两阶段预算计划(Explore + SettleReserve + HardBuffer)，任务 deadline 夹逼 (F01/F02/F03)。
 	tc := taskClockFrom(ctx)
-	plan := resolveBudgetPlan(w.runTimeout, tc)
+	plan := resolveBudgetPlanWithPolicy(w.runTimeout, tc, w.budgetPolicy)
 	ctx, cancelRun := runBudgetDeadline(ctx, plan)
 	defer cancelRun()
+	ctx = harness.WithCompletionRequest(ctx)
+	preflightCtx := ctx
+	if deadline, ok := harness.ExplorationDeadline(ctx); ok {
+		var cancel context.CancelFunc
+		preflightCtx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	for i, input := range contract.Inputs {
+		if !input.Valid {
+			continue
+		}
+		verified, batches, err := VerifyArtifact(preflightCtx, runDir, input)
+		if err != nil {
+			if preflightCtx.Err() != nil {
+				code := kernel.TermBudgetRun
+				if plan.ClampedByTask {
+					code = kernel.TermBudgetTask
+				}
+				return harness.ReasonTimeout, WriteCounts{DeliveryStatus: kernel.DeliveryPartialCheckpoint, AbortCode: code, Checkpoint: &kernel.Checkpoint{RemainingScope: contract.Scope, NextAction: "核验上游产物后继续执行"}}, preflightCtx.Err()
+			}
+			message := "前提产物不可用: " + err.Error()
+			id, created, newEvidence, recordErr := ts.RecordFactLinked(map[string]any{"summary": message, "evidence": message, "evidence_key": message, "scope": contract.Scope, "confidence": "observed", "provenance": "local_artifact"}, name, intentAssetIDs(intent), []int64{intent.ID})
+			writes := WriteCounts{DeliveryStatus: kernel.DeliveryPreconditionBlocked, FinalText: message}
+			if created {
+				writes.Facts = 1
+			}
+			if newEvidence {
+				writes.ResearchGain.Evidence = 1
+			}
+			if id > 0 {
+				writes.EvidenceIDs = []int64{id}
+			}
+			return harness.ReasonCompleted, writes, recordErr
+		}
+		contract.Inputs[i] = verified
+		seedRunEvidence(ctx, batches)
+	}
+	tsx.SetExecutionContract(runDir, contract)
 	settle := wrapupSettlement("worker", []string{"Bash", "RunScript"})
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("worker", []string{"Bash", "RunScript"}, plan.ClampedByTask)
@@ -601,6 +647,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
 	ctx = attachSideCapture(ctx, &opts)
 	opts.Hooks = guard.WithToolReview(opts.Hooks, opts.Tools)
+	opts.Hooks = &workerDeliveryHooks{HookRunner: opts.Hooks, tools: tsx}
 	s := newAgentSession(opts)
 	defer func() { s.Close() }() // release the session's background-task manager (temp dir + processes)
 
@@ -618,6 +665,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 				// An exclusive publish failure leaves no partial destination history.
 				s.Close()
 				runDir = ensureRunDir(w.workDir, taskID, intent.ID)
+				tsx.SetExecutionContract(runDir, contract)
 				opts.WorkingDir, opts.ToolOutputDir = runDir, cmdOutDir(runDir)
 				opts.SystemPrompt, opts.DynamicBoundary = deferredSystemWithDynamic(staticSys, laneSystemTail(intent, runDir), def)
 				system, boundary = opts.SystemPrompt, opts.DynamicBoundary
@@ -690,7 +738,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		}
 	}
 	writes := tsx.Writes()
-	writes.FinalText = outcome.Text
+	if strings.TrimSpace(outcome.Text) != "" {
+		writes.FinalText = outcome.Text
+	}
 	writes.AbortCode = outcome.AbortCode
 	return outcome.Reason, writes, outcome.Err
 }

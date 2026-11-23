@@ -130,27 +130,22 @@ func TestAuditFix_NewNegativeCoverageNotStagnant(t *testing.T) {
 	}
 }
 
-// F20: Four consecutive exhausted runs that each persist a real fact must NOT
-// force single-worker focus mode; four zero-gain runs still do.
+// Valid partial delivery remains research gain independently of execution state.
 func TestAuditFix_ExhaustedNetGainKeepsConcurrency(t *testing.T) {
-	t.Setenv("VESTRAIL_OPT_PROGRESS_GUARD", "1")
 	e := NewEngine(nil)
 	for range 4 {
-		e.recordWorkerGainReceipt("task-f20", kernel.RunReceipt{
+		receipt := kernel.RunReceipt{
 			SettledState: "exhausted",
-			FactsWritten: 1,
-		})
+			ResearchGain: &kernel.ResearchGain{Evidence: 1},
+		}
+		if !receipt.HasNetGain() {
+			t.Fatal("valid partial delivery lost its gain")
+		}
 	}
-	if e.focusWorker("task-f20", "work#2") {
-		t.Fatal("valid exhausted runs with written facts wrongly reduced concurrency to single worker")
-	}
-	for range 4 {
-		e.recordWorkerGainReceipt("task-f20", kernel.RunReceipt{
-			SettledState: "done",
-		})
-	}
-	if !e.focusWorker("task-f20", "work#2") || e.focusWorker("task-f20", "work#1") {
-		t.Fatal("four zero-gain runs did not engage single-worker focus mode")
+	for id := int64(1); id <= 4; id++ {
+		if !e.resources.tryAcquire(intentResourceRequest{intentID: id, taskID: "task-f20", locks: map[string]bool{}}) {
+			t.Fatal("independent work must remain admissible")
+		}
 	}
 }
 

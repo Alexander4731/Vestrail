@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Alexander4731/Vestrail/db"
@@ -76,6 +77,10 @@ type ToolSet struct {
 	GoalMet        bool
 	Reason         string
 	writes         WriteCounts
+	writesMu       sync.Mutex
+	writtenAssets  map[int64]struct{} // unique asset writes within this run
+	artifactDir    string
+	contract       kernel.IntentContract
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(intentID int64) error
@@ -150,14 +155,18 @@ type EnrichTrigger interface {
 // findings under "facts" (record_fact → Facts, insert_assets → Assets,
 // report_finding → Findings; each element of a batch counts once).
 type WriteCounts struct {
-	Facts          int
-	Assets         int
-	Findings       int
-	DeliveryStatus kernel.DeliveryStatus
-	Checkpoint     *kernel.Checkpoint
-	ValidBatches   []kernel.EvidenceBatch
-	FinalText      string
-	AbortCode      kernel.TerminationCode
+	Facts                    int
+	Assets                   int
+	Findings                 int
+	DeliveryStatus           kernel.DeliveryStatus
+	DeliveryFinalized        bool
+	Checkpoint               *kernel.Checkpoint
+	ValidBatches             []kernel.EvidenceBatch
+	FinalText                string
+	AbortCode                kernel.TerminationCode
+	ResearchGain             kernel.ResearchGain
+	EvidenceIDs              []int64
+	ConsumedEvidenceVersions map[int64]int
 }
 
 // Total is every node persisted this run, regardless of kind — the
@@ -172,7 +181,28 @@ func (w WriteCounts) String() string {
 // Writes reports what this run wrote back, split by node kind (so the engine can
 // tell "explored but persisted nothing" apart from a completed intent, and log an
 // honest breakdown instead of calling assets/findings "facts").
-func (t *ToolSet) Writes() WriteCounts { return t.writes }
+func (t *ToolSet) Writes() WriteCounts {
+	t.writesMu.Lock()
+	defer t.writesMu.Unlock()
+	w := t.writes
+	w.EvidenceIDs = append([]int64(nil), w.EvidenceIDs...)
+	w.ValidBatches = append([]kernel.EvidenceBatch(nil), w.ValidBatches...)
+	w.ConsumedEvidenceVersions = make(map[int64]int, len(t.writes.ConsumedEvidenceVersions))
+	for id, version := range t.writes.ConsumedEvidenceVersions {
+		w.ConsumedEvidenceVersions[id] = version
+	}
+	return w
+}
+
+func (t *ToolSet) updateWrites(fn func(*WriteCounts)) {
+	t.writesMu.Lock()
+	defer t.writesMu.Unlock()
+	fn(&t.writes)
+}
+
+func (t *ToolSet) SetExecutionContract(dir string, contract kernel.IntentContract) {
+	t.artifactDir, t.contract = dir, contract
+}
 
 func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 	return &ToolSet{ts: ts, worker: worker}
@@ -1328,7 +1358,7 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 			"id":  idp("单个探索图节点 id（兼容旧调用）"),
 			"ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "【批量优先】一次取多个探索节点详情（最多 8 个），省往返"},
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				ID  json.RawMessage   `json:"id"`
 				IDs []json.RawMessage `json:"ids"`
@@ -1375,6 +1405,11 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 					nodes = append(nodes, n)
 				}
 				res := map[string]any{"nodes": nodes}
+				readIDs := make([]int64, 0, len(nodes))
+				for _, node := range nodes {
+					readIDs = append(readIDs, node.ID)
+				}
+				t.noteEvidenceRead(ctx, readIDs)
 				if len(missing) > 0 {
 					res["missing_ids"] = missing
 				}
@@ -1397,6 +1432,7 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 			if err := t.ts.PopulateFindingTrafficIDs([]*db.Node{n}); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			t.noteEvidenceRead(ctx, []int64{n.ID})
 			return jsonResult(n) // full payload incl. detail / evidence, plus explicit finding IDs
 		})
 }
@@ -1411,6 +1447,7 @@ type intentItem struct {
 	AssetIDs         []json.RawMessage `json:"asset_ids"`
 	ParentIDs        []json.RawMessage `json:"parent_ids"`
 	Priority         int               `json:"priority"`
+	ToolBudget       *int              `json:"max_tool_calls,omitempty"`
 	kernel.IntentContract
 }
 
@@ -1422,7 +1459,7 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	return id, err
 }
 
-func (t *ToolSet) addOneIntentMode(it intentItem) (int64, bool, error) {
+func (t *ToolSet) addOneIntentMode(it intentItem, requireContract ...bool) (int64, bool, error) {
 	if t.ts == nil {
 		return 0, false, fmt.Errorf("add_intent 需要任务上下文")
 	}
@@ -1450,6 +1487,9 @@ func (t *ToolSet) addOneIntentMode(it intentItem) (int64, bool, error) {
 		priority = 5
 	}
 	anchors := pidList(it.AssetIDs)
+	if err := t.normalizeIntentContract(&it, anchors, len(requireContract) > 0 && requireContract[0]); err != nil {
+		return 0, false, err
+	}
 	// 资产拦截：意图绑定的资产若命中系统资产拦截规则，则禁止下发该意图。
 	if t.as != nil && len(anchors) > 0 {
 		hits, err := t.as.CheckAssetsIntercept(t.taskID, anchors)
@@ -1491,7 +1531,7 @@ func (t *ToolSet) addOneIntentMode(it intentItem) (int64, bool, error) {
 	if len(it.StopConditions) > 0 {
 		payload["stop_conditions"] = it.StopConditions
 	}
-	if it.MaxToolCalls > 0 {
+	if it.ToolBudget != nil || it.MaxToolCalls > 0 {
 		payload["max_tool_calls"] = it.MaxToolCalls
 	}
 	if len(it.AfterIntents) > 0 {
@@ -1560,7 +1600,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 		"intents": map[string]any{
 			"type":        "array",
 			"description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素支持 summary/brief/continue_intent_id/scope/hypothesis/max_tool_calls/after_intents/resource_locks/asset_ids/parent_ids/priority。返回 ids 与数组等长、同序。",
-			"items":       obj(intentProps, "summary"),
+			"items":       obj(intentProps, "summary", "scope", "deliverable", "max_tool_calls"),
 		},
 		"resolved_hint_ids": map[string]any{
 			"type":        "array",
@@ -1600,14 +1640,14 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			errs := map[string]string{}
 			createdAny := false
 			for i, it := range items {
-				id, standalone, err := t.addOneIntentMode(it)
+				id, standalone, err := t.addOneIntentMode(it, true)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
 				}
 				if standalone && t.dispatchAdHoc != nil {
 					if derr := t.dispatchAdHoc(id); derr != nil {
-						_ = t.ts.SetNodeState(id, "blocked")
+						_, _ = t.ts.CompareAndSetIntentState(id, "open", "blocked")
 						errs[strconv.Itoa(i)] = "独立执行启动失败: " + derr.Error()
 						continue
 					}
@@ -1774,7 +1814,11 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			}
 			iid = t.workerIntentID
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: iid, VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		key, err := t.ts.ObservedEvidenceKey(ctx, iid, a.Evidence)
+		if err != nil {
+			return actool.Errorf(err.Error()), nil
+		}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: iid, VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Scope: t.contract.Scope, EvidenceKey: key, Deduplicate: true}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1786,16 +1830,24 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		if t.notifyFinding != nil {
+		if recorded.Created && t.notifyFinding != nil {
 			iid := input.IntentID
 			if iid <= 0 {
 				iid = t.ownerNode
 			}
 			t.notifyFinding(iid, a.Summary)
-		} else if t.notify != nil {
+		} else if recorded.Created && t.notify != nil {
 			t.notify()
 		}
-		t.writes.Findings++
+		t.updateWrites(func(w *WriteCounts) {
+			if recorded.Created {
+				w.Findings++
+			}
+			w.EvidenceIDs = append(w.EvidenceIDs, recorded.NodeID)
+			if recorded.NewEvidence {
+				w.ResearchGain.Evidence++
+			}
+		})
 		// Keep the first line's node-ID contract for existing reporter triggers.
 		for i := range recorded.Traffic.Bindings {
 			recorded.Traffic.Bindings[i].Snapshot.ReqHead = ""
@@ -1803,9 +1855,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		result := struct {
 			*db.RecordedFinding
-			EvidenceStatus string `json:"evidence_status"`
-			EvidenceNote   string `json:"evidence_note,omitempty"`
+			EvidenceStatus string              `json:"evidence_status"`
+			EvidenceNote   string              `json:"evidence_note,omitempty"`
+			ResearchGain   kernel.ResearchGain `json:"research_gain"`
 		}{RecordedFinding: recorded, EvidenceStatus: "bound"}
+		if recorded.NewEvidence {
+			result.ResearchGain.Evidence = 1
+		}
 		if len(recorded.Traffic.Bindings) == 0 {
 			result.EvidenceStatus = "not_bound"
 			result.EvidenceNote = "漏洞已保存，未绑定流量。TCP/无包情形可正常继续；若已有核实的 HTTP 流量，请用可用的 bind_finding_traffic 或漏洞页面补绑，再完成证据交接。不要重复创建漏洞。"
@@ -1843,16 +1899,25 @@ type factItem struct {
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
 // 批量时的默认意图（本条未给 intent_id 时用）。
 func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error) {
+	id, _, err := t.recordOneFactWithGain(context.Background(), it, defaultIntent)
+	return id, err
+}
+
+func (t *ToolSet) recordOneFactWithGain(ctx context.Context, it factItem, defaultIntent int64) (int64, kernel.ResearchGain, error) {
+	gain := kernel.ResearchGain{}
 	if strings.TrimSpace(it.Summary) == "" {
-		return 0, fmt.Errorf("summary 不能为空")
+		return 0, gain, fmt.Errorf("summary 不能为空")
 	}
 	if err := kernel.ValidateFactRangeConsistency(it.Summary, it.Detail); err != nil {
-		return 0, err
+		return 0, gain, err
 	}
 	if err := kernel.ValidateFactBatches(it.Batches); err != nil {
-		return 0, err
+		return 0, gain, err
 	}
-	payload := map[string]any{"summary": it.Summary}
+	if err := ValidateScopeBatches(t.contract.Scope, it.Batches); err != nil {
+		return 0, gain, err
+	}
+	payload := map[string]any{"summary": it.Summary, "scope": t.contract.Scope}
 	if it.Detail != "" {
 		payload["detail"] = it.Detail
 	}
@@ -1860,6 +1925,21 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 		payload["evidence"] = e
 	}
 	conf, epistemicNote := kernel.NormalizeFactEpistemics(it.Summary, it.Detail, it.Confidence, it.UnverifiedAssumptions)
+	if it.ClaimType == "inference" || it.ClaimType == "hypothesis_update" || it.Provenance == "guess_wordlist" || it.Provenance == "history_log" {
+		conf = "inferred"
+	}
+	if conf == "observed" && t.workerIntentID > 0 {
+		key, err := t.ts.ObservedEvidenceKey(ctx, t.workerIntentID, it.Evidence)
+		if err != nil {
+			return 0, gain, err
+		}
+		if key == "" {
+			conf = "inferred"
+			epistemicNote = "尚缺本次工具结果中的可核对引用，保留为推断"
+		} else {
+			payload["evidence_key"] = key
+		}
+	}
 	if conf != "" {
 		payload["confidence"] = conf
 	}
@@ -1893,14 +1973,14 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	}
 	if t.workerIntentID > 0 {
 		if intent > 0 && intent != t.workerIntentID {
-			return 0, fmt.Errorf("写回 intent_id 必须为当前执行意图 #%d", t.workerIntentID)
+			return 0, gain, fmt.Errorf("写回 intent_id 必须为当前执行意图 #%d", t.workerIntentID)
 		}
 		intent = t.workerIntentID
 	}
 	if intent > 0 {
 		node, err := t.ts.GetNode(intent)
 		if err != nil || node == nil || node.Kind != db.KindIntent {
-			return 0, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
+			return 0, gain, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
 	// a fact is its OWN node kind (distinct from a vuln finding).
@@ -1908,24 +1988,28 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if intent > 0 {
 		parents = []int64{intent}
 	}
-	id, err := t.ts.AddNodeLinked(db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs), parents, db.RelYields)
+	id, created, newEvidence, err := t.ts.RecordFactLinked(payload, t.worker, pidList(it.AssetIDs), parents)
 	if err != nil {
-		return 0, err
+		return 0, gain, err
 	}
-	t.writes.Facts++
-	if it.DeliveryStatus != "" {
-		t.writes.DeliveryStatus = it.DeliveryStatus
+	if newEvidence {
+		gain.Evidence = 1
 	}
-	if it.Checkpoint != nil {
-		cp := *it.Checkpoint
-		t.writes.Checkpoint = &cp
-	}
-	for _, b := range it.Batches {
-		if b.Valid && b.PreconditionOK {
-			t.writes.ValidBatches = append(t.writes.ValidBatches, b)
+	t.updateWrites(func(w *WriteCounts) {
+		if created {
+			w.Facts++
 		}
-	}
-	return id, nil
+		w.EvidenceIDs = append(w.EvidenceIDs, id)
+		w.ResearchGain.Evidence += gain.Evidence
+		if it.DeliveryStatus != "" && it.DeliveryStatus != kernel.DeliveryComplete {
+			w.DeliveryStatus = it.DeliveryStatus
+		}
+		if it.Checkpoint != nil {
+			cp := *it.Checkpoint
+			w.Checkpoint = &cp
+		}
+	})
+	return id, gain, nil
 }
 
 func (t *ToolSet) recordFact() actool.CoreTool {
@@ -1952,7 +2036,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			"batches":                map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "可选：vestrail.batch.v1 结构化批次结果数组"},
 			"asset_ids":              map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Facts    []factItem `json:"facts"`
 				factItem            // 单条模式 + 批量默认 intent_id
@@ -1967,22 +2051,25 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 
 			ids := make([]int64, len(items))
 			errs := map[string]string{}
+			gain := kernel.ResearchGain{}
 			for i, it := range items {
-				id, err := t.recordOneFact(it, defaultIntent)
+				id, delta, err := t.recordOneFactWithGain(ctx, it, defaultIntent)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
 				}
 				ids[i] = id
+				gain.Evidence += delta.Evidence
 			}
 
 			if !batch { // 单条：保持原返回
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
-				return actool.Text(fmt.Sprintf("fact recorded: %d", ids[0])), nil
+				metadata, _ := json.Marshal(map[string]any{"id": ids[0], "research_gain": gain})
+				return actool.Text(fmt.Sprintf("fact recorded: %d\n%s", ids[0], metadata)), nil
 			}
-			out := map[string]any{"ids": ids}
+			out := map[string]any{"ids": ids, "research_gain": gain}
 			if len(errs) > 0 {
 				out["errors"] = errs
 			}

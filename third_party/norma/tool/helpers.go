@@ -63,11 +63,20 @@ func maxOut(tc *ToolContext) int {
 // tails cut by Capture and truncate() are aligned to UTF-8 rune boundaries, so a
 // bounded result never carries a half-encoded character.
 func Capture(tc *ToolContext, s string) string {
+	return capturePreview(tc, s, cleanDisplayNoise(s))
+}
+
+// CapturePreview archives the full raw output before showing a host-computed
+// preview. Without an archive directory it retains the ordinary raw preview.
+func CapturePreview(tc *ToolContext, raw, preview string) string {
+	return capturePreview(tc, raw, cleanDisplayNoise(preview))
+}
+
+func capturePreview(tc *ToolContext, s, cleaned string) string {
 	max := maxOut(tc)
 	if tc == nil || tc.OutputDir == "" {
 		return truncate(s, max)
 	}
-	cleaned := cleanDisplayNoise(s)
 	if len(s) <= max && cleaned == s {
 		return s
 	}

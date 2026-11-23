@@ -1118,6 +1118,8 @@ export const api = {
       llm_profile_id?: number | null; // number=绑定；null=解绑(跟随任务/全局)；缺省=不动
       max_turns?: number;
       run_seconds?: number;
+      settle_seconds?: number;
+      hard_buffer_seconds?: number | null;
       web_search?: boolean;
       interactive_shell?: boolean;
       trigger_run_mode?: "serial" | "parallel";

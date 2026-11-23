@@ -1251,6 +1251,8 @@ export interface Agent {
   llm_profile_id?: number | null; // 绑定的 LLM 配置；null/absent = 跟随任务/会话/全局
   max_turns?: number; // 0 = 无限制
   run_seconds?: number; // worker 单次运行墙钟上限(秒)；0 = 无限制
+  settle_seconds?: number; // 收尾预留秒数；0 = 自动
+  hard_buffer_seconds?: number | null; // null = 默认宽限；0 = 无额外宽限
   web_search?: boolean; // 是否启用网络搜索(受系统全局开关门控)
   interactive_shell?: boolean; // 是否启用交互式 shell(持久 PTY 会话工具族)
   // P3 触发后处理策略(仅自定义 agent 有意义)

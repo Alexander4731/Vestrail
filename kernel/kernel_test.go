@@ -9,7 +9,7 @@ func TestComputeBudgetPlan(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 
 	// 0 = truly unlimited (no 5-minute fallback)
-	if plan := ComputeBudgetPlan(0, 0, now); plan.Total != 0 || plan.Explore != 0 || plan.SettleReserve != 0 || plan.ClampedByTask {
+	if plan := ComputeBudgetPlan(0, 0, now); plan.Total != 0 || plan.Explore != 0 || plan.SettleReserve <= 0 || plan.ClampedByTask {
 		t.Fatalf("expected unlimited plan, got %+v", plan)
 	}
 
@@ -142,9 +142,14 @@ func TestIntentDedupAndResourceLocks(t *testing.T) {
 	if ok, _ := CanClaimIntent(cleanup, []IntentScheduleInfo{cleanup, consumerRunning}, nil); ok {
 		t.Fatal("exclusive cleanup must wait for running shared consumer")
 	}
-	if ok, _ := CanClaimIntent(cleanup, []IntentScheduleInfo{cleanup, consumerOpen}, nil); ok {
-		t.Fatal("exclusive cleanup must wait for queued open shared consumer")
+	if ok, _ := CanClaimIntent(cleanup, []IntentScheduleInfo{cleanup, consumerOpen}, nil); !ok {
+		t.Fatal("queued work must not hold a resource")
 	}
+	cleanup.AfterIntents = []int64{consumerOpen.ID}
+	if ok, _ := CanClaimIntent(cleanup, []IntentScheduleInfo{cleanup, consumerOpen}, nil); ok {
+		t.Fatal("cleanup must wait for its explicit consumer dependency")
+	}
+	cleanup.AfterIntents = nil
 	if ok, _ := CanClaimIntent(cleanup, []IntentScheduleInfo{cleanup}, nil); !ok {
 		t.Fatal("exclusive cleanup should proceed once no shared consumers remain")
 	}

@@ -335,11 +335,13 @@ func (s *ExplorationStore) DeleteGoal(id int64) error {
 // operation pauses its intent until verification; other workers can resume.
 func (s *ExplorationStore) ResetRunningIntents() (int64, error) {
 	res, err := s.db.Exec(`WITH interrupted AS (
-SELECT n.id, EXISTS(SELECT 1 FROM intercept_pending ip JOIN tasks t ON ip.task_id=t.id::text
+SELECT n.id, n.owner='adhoc' AS adhoc, EXISTS(SELECT 1 FROM intercept_pending ip JOIN tasks t ON ip.task_id=t.id::text
  WHERE t.exploration_id=$1 AND (ip.audit->>'intent_id' IS NULL OR ip.audit->>'intent_id'=n.id::text)
  AND ip.audit->>'execution_status' IN ('unknown','awaiting_result')) AS unresolved
-FROM exploration_nodes n WHERE n.exploration_id=$1 AND n.kind='intent' AND n.state='running')
-UPDATE exploration_nodes n SET state=CASE WHEN i.unresolved THEN 'paused' ELSE 'open' END,
+FROM exploration_nodes n WHERE n.exploration_id=$1 AND n.kind='intent'
+ AND (n.state='running' OR (n.state='open' AND n.owner='adhoc')))
+UPDATE exploration_nodes n SET state=CASE WHEN i.unresolved OR i.adhoc THEN 'paused' ELSE 'open' END,
+owner=CASE WHEN i.adhoc THEN 'adhoc' ELSE NULL END,
 completed_at=NULL, blocked_reason=CASE WHEN i.unresolved THEN $2 ELSE NULL END
 FROM interrupted i WHERE n.id=i.id`, s.expID, IntentBlockedExecutionUnknown)
 	if err != nil {
@@ -355,7 +357,7 @@ FROM interrupted i WHERE n.id=i.id`, s.expID, IntentBlockedExecutionUnknown)
 // done/open/running are left untouched. Returns whether a row changed. Used by "重跑".
 func (s *ExplorationStore) ReopenIntent(id int64) (bool, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes
-SET state='open', completed_at=NULL, blocked_reason=NULL
+SET state='open', owner=NULL, completed_at=NULL, blocked_reason=NULL
 WHERE id=$1 AND exploration_id=$2 AND kind='intent'
   AND state IN ('blocked','exhausted','stopped')`, id, s.expID)
 	if err != nil {

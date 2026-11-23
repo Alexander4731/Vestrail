@@ -343,12 +343,16 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+	Scope, EvidenceKey                                   string
+	Deduplicate                                          bool
 }
 
 type RecordedFinding struct {
-	FindingID int64           `json:"finding_id,string"`
-	NodeID    int64           `json:"finding_node_id,string"`
-	Traffic   *FindingTraffic `json:"traffic"`
+	FindingID   int64           `json:"finding_id,string"`
+	NodeID      int64           `json:"finding_node_id,string"`
+	Traffic     *FindingTraffic `json:"traffic"`
+	Created     bool            `json:"created"`
+	NewEvidence bool            `json:"new_evidence"`
 }
 
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
@@ -375,8 +379,52 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
-	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
+	assets := in.AssetIDs
+	if assets == nil {
+		assets = []int64{}
+	}
 	out := &RecordedFinding{}
+	err := sql.ErrNoRows
+	if in.Deduplicate {
+		err = tx.QueryRowContext(ctx, `SELECT f.id,n.id FROM findings f JOIN exploration_nodes n ON n.id=f.node_id
+WHERE n.exploration_id=$1 AND n.state <> 'deleted' AND f.vulnclass=$2 AND f.name=$3 AND f.severity=$4
+ AND f.summary=$5 AND f.evidence=$6 AND COALESCE(n.payload->>'scope','')=$7
+ AND NOT EXISTS(SELECT 1 FROM exploration_anchors a WHERE a.node_id=n.id AND NOT(a.asset_id=ANY($8)))
+ AND NOT EXISTS(SELECT 1 FROM unnest($8::bigint[]) ids(asset_id) WHERE NOT EXISTS(SELECT 1 FROM exploration_anchors a WHERE a.node_id=n.id AND a.asset_id=ids.asset_id))
+ORDER BY f.id LIMIT 1`, in.ExplorationID, in.VulnClass, utf8Clean(in.Name), in.Severity, utf8Clean(in.Summary), utf8Clean(in.Evidence), in.Scope, assets).Scan(&out.FindingID, &out.NodeID)
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if err == nil {
+		if in.IntentID > 0 {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, in.ExplorationID, in.IntentID, RelYields, out.NodeID); err != nil {
+				return nil, err
+			}
+		}
+		if err := AddFindingTrafficTx(tx, out.FindingID, prepared); err != nil {
+			return nil, err
+		}
+		out.Traffic, err = FindingTrafficTx(tx, out.FindingID)
+		return out, err
+	}
+	if in.EvidenceKey != "" {
+		var seen bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM exploration_nodes WHERE exploration_id=$1 AND kind IN ('fact','finding')
+ AND state <> 'deleted' AND payload->>'evidence_key'=$2 AND COALESCE(payload->>'scope','')=$3)`, in.ExplorationID, in.EvidenceKey, in.Scope).Scan(&seen); err != nil {
+			return nil, err
+		}
+		out.NewEvidence = !seen
+	}
+	fields := map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}}
+	if in.Scope != "" {
+		fields["scope"] = in.Scope
+	}
+	if in.EvidenceKey != "" {
+		fields["evidence_key"] = in.EvidenceKey
+	}
+	payload, _ := json.Marshal(fields)
+	out.Created = true
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
 VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(jsonbClean(payload)), in.Worker).Scan(&out.NodeID); err != nil {
 		return nil, err
@@ -390,10 +438,6 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,$3,$4)`, in.ExplorationID, in.IntentID, RelYields, out.NodeID); err != nil {
 			return nil, err
 		}
-	}
-	assets := in.AssetIDs
-	if assets == nil {
-		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
 	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
@@ -416,7 +460,6 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeI
 	if err := AddFindingTrafficTx(tx, out.FindingID, prepared); err != nil {
 		return nil, err
 	}
-	var err error
 	out.Traffic, err = FindingTrafficTx(tx, out.FindingID)
 	return out, err
 }

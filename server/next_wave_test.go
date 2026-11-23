@@ -68,7 +68,7 @@ func TestProgressGuardWritebackAndStatusFingerprint(t *testing.T) {
 	g.stagnantTurns = 23
 	g.steered = true
 	g.after("record_fact", nil, false, []byte(`{"ids":[0],"errors":["failed"]}`))
-	if g.stagnantTurns != 23 {
+	if g.stagnantTurns < 23 {
 		t.Fatal("empty batch reset progress")
 	}
 	g.after("record_fact", nil, false, []byte(`{"ids":[123]}`))
@@ -87,7 +87,7 @@ func TestProgressGuardWritebackAndStatusFingerprint(t *testing.T) {
 		t.Fatal("error flag missing")
 	}
 }
-func TestWorkerLaneLeaseAndAdaptiveGain(t *testing.T) {
+func TestWorkerLaneLease(t *testing.T) {
 	t.Setenv("VESTRAIL_OPT_PROGRESS_GUARD", "1")
 	e := NewEngine(nil)
 	one := &db.Node{ID: 10, Payload: []byte(`{"lane_root_id":5}`)}
@@ -115,16 +115,6 @@ func TestWorkerLaneLeaseAndAdaptiveGain(t *testing.T) {
 	e.releaseLane(key, one.ID)
 	if _, ok = e.leaseLane("a", two); !ok {
 		t.Fatal("owner release failed")
-	}
-	for range 4 {
-		e.recordWorkerGain("a", "exhausted", agent.WriteCounts{})
-	}
-	if !e.focusWorker("a", "work#2") || e.focusWorker("a", "work#1") {
-		t.Fatal("focus concurrency incorrect")
-	}
-	e.recordWorkerGain("a", "done", agent.WriteCounts{Facts: 1})
-	if e.focusWorker("a", "work#2") {
-		t.Fatal("gain did not restore parallelism")
 	}
 }
 

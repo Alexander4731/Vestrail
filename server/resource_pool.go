@@ -69,11 +69,11 @@ func (p *channelPoolTracker) poolKeyFor(taskID, proxyAddr string, intent *db.Nod
 	for _, lock := range info.ResourceLocks {
 		res := strings.TrimSpace(strings.ToLower(lock.Resource))
 		if strings.HasPrefix(res, "channel:") || strings.HasPrefix(res, "proxy:") {
-			return taskID + ":" + res
+			return res
 		}
 	}
 	if strings.TrimSpace(proxyAddr) != "" {
-		return taskID + ":proxy:" + strings.TrimSpace(proxyAddr)
+		return "proxy:" + strings.TrimSpace(proxyAddr)
 	}
 	return ""
 }

@@ -226,6 +226,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 
 			var results []result
 			var errs []errEntry
+			firstWrites := []int64{}
 
 			// 资产闸门规则一次性载入；读取失败则跳过判定（不阻断插入）。
 			// 拦截规则 = 全局 ∪ 任务级 block；允许规则 = 任务级 allow。
@@ -338,7 +339,16 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					continue
 				}
 				results = append(results, result{Index: i, ID: id, Type: typ})
-				t.writes.Assets++
+				t.updateWrites(func(w *WriteCounts) {
+					if t.writtenAssets == nil {
+						t.writtenAssets = map[int64]struct{}{}
+					}
+					if _, seen := t.writtenAssets[id]; !seen {
+						t.writtenAssets[id] = struct{}{}
+						w.Assets++
+						firstWrites = append(firstWrites, id)
+					}
+				})
 				t.anchorOwner(id)
 				if taskID > 0 {
 					var sourceNodeID *int64
@@ -366,8 +376,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			}
 
 			return jsonResult(map[string]any{
-				"results": results,
-				"errors":  errs,
+				"results":                results,
+				"errors":                 errs,
+				"first_written_this_run": firstWrites,
 			})
 		},
 	)
@@ -645,7 +656,7 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
 		t.listFindings(),
-		t.addFinding(), t.recordFact(),
+		t.addFinding(), t.recordFact(), t.finishWork(),
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),

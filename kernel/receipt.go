@@ -24,24 +24,35 @@ type Checkpoint struct {
 
 // RunReceipt is the authoritative persisted summary of one intent execution.
 type RunReceipt struct {
-	TaskID          int64           `json:"task_id"`
-	ExplorationID   int64           `json:"exploration_id"`
-	IntentID        int64           `json:"intent_id"`
-	TerminationCode TerminationCode `json:"termination_code"`
-	DeliveryStatus  DeliveryStatus  `json:"delivery_status"`
-	SettledState    string          `json:"settled_state"`
-	ToolCalls       int             `json:"tool_calls"`
-	FactsWritten    int             `json:"facts_written"`
-	AssetsWritten   int             `json:"assets_written"`
-	FindingsWritten int             `json:"findings_written"`
-	ValidBatches    []EvidenceBatch `json:"valid_batches,omitempty"`
-	Checkpoint      *Checkpoint     `json:"checkpoint,omitempty"`
-	Summary         string          `json:"summary,omitempty"`
+	TaskID                int64           `json:"task_id"`
+	ExplorationID         int64           `json:"exploration_id"`
+	IntentID              int64           `json:"intent_id"`
+	TerminationCode       TerminationCode `json:"termination_code"`
+	DeliveryStatus        DeliveryStatus  `json:"delivery_status"`
+	SettledState          string          `json:"settled_state"`
+	ToolCalls             int             `json:"tool_calls"`
+	FactsWritten          int             `json:"facts_written"`
+	AssetsWritten         int             `json:"assets_written"`
+	FindingsWritten       int             `json:"findings_written"`
+	ValidBatches          []EvidenceBatch `json:"valid_batches,omitempty"`
+	Checkpoint            *Checkpoint     `json:"checkpoint,omitempty"`
+	Summary               string          `json:"summary,omitempty"`
+	ResearchGain          *ResearchGain   `json:"research_gain,omitempty"`
+	InputEvidenceVersions map[int64]int   `json:"input_evidence_versions,omitempty"`
+}
+
+type ResearchGain struct {
+	Evidence  int   `json:"evidence"`
+	Coverage  int64 `json:"coverage"`
+	Artifacts int   `json:"artifacts"`
 }
 
 // HasNetGain reports whether the run produced verified research value regardless
 // of whether it settled as done or exhausted (F20).
 func (r RunReceipt) HasNetGain() bool {
+	if r.ResearchGain != nil {
+		return r.ResearchGain.Evidence > 0 || r.ResearchGain.Coverage > 0 || r.ResearchGain.Artifacts > 0
+	}
 	if r.FindingsWritten > 0 || r.FactsWritten > 0 {
 		return true
 	}
@@ -50,7 +61,7 @@ func (r RunReceipt) HasNetGain() bool {
 			return true
 		}
 	}
-	return r.Checkpoint != nil && (strings.TrimSpace(r.Checkpoint.RemainingScope) != "" || len(r.Checkpoint.ValidArtifacts) > 0)
+	return false
 }
 
 var incompleteHandbackMarkers = []string{
