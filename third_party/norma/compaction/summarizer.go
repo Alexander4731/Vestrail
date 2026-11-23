@@ -79,6 +79,7 @@ func streamSummary(ctx context.Context, p llm.Provider, maxOut int, head []llm.M
 }
 
 func streamSummaryWithPrompt(ctx context.Context, p llm.Provider, maxOut int, head []llm.Message, prompt string, nonStreaming bool) (string, error) {
+	ctx = llm.WithCallPurpose(ctx, "session_compaction")
 	reqMsgs := make([]llm.Message, 0, len(head)+1)
 	reqMsgs = append(reqMsgs, head...)
 	reqMsgs = append(reqMsgs, llm.UserText(prompt))

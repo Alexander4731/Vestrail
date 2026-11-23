@@ -614,7 +614,7 @@ type LLMProfileDTO struct {
 	// 收发模式：true=流式(SSE) | false=非流式。没有 omitempty —— false 必须出现在
 	// 响应里，否则前端读不到「非流式」，开关会回落成默认的流式。
 	Streaming bool `json:"streaming"`
-	// 单次回复输出上限(0=不发送，由服务端默认值决定)，以及它用哪个请求字段名
+	// 单次回复输出上限及请求字段名。0 采用所选协议的默认行为。
 	// (''=max_tokens | 'max_completion_tokens'，仅 openai 格式有意义)。
 	MaxTokens      int    `json:"max_tokens"`
 	MaxTokensField string `json:"max_tokens_field"`

@@ -613,14 +613,45 @@ func tailFile(path string, maxBytes int) (string, error) {
 	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + tail, nil
 }
 
+var (
+	windowsShellOnce sync.Once
+	windowsShellName string
+)
+
+// ActiveWindowsShell returns "pwsh" when PowerShell 7+ is available on Windows,
+// falling back to "powershell" (Windows PowerShell 5.1). Returns "" on non-Windows.
+func ActiveWindowsShell() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	windowsShellOnce.Do(func() {
+		if _, err := exec.LookPath("pwsh"); err == nil {
+			windowsShellName = "pwsh"
+		} else {
+			windowsShellName = "powershell"
+		}
+	})
+	return windowsShellName
+}
+
+// prepareShellCommand ensures Windows PowerShell commands propagate non-terminating
+// cmdlet errors by default unless the command explicitly manages ErrorActionPreference.
+func prepareShellCommand(command string) string {
+	if runtime.GOOS != "windows" {
+		return command
+	}
+	if strings.Contains(strings.ToLower(command), "erroractionpreference") {
+		return command
+	}
+	return "$ErrorActionPreference = 'Stop'\n" + command
+}
+
 // shellCmd returns the platform shell and the argument flags that precede the
-// command string. On Windows it uses PowerShell with -NoProfile -NonInteractive
-// (the command is passed to -Command) so a user profile can't inject banners or
-// prompts and an interactive prompt can't hang an unattended run. Elsewhere it
-// uses `bash -c`.
+// command string. On Windows it prefers pwsh (PowerShell 7+) and falls back to
+// powershell with -NoProfile -NonInteractive -Command. Elsewhere it uses `bash -c`.
 func shellCmd() (string, []string) {
 	if runtime.GOOS == "windows" {
-		return "powershell", []string{"-NoProfile", "-NonInteractive", "-Command"}
+		return ActiveWindowsShell(), []string{"-NoProfile", "-NonInteractive", "-Command"}
 	}
 	return "bash", []string{"-c"}
 }

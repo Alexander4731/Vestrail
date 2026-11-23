@@ -4,18 +4,23 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/Alexander4731/Vestrail/agent"
+	"github.com/Alexander4731/Vestrail/kernel"
 )
 
 type failedToolAttempt struct{ failures, warnings int }
 
 // Per-intent, shared across model retries, bounded memory, no command text kept.
-// Success clears the corresponding failure streak; ordinary polling is unaffected.
+// Combines three orthogonal guards:
+//   - Track A: repeated identical tool failures (3 warn + 3 stop)
+//   - Track B: semantic stagnation (EvidenceBatch-first, input-aware fingerprint without digit wiping) (F18/F19)
+//   - Track C: optional per-intent max_tool_calls enforcement with write-back reserve (F17)
 type workerFailureGuard struct {
 	mu                                     sync.Mutex
 	entries                                map[[32]byte]failedToolAttempt
@@ -25,25 +30,59 @@ type workerFailureGuard struct {
 	probeTurns, stagnantTurns, settleGrace int
 	steered                                bool
 	recentFPs                              [][32]byte
+	seenBatchKeys                          map[string]bool
+	validBatches                           []kernel.EvidenceBatch
+
+	// Per-intent tool budget (F17): 0 = unlimited. Write-back tools are never counted or blocked.
+	maxProbeTools  int
+	probeToolCount int
+	totalToolCalls int
 }
 
 func newWorkerFailureGuard(cancel context.CancelCauseFunc) *workerFailureGuard {
-	return &workerFailureGuard{entries: map[[32]byte]failedToolAttempt{}, cancel: cancel, progress: agent.OptimizationEnabled("VESTRAIL_OPT_PROGRESS_GUARD")}
+	return newWorkerFailureGuardWithBudget(cancel, 0)
 }
 
-func toolAttemptKey(name string, input []byte) [32]byte {
+func newWorkerFailureGuardWithBudget(cancel context.CancelCauseFunc, maxProbeTools int) *workerFailureGuard {
+	return &workerFailureGuard{
+		entries:       map[[32]byte]failedToolAttempt{},
+		seenBatchKeys: map[string]bool{},
+		cancel:        cancel,
+		progress:      agent.OptimizationEnabled("VESTRAIL_OPT_PROGRESS_GUARD"),
+		maxProbeTools: max(0, maxProbeTools),
+	}
+}
+
+func (g *workerFailureGuard) stats() (toolCalls int, batches []kernel.EvidenceBatch) {
+	if g == nil {
+		return 0, nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.validBatches) > 0 {
+		batches = append([]kernel.EvidenceBatch(nil), g.validBatches...)
+	}
+	return g.totalToolCalls, batches
+}
+
+func canonicalInputBytes(input []byte) []byte {
 	var value any
 	decoder := json.NewDecoder(bytes.NewReader(input))
 	decoder.UseNumber()
 	if decoder.Decode(&value) == nil {
 		if canonical, err := json.Marshal(value); err == nil {
-			input = canonical
+			return canonical
 		}
 	}
+	return input
+}
+
+func toolAttemptKey(name string, input []byte) [32]byte {
+	canon := canonicalInputBytes(input)
 	h := sha256.New()
 	h.Write([]byte(name))
 	h.Write([]byte{0})
-	h.Write(input)
+	h.Write(canon)
 	var key [32]byte
 	copy(key[:], h.Sum(nil))
 	return key
@@ -52,10 +91,17 @@ func toolAttemptKey(name string, input []byte) [32]byte {
 func (g *workerFailureGuard) before(name string, input []byte) (bool, string) {
 	key := toolAttemptKey(name, input)
 	g.mu.Lock()
-	if g.progress && progressWrite(name) && g.stagnantTurns >= 23 {
+	// Write-back tools are always permitted so conclusions and checkpoints are never lost.
+	if progressWrite(name) {
 		g.mu.Unlock()
 		return false, ""
 	}
+	// Track C: per-intent explicit tool budget (F17).
+	if g.maxProbeTools > 0 && g.probeToolCount >= g.maxProbeTools {
+		g.mu.Unlock()
+		return true, fmt.Sprintf("【工具预算已达上限】本意图限定最多 %d 次探测/操作工具调用，当前已用完。请立即使用 record_fact / report_finding / insert_assets 写回已有结论与断点并总结结束。", g.maxProbeTools)
+	}
+	// Track B: semantic stagnation guard.
 	if g.progress && progressProbe(name) {
 		if g.stagnantTurns >= 23 {
 			g.settleGrace++
@@ -72,6 +118,7 @@ func (g *workerFailureGuard) before(name string, input []byte) (bool, string) {
 			return true, "【进展纠偏】近期探测结果重复，请验证前提、换一种有依据的方法，或写回已有结论后结束。本次探测未执行。"
 		}
 	}
+	// Track A: repeated identical tool failure guard.
 	entry := g.entries[key]
 	if entry.failures < 3 {
 		g.mu.Unlock()
@@ -91,36 +138,70 @@ func (g *workerFailureGuard) after(name string, input []byte, isError bool, resu
 	key := toolAttemptKey(name, input)
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.totalToolCalls++
+	if !progressWrite(name) {
+		g.probeToolCount++
+	}
 	if g.progress && len(result) > 0 {
-		if progressWrite(name) && !isError && meaningfulWrite(result[0]) {
+		unwrapped := unwrapToolResult(result[0])
+		if progressWrite(name) && !isError && meaningfulWrite(unwrapped) {
 			g.stagnantTurns = 0
 			g.steered = false
 			g.settleGrace = 0
 		}
 		if progressProbe(name) {
 			g.probeTurns++
-			fp := responseFingerprint(name, result[0], isError)
-			seen := false
-			for _, old := range g.recentFPs {
-				if old == fp {
-					seen = true
-					break
+			batches := kernel.ExtractEvidenceBatches(string(unwrapped))
+			if len(batches) > 0 {
+				// Structured EvidenceBatch path (F19/F27): valid unseen coverage resets stagnation;
+				// invalid batches (valid=false or precondition_ok=false) never count as progress.
+				newValidCoverage := false
+				for _, b := range batches {
+					if err := kernel.ValidateBatch(b); err != nil {
+						continue
+					}
+					if b.Valid && b.PreconditionOK && b.UniqueCovered > 0 {
+						bk := b.CanonicalKey()
+						if bk == "" || !g.seenBatchKeys[bk] {
+							if bk != "" {
+								g.seenBatchKeys[bk] = true
+							}
+							g.validBatches = append(g.validBatches, b)
+							newValidCoverage = true
+						}
+					}
 				}
-			}
-			if g.probeTurns > 25 {
-				if !isError && !seen {
+				if !isError && newValidCoverage {
 					g.stagnantTurns = 0
 					g.steered = false
 					g.settleGrace = 0
-				} else {
+				} else if g.probeTurns > 25 {
 					g.stagnantTurns++
 				}
-			}
-			if !seen {
-				if len(g.recentFPs) == 12 {
-					g.recentFPs = g.recentFPs[1:]
+			} else {
+				fp := responseFingerprintWithInput(name, input, unwrapped, isError)
+				seen := false
+				for _, old := range g.recentFPs {
+					if old == fp {
+						seen = true
+						break
+					}
 				}
-				g.recentFPs = append(g.recentFPs, fp)
+				if g.probeTurns > 25 {
+					if !isError && !seen {
+						g.stagnantTurns = 0
+						g.steered = false
+						g.settleGrace = 0
+					} else {
+						g.stagnantTurns++
+					}
+				}
+				if !seen {
+					if len(g.recentFPs) == 12 {
+						g.recentFPs = g.recentFPs[1:]
+					}
+					g.recentFPs = append(g.recentFPs, fp)
+				}
 			}
 		}
 	}
@@ -149,10 +230,32 @@ func progressProbe(name string) bool {
 func progressWrite(name string) bool {
 	return name == "record_fact" || name == "report_finding" || name == "insert_assets"
 }
+
+// unwrapToolResult unwraps the JSON string wrapper added by norma/harness PostToolUse
+// (`json.Marshal(res.Flatten())`) so downstream parsers see the real tool output (F18).
+func unwrapToolResult(raw []byte) []byte {
+	var unwrapped string
+	if json.Unmarshal(raw, &unwrapped) == nil {
+		return []byte(unwrapped)
+	}
+	return raw
+}
+
+var recordedTextIDRE = regexp.MustCompile(`^(?:fact|finding)\s+recorded:\s*([1-9][0-9]*)`)
+
+// meaningfulWrite returns true ONLY when a write tool actually persisted at least
+// one new/valid object (F18). Empty arrays/zero counts/all-error batches return false.
 func meaningfulWrite(result []byte) bool {
+	raw := bytes.TrimSpace(unwrapToolResult(result))
+	if len(raw) == 0 {
+		return false
+	}
+	if recordedTextIDRE.Match(raw) {
+		return true
+	}
 	var data map[string]any
-	if json.Unmarshal(result, &data) != nil {
-		return len(bytes.TrimSpace(result)) > 0
+	if json.Unmarshal(raw, &data) != nil {
+		return false
 	}
 	if results, ok := data["results"].([]any); ok {
 		for _, value := range results {
@@ -172,26 +275,39 @@ func meaningfulWrite(result []byte) bool {
 		}
 		return false
 	}
-	for _, key := range []string{"inserted", "added", "created"} {
+	for _, key := range []string{"inserted", "added", "created", "id", "finding_node_id", "node_id"} {
 		if n, ok := data[key].(float64); ok {
 			return n > 0
 		}
 	}
-	return len(data) > 0
+	return false
 }
 
 var fpUUID = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 var fpTime = regexp.MustCompile(`\b(?:[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]|)[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?`)
-var fpHex = regexp.MustCompile(`(?i)\b[0-9a-f]{12,}\b`)
-var fpDigits = regexp.MustCompile(`[0-9]{4,}`)
+var fpHex = regexp.MustCompile(`(?i)\b[0-9a-f]{16,}\b`)
+var fpDuration = regexp.MustCompile(`\b[0-9]+(?:\.[0-9]+)?(?:ms|us|µs|ns|s)\b`)
+var fpLongDigits = regexp.MustCompile(`\b[0-9]{8,}\b`)
 
+// normalizedResponse strips volatile timestamps, UUIDs, long hex tokens, latency jitter,
+// and >=8-digit nonces/epoch numbers while PRESERVING 1–7 digit numbers (ports, ranges,
+// batch offsets, counts) so distinct negative coverage slices never collide (F19).
 func normalizedResponse(data []byte) []byte {
 	data = fpUUID.ReplaceAll(data, []byte("<uuid>"))
 	data = fpTime.ReplaceAll(data, []byte("<time>"))
 	data = fpHex.ReplaceAll(data, []byte("<hex>"))
-	return fpDigits.ReplaceAll(data, []byte("<number>"))
+	data = fpDuration.ReplaceAll(data, []byte("<dur>"))
+	return fpLongDigits.ReplaceAll(data, []byte("<bignum>"))
 }
+
 func responseFingerprint(name string, result []byte, isError bool) [32]byte {
+	return responseFingerprintWithInput(name, nil, result, isError)
+}
+
+// responseFingerprintWithInput hashes tool name, error flag, normalized input signature,
+// and normalized full output so distinct valid negative ranges do not collide
+// while repeated noise with changing timestamps still matches (F19).
+func responseFingerprintWithInput(name string, input []byte, result []byte, isError bool) [32]byte {
 	h := sha256.New()
 	h.Write([]byte(name))
 	h.Write([]byte{0})
@@ -200,21 +316,28 @@ func responseFingerprint(name string, result []byte, isError bool) [32]byte {
 	} else {
 		h.Write([]byte{0})
 	}
-	bucket := uint64(1)
-	for bucket < uint64(len(result)) {
-		bucket <<= 1
-	}
-	var size [8]byte
-	binary.LittleEndian.PutUint64(size[:], bucket)
-	h.Write(size[:])
-	// Normalize before taking edges, so variable UUID length cannot shift the sampled text.
-	clean := normalizedResponse(result)
-	h.Write(clean[:min(256, len(clean))])
 	h.Write([]byte{0})
-	if len(clean) > 256 {
-		h.Write(clean[max(256, len(clean)-128):])
+	if len(input) > 0 {
+		h.Write(normalizedResponse(canonicalInputBytes(input)))
+	}
+	h.Write([]byte{0})
+	clean := normalizedResponse(bytes.TrimSpace(result))
+	// Hash full normalized output (capped only against extreme multi-MB blobs) so
+	// mid-log result differences are not ignored.
+	const maxHashBytes = 64 * 1024
+	if len(clean) > maxHashBytes {
+		h.Write(clean[:maxHashBytes/2])
+		h.Write([]byte{0})
+		h.Write(clean[len(clean)-maxHashBytes/2:])
+	} else {
+		h.Write(clean)
 	}
 	var fp [32]byte
 	copy(fp[:], h.Sum(nil))
 	return fp
+}
+
+func formatReceiptSummary(r kernel.RunReceipt) string {
+	return strings.TrimSpace(fmt.Sprintf("state=%s term=%s delivery=%s tools=%d facts=%d assets=%d findings=%d batches=%d",
+		r.SettledState, r.TerminationCode, r.DeliveryStatus, r.ToolCalls, r.FactsWritten, r.AssetsWritten, r.FindingsWritten, len(r.ValidBatches)))
 }

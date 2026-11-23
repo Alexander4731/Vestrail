@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/guard"
@@ -27,17 +28,25 @@ type MainAgent struct {
 	window          int                                    // context window in tokens (for compaction)
 	windowFn        func() int                             // optional dynamic task-chain minimum
 	maxTurns        int                                    // max agent turns per run (0 = unlimited)
+	runTimeout      time.Duration                          // per-interaction wall-clock budget (0 = unlimited, F02)
 	proxyAddr       string                                 // recording proxy for WebFetch (empty = direct)
 	proxyCACert     string                                 // recording proxy's CA cert path (HTTPS verify)
 	webSearch       WebSearchOpts                          // web_search tool backend selection (off by default)
 	workDir         string                                 // shared work dir (surfaced in prompt as artifact-output target)
 	steerWork       func(intentID int64, msg string) error // engine callback: steer a running work (nil = off)
+	dispatchAdHoc   func(intentID int64) error             // engine callback: run one ad-hoc intent without reviving paused/done queue (F23/F24)
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = protocol default)
 }
 
 func (m *MainAgent) SetGuard(g *guard.Guard) { m.guard = g }
+
+// SetRunTimeout configures MainAgent's per-interaction wall-clock budget (0 = unlimited, F02).
+func (m *MainAgent) SetRunTimeout(d time.Duration) { m.runTimeout = d }
+
+// SetDispatchAdHoc wires scoped single-intent execution on paused/done tasks (F23/F24).
+func (m *MainAgent) SetDispatchAdHoc(fn func(intentID int64) error) { m.dispatchAdHoc = fn }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
 // context-compression mechanism. nil/unset = off (built-in compaction). Read per
@@ -50,8 +59,7 @@ func (m *MainAgent) SetNonStreaming(fn func() bool) { m.nonStreamingFn = fn }
 
 func (m *MainAgent) nonStreaming() bool { return m.nonStreamingFn != nil && m.nonStreamingFn() }
 
-// SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
-// send no cap and let the endpoint decide. Read per run, like nonStreaming.
+// SetMaxTokens wires a per-run output cap resolver. Nil or zero uses the protocol default.
 func (m *MainAgent) SetMaxTokens(fn func() int) { m.maxTokensFn = fn }
 
 func (m *MainAgent) maxTokens() int {
@@ -124,6 +132,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.SetNotify(notify)         // 通用唤醒（无专用回调的写操作走它，debounced）
 	tsx.SetResumeTask(resume)     // set_goals 新增目标 → 把已完成/暂停的任务拉回 running
+	tsx.SetDispatchAdHoc(m.dispatchAdHoc) // add_intent 单条直投 → 仅执行该意图，不唤醒旧队列 (F23/F24)
 	tsx.SetNotifyGoal(notifyGoal) // set_goals 新增目标 → 给 planner 记一条「人新增了目标：…」触发
 	tsx.SetNotifyHint(notifyHint) // add_hint 新增提示 → 给 planner 记一条「人新增了 N 条战略提示：…」触发
 	tsx.steerWork = m.steerWork   // enable steer_work tool (nil = unavailable)
@@ -137,6 +146,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	system, boundary := deferredSystem(mainAgentSystem(goal, m.workDir, mainDir), def)
+	plan := resolveBudgetPlan(m.runTimeout, TaskClock{})
+	ctx, cancelRun := runBudgetDeadline(ctx, plan)
+	defer cancelRun()
 	opts := agentcore.Options{
 		Provider:        m.prov,
 		SystemPrompt:    system,
@@ -161,14 +173,16 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		BashEnv:               proxyEnv(m.proxyAddr, m.proxyCACert), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:            mainDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:         cmdOutDir(mainDir),
-		MaxToolOutputChars:    defaultToolOutputChars,
-		MaxTurns:              m.maxTurns,                             // 0 = unlimited (configurable in agent management)
-		Compaction:            compactionConfig(m.compactionWindow()), // long chats stay within the window
+		MaxToolOutputChars:    toolOutputCharsForRole("mainagent"),
+		MaxTurns:              m.maxTurns,         // 0 = unlimited (configurable in agent management)
+		MaxDuration:           plan.Explore,       // 0 = unlimited (F02)
+		SettleDuration:        plan.SettleReserve, // deterministic wrap-up window (F03)
+		Compaction:            compactionConfigForRole("mainagent", m.compactionWindow()), // long chats stay within the window
 		Todos:                 actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		// 命中预算(步数)→ SDK 跑收尾:向用户输出一句进展总结。Prompt 与收尾轮数可后台编辑(默认 10 轮)。
 		Settlement:   wrapupSettlement("mainagent", nil),
 		NonStreaming: m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    m.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		MaxTokens:    m.maxTokens(),
 	}
 	if m.guard != nil {
 		opts.Hooks = m.guard.Hooks()

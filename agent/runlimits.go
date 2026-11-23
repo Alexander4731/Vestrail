@@ -8,20 +8,83 @@ import (
 	"time"
 
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-// The SDK's tool deadline does not cover PreToolUse. Give approval the same
-// deadline and bound the complete run, including its settlement phase.
+// ErrLocalRunBudgetExceeded signals that a run stopped because its own local
+// wall-clock budget (or task deadline clamp) expired — never a transient model outage.
+var ErrLocalRunBudgetExceeded = errors.New("单次运行预算已耗尽")
+
+// BudgetTimeoutError wraps a local hard-timeout abort cause with its kernel TerminationCode.
+type BudgetTimeoutError struct {
+	Code  kernel.TerminationCode
+	Cause error
+}
+
+func (e *BudgetTimeoutError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("%s: %v", ErrLocalRunBudgetExceeded.Error(), e.Cause)
+	}
+	return ErrLocalRunBudgetExceeded.Error()
+}
+
+func (e *BudgetTimeoutError) Unwrap() []error {
+	if e.Cause != nil {
+		return []error{ErrLocalRunBudgetExceeded, e.Cause}
+	}
+	return []error{ErrLocalRunBudgetExceeded}
+}
+
+type extraBashEnvKey struct{}
+
+// WithExtraBashEnv appends extra KEY=VALUE pairs (e.g. shared channel concurrency budget)
+// to a worker's subprocess environment without mutating shared Worker state (F21).
+func WithExtraBashEnv(ctx context.Context, env []string) context.Context {
+	if len(env) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, extraBashEnvKey{}, append([]string(nil), env...))
+}
+
+func extraBashEnvFrom(ctx context.Context) []string {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(extraBashEnvKey{}).([]string)
+	return v
+}
+
+// resolveBudgetPlan computes the unified Explore/Settle/Hard budget plan for any
+// role (Worker, Planner, MainAgent). ownTimeout <= 0 means unlimited (F02/F03).
+func resolveBudgetPlan(ownTimeout time.Duration, tc TaskClock) kernel.BudgetPlan {
+	ownSec := int(ownTimeout / time.Second)
+	if ownTimeout > 0 && ownSec <= 0 {
+		ownSec = 1
+	}
+	return kernel.ComputeBudgetPlan(ownSec, tc.DeadlineUnix, time.Now())
+}
+
+// runBudgetDeadline attaches the exploration approval deadline and final hard backstop
+// (Total + HardBuffer) using the unified two-phase BudgetPlan (F01/F03).
+func runBudgetDeadline(ctx context.Context, plan kernel.BudgetPlan) (context.Context, context.CancelFunc) {
+	if plan.Total <= 0 {
+		return ctx, func() {}
+	}
+	now := time.Now()
+	ctx = intercept.WithApprovalDeadline(ctx, now.Add(plan.Explore))
+	return context.WithDeadlineCause(ctx, now.Add(plan.HardDuration()), AbortRunHardTimeout)
+}
+
+// runDeadline is retained for existing internal tests/callers.
 func runDeadline(ctx context.Context, duration time.Duration) (context.Context, context.CancelFunc) {
 	if duration <= 0 {
 		return ctx, func() {}
 	}
-	deadline := time.Now().Add(duration)
-	ctx = intercept.WithApprovalDeadline(ctx, deadline)
-	return context.WithDeadlineCause(ctx, deadline.Add(30*time.Second), AbortRunHardTimeout)
+	plan := kernel.ComputeBudgetPlan(max(1, int(duration/time.Second)), 0, time.Now())
+	return runBudgetDeadline(ctx, plan)
 }
 
 func resumeSession(s *agentcore.Session, id string) error {

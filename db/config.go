@@ -44,10 +44,7 @@ type LLMProfile struct {
 	// Provider.Complete). Non-streaming sidesteps flaky gateway SSE at the cost of
 	// live in-run progress. Maps to agent.Config.Stream.
 	Streaming bool `json:"streaming"`
-	// MaxTokens caps a single reply's output in tokens. 0 = send no cap and let
-	// the endpoint's own default apply (the historical behaviour). Unlike
-	// ContextWindowK — the model's total capacity, used locally to size compaction
-	// — this value travels with every request.
+	// MaxTokens caps a single reply's output in tokens. Zero uses the protocol default.
 	MaxTokens int `json:"max_tokens"`
 	// MaxTokensField picks the request key carrying MaxTokens, for format
 	// "openai" only: "" = max_tokens (default); "max_completion_tokens" = the
@@ -735,12 +732,22 @@ func (d *DB) PromptVars(agentID int64) ([]PromptVar, error) {
 
 // CurrentPrompt returns the agent's active template text ("" if none set yet).
 func (d *DB) CurrentPrompt(agentID int64) (string, error) {
+	tmpl, _, err := d.CurrentPromptWithAuthor(agentID)
+	return tmpl, err
+}
+
+// CurrentPromptWithAuthor returns the active template and its recorded author.
+func (d *DB) CurrentPromptWithAuthor(agentID int64) (string, string, error) {
 	var tmpl sql.NullString
-	err := d.QueryRow(`SELECT p.template_text FROM agents a JOIN agent_prompts p ON p.id=a.current_prompt_id WHERE a.id=$1`, agentID).Scan(&tmpl)
+	var author string
+	err := d.QueryRow(`
+SELECT p.template_text, COALESCE(p.updated_by, '')
+FROM agents a JOIN agent_prompts p ON p.id=a.current_prompt_id
+WHERE a.id=$1`, agentID).Scan(&tmpl, &author)
 	if err == sql.ErrNoRows {
-		return "", nil
+		return "", "", nil
 	}
-	return tmpl.String, err
+	return tmpl.String, author, err
 }
 
 // SeedPromptIfEmpty writes the code-default template as the agent's first prompt
@@ -748,15 +755,60 @@ func (d *DB) CurrentPrompt(agentID int64) (string, error) {
 // SeedTool's first-insert-only philosophy: a user's edited prompt is never
 // clobbered on restart. Idempotent — a no-op once any version exists.
 func (d *DB) SeedPromptIfEmpty(agentID int64, tmpl string) error {
-	var cur sql.NullInt64
-	if err := d.QueryRow(`SELECT current_prompt_id FROM agents WHERE id=$1`, agentID).Scan(&cur); err != nil {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	cur, err := lockAgentPrompt(tx, agentID)
+	if err != nil {
 		return err
 	}
 	if cur.Valid {
 		return nil // already seeded or user-edited → leave it
 	}
-	_, err := d.SavePrompt(agentID, tmpl, "内置默认", "system")
-	return err
+	if _, err := savePrompt(tx, agentID, tmpl, "内置默认", "system"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SyncBuiltinPrompt idempotently ensures an unmodified built-in prompt matches
+// tmpl while preserving any user-customized prompt (updated_by != "system") (F12).
+// Unlike one-shot boolean flags, failed writes leave no completion mark so the
+// next startup retries cleanly.
+func (d *DB) SyncBuiltinPrompt(agentID int64, tmpl string) (upgraded bool, err error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	cur, err := lockAgentPrompt(tx, agentID)
+	if err != nil {
+		return false, err
+	}
+	if !cur.Valid {
+		if _, err := savePrompt(tx, agentID, tmpl, "内置默认", "system"); err != nil {
+			return false, err
+		}
+		return true, tx.Commit()
+	}
+	var currentTmpl string
+	var author string
+	err = tx.QueryRow(`SELECT template_text, COALESCE(updated_by, '') FROM agent_prompts WHERE id=$1`, cur.Int64).Scan(&currentTmpl, &author)
+	if err != nil {
+		return false, err
+	}
+	if author != "system" {
+		return false, nil // preserve user-edited template
+	}
+	if currentTmpl == tmpl {
+		return false, nil
+	}
+	if _, err := savePrompt(tx, agentID, tmpl, "升级内置默认", "system"); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // ResetPromptToDefault appends the code-default template as a new version and
@@ -772,6 +824,23 @@ func (d *DB) SavePrompt(agentID int64, template, note, by string) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	if _, err := lockAgentPrompt(tx, agentID); err != nil {
+		return 0, err
+	}
+	ver, err := savePrompt(tx, agentID, template, note, by)
+	if err != nil {
+		return 0, err
+	}
+	return ver, tx.Commit()
+}
+
+func lockAgentPrompt(tx *sql.Tx, agentID int64) (sql.NullInt64, error) {
+	var current sql.NullInt64
+	err := tx.QueryRow(`SELECT current_prompt_id FROM agents WHERE id=$1 FOR UPDATE`, agentID).Scan(&current)
+	return current, err
+}
+
+func savePrompt(tx *sql.Tx, agentID int64, template, note, by string) (int, error) {
 	var ver int
 	if err := tx.QueryRow(`SELECT COALESCE(max(version),0)+1 FROM agent_prompts WHERE agent_id=$1`, agentID).Scan(&ver); err != nil {
 		return 0, err
@@ -784,7 +853,7 @@ func (d *DB) SavePrompt(agentID int64, template, note, by string) (int, error) {
 	if _, err := tx.Exec(`UPDATE agents SET current_prompt_id=$1 WHERE id=$2`, pid, agentID); err != nil {
 		return 0, err
 	}
-	return ver, tx.Commit()
+	return ver, nil
 }
 
 type PromptVersion struct {

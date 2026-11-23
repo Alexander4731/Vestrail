@@ -13,6 +13,7 @@ import (
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/guard"
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -84,7 +85,7 @@ type Worker struct {
 	// compaction).
 	noaEnabledFn func() bool
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
-	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
+	// per-run basis. Nil or zero uses the protocol default.
 	maxTokensFn func() int
 }
 
@@ -125,8 +126,7 @@ func (w *Worker) nonStreaming() bool { return w.nonStreamingFn != nil && w.nonSt
 // run so the settings toggle takes effect without rebuilding the agent.
 func (w *Worker) SetNoaEnabled(fn func() bool) { w.noaEnabledFn = fn }
 
-// SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
-// send no cap and let the endpoint decide. Read per run, like nonStreaming.
+// SetMaxTokens wires a per-run output cap resolver. Nil or zero uses the protocol default.
 func (w *Worker) SetMaxTokens(fn func() int) { w.maxTokensFn = fn }
 
 func (w *Worker) maxTokens() int {
@@ -410,9 +410,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
 	base := append(tsx.WorkerTools(), w.extraTools...)
-	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
-	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
-	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	// 保留 SDK 原生 Glob/Grep，让普通文件与日志检索零 Shell 启动成本、规避 Windows PowerShell 语法摩擦 (F06)；
+	// 仅剔除 MultiEdit（精改用 Edit）。
+	base = append(base, defaultToolsExcept("MultiEdit")...)
 	if OptimizationEnabled("VESTRAIL_OPT_RUNSCRIPT") {
 		base = append(base, NewRunScriptTool())
 	}
@@ -481,15 +481,16 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if lane.Context != nil && lane.Context.Fingerprint == fingerprint {
 		system, boundary = lane.Context.System, lane.Context.Boundary
 	}
-	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
+	// 统一两阶段预算计划(Explore + SettleReserve + HardBuffer)，任务 deadline 夹逼 (F01/F02/F03)。
 	tc := taskClockFrom(ctx)
-	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
-	ctx, cancelRun := runDeadline(ctx, maxDur)
+	plan := resolveBudgetPlan(w.runTimeout, tc)
+	ctx, cancelRun := runBudgetDeadline(ctx, plan)
 	defer cancelRun()
 	settle := wrapupSettlement("worker", []string{"Bash", "RunScript"})
 	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("worker", []string{"Bash", "RunScript"}, clamped)
+		settle = wrapupSettlementForTask("worker", []string{"Bash", "RunScript"}, plan.ClampedByTask)
 	}
+	bashEnv := append(proxyEnv(w.proxyAddr, w.proxyCACert), extraBashEnvFrom(ctx)...)
 	opts := agentcore.Options{
 		Provider:        w.prov,
 		SystemPrompt:    system,
@@ -513,25 +514,25 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		DeepSeekSearchAPIKey:  w.webSearch.DeepSeekAPIKey,
 		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
 		WebSearchProxy:        w.webSearch.Proxy,
-		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
-		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
+		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA，并附带共享通道并发预算 (F21)。
+		BashEnv:    bashEnv,
 		WorkingDir: runDir,
 		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
-		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
-		// 距 deadline 剩余),让本 run 在任务到点时自然进收尾(见 taskclock.go)。
-		MaxDuration: maxDur,
+		// 两阶段预算：MaxDuration=探索窗，SettleDuration=确定性收尾窗 (F03)。
+		MaxDuration:    plan.Explore,
+		SettleDuration: plan.SettleReserve,
 		// 命中预算(轮次 OR 时长)→ SDK 跑一轮收尾(隐藏 Bash),把已识别的写回,避免烂尾。
 		// clamped(被任务 deadline 夹逼)时用 PromptByReason:因超时=任务到点→任务超时词,
 		// 因步数=夹逼窗口内步数先耗尽→回落 per-run 词。非 clamped 维持纯 per-run。
 		Settlement: settle,
-		// large tool output spills to cmd-output/ with a compact 10KB head+tail preview
+		// large tool output spills to cmd-output/ with a compact head+tail preview
 		// and a file pointer (SDK tool.Capture); full output preserved lossless on disk.
 		ToolOutputDir:      cmdOutDir(runDir),
-		MaxToolOutputChars: defaultToolOutputChars,
-		Compaction:         compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
-		Todos:              actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
-		NonStreaming:       w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:          w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		MaxToolOutputChars: toolOutputCharsForRole("worker"),
+		Compaction:         compactionConfigForRole("worker", w.compactionWindow()), // long tool-heavy runs stay within the window
+		Todos:              actool.NewTodoStore(),                                   // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		NonStreaming:       w.nonStreaming(),                                        // 该 profile 选非流式时走 Provider.Complete
+		MaxTokens:          w.maxTokens(),
 	}
 	if laneMode {
 		opts.PreserveReasoningHistory = true
@@ -565,14 +566,28 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if lane.Note != "" {
 		input += "\n" + lane.Note
 	}
-	if handoff := readIntentLane(intent); lane.Source == "" && (handoff.Continue > 0 || handoff.Handoff > 0) {
+	if handoff := readIntentLane(intent); handoff.Continue > 0 || handoff.Handoff > 0 {
 		sourceID := handoff.Continue
 		if sourceID == 0 {
 			sourceID = handoff.Handoff
 		}
-		if w.tx != nil {
+		if lane.Source == "" && w.tx != nil {
 			if state, e := readWorkerContext(w.tx.MainPath(WorkerSessionID(ts.ID(), sourceID)) + ".lane.json"); e == nil && state.TaskID == taskID && contextDirectory(w.workDir, taskID, state.Directory) {
 				input += "\n上游脚本目录（只作交接参考，复制到当前目录后使用）：" + state.Directory + "\n当前执行仍使用本意图目录：" + runDir
+			}
+		}
+		// Auto-Handoff (F07/F08): inject structured upstream checkpoint & valid artifacts directly
+		// so the successor worker skips directory scanning and working-set reconstruction.
+		if rec, e := ts.LatestIntentReceipt(ctx, sourceID); e == nil && rec != nil {
+			if block := renderUpstreamReceiptHandoff(sourceID, rec); block != "" {
+				input += "\n\n" + block
+			}
+		}
+	}
+	if extraEnv := extraBashEnvFrom(ctx); len(extraEnv) > 0 {
+		for _, kv := range extraEnv {
+			if strings.HasPrefix(kv, "VESTRAIL_WORKER_CONCURRENCY_BUDGET=") {
+				input += "\n\n【共享通道并发配额】" + kv + "（脚本内部并发请勿超过此值；若遇批量异常先降并发并做串行对照，无效批次标 valid=false）。"
 			}
 		}
 	}
@@ -655,7 +670,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			emitWrap(db.Activity{Kind: "text", Summary: "独立执行线元数据保存失败", Detail: e.Error()})
 		}
 	}
-	_, reason, err := captureRunSession(ctx, s, opts.Transcript, input, emitWrap)
+	outcome := captureRunSessionOutcome(ctx, s, opts.Transcript, input, emitWrap)
 	if w.tx != nil && laneMode {
 		root, depth := intent.ID, 1
 		if lane.Context != nil {
@@ -674,5 +689,37 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			emitWrap(db.Activity{Kind: "text", Summary: "执行线元数据保存失败，后续接力将停用", Detail: e.Error()})
 		}
 	}
-	return reason, tsx.Writes(), err
+	writes := tsx.Writes()
+	writes.FinalText = outcome.Text
+	writes.AbortCode = outcome.AbortCode
+	return outcome.Reason, writes, outcome.Err
+}
+
+func renderUpstreamReceiptHandoff(sourceID int64, rec *kernel.RunReceipt) string {
+	if rec == nil || (rec.Checkpoint == nil && len(rec.ValidBatches) == 0) {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "【上游意图 #%d 结构化断点与可复用产物（禁止将 history_log/guess_wordlist 升级为目标暴露证据）】", sourceID)
+	if cp := rec.Checkpoint; cp != nil {
+		if cp.CompletedScope != "" {
+			b.WriteString("\n- 已完成范围: " + cp.CompletedScope)
+		}
+		if cp.RemainingScope != "" {
+			b.WriteString("\n- 剩余未测范围: " + cp.RemainingScope)
+		}
+		if cp.NextAction != "" {
+			b.WriteString("\n- 下一条最小动作: " + cp.NextAction)
+		}
+		for _, a := range cp.ValidArtifacts {
+			fmt.Fprintf(&b, "\n- 产物 %s (provenance=%s, valid=%v) %s", a.Path, a.Provenance, a.Valid, a.Note)
+		}
+		if len(cp.InvalidArtifacts) > 0 {
+			b.WriteString("\n- 已失效/不可复用产物（严禁 SKIP）: " + strings.Join(cp.InvalidArtifacts, ", "))
+		}
+	}
+	if len(rec.ValidBatches) > 0 {
+		fmt.Fprintf(&b, "\n- 上游已核销有效批次: %d 批", len(rec.ValidBatches))
+	}
+	return b.String()
 }

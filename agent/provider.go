@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,9 +61,9 @@ type Config struct {
 	// 某些网关糟糕的 SSE 实现(空帧、思考字段丢帧),代价是失去运行中的实时进度/实时
 	// token 计数。映射为 agentcore.Options.NonStreaming = !Stream。
 	Stream bool
-	// MaxTokens 是单次回复的输出上限(token)。0 = 不发送该字段,由服务端默认值决定
-	// (历史行为)。与 ContextWindowK 不同:后者是模型总容量,只在本地用来算压缩阈值,
-	// 不出现在请求里;本值随每次请求发出。映射为 agentcore.Options.MaxTokens。
+	// MaxTokens 是单次回复的输出上限。0 表示采用协议默认行为：
+	// OpenAI Chat Completions 和 Responses 省略上限，Anthropic 发送必填的 32768。
+	// ContextWindowK 是用于计算本地压缩阈值的模型总容量。
 	MaxTokens int
 	// MaxTokensField 选择 MaxTokens 用哪个请求字段名,仅对 format=openai 生效:
 	//   "" = max_tokens(默认); "max_completion_tokens" = 新字段。
@@ -161,6 +162,12 @@ var extraCompactableDomainTools = []string{
 // in tokens. agentcore.NewSession wires the summarizer (same provider) when this
 // is set on Options.Compaction.
 func compactionConfig(windowTokens int) *compaction.Config {
+	return compactionConfigForRole("", windowTokens)
+}
+
+// compactionConfigForRole allows role-specific SoftWindow / MicroBatchGrowth A/B
+// tuning via optional env overrides (F29) while preserving safe defaults.
+func compactionConfigForRole(role string, windowTokens int) *compaction.Config {
 	if windowTokens <= 0 {
 		windowTokens = defaultWindowK * 1000
 	}
@@ -168,6 +175,15 @@ func compactionConfig(windowTokens int) *compaction.Config {
 	growth := defaultMicroBatchGrowth
 	if !OptimizationEnabled("VESTRAIL_OPT_COMPACTION") {
 		soft, growth = 72000, 18000
+	}
+	if role != "" {
+		prefix := "VESTRAIL_" + strings.ToUpper(strings.TrimSpace(role)) + "_"
+		if v := envPositiveInt(prefix + "SOFT_WINDOW"); v >= 32000 {
+			soft = v
+		}
+		if v := envPositiveInt(prefix + "MICRO_GROWTH"); v >= 4000 {
+			growth = v
+		}
 	}
 	if windowTokens < soft {
 		soft = windowTokens
@@ -180,6 +196,29 @@ func compactionConfig(windowTokens int) *compaction.Config {
 		ExtraCompactable: extraCompactableDomainTools,
 		ConciseSummary:   true,
 	}
+}
+
+// toolOutputCharsForRole resolves per-role tool output preview cap for F29 A/B experiments.
+func toolOutputCharsForRole(role string) int {
+	if role != "" {
+		key := "VESTRAIL_" + strings.ToUpper(strings.TrimSpace(role)) + "_TOOL_OUTPUT_CHARS"
+		if v := envPositiveInt(key); v >= 1000 {
+			return v
+		}
+	}
+	return defaultToolOutputChars
+}
+
+func envPositiveInt(key string) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }
 
 // FromEnv resolves the LLM provider config:

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -9,12 +10,24 @@ import (
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/guard"
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Alexander4731/Vestrail/sidequestion"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
+
+// RunOutcome captures the full result of one agent session prompt, preserving the
+// exact child-context abort cause so local hard timeouts never degrade to raw
+// DeadlineExceeded across layer boundaries (F01).
+type RunOutcome struct {
+	Text       string
+	Reason     harness.TerminalReason
+	AbortCode  kernel.TerminationCode
+	AbortCause error
+	Err        error
+}
 
 // captureRun drives one agent turn-to-completion over Session.Prompt and emits a
 // coalesced ActivityRecord per execution step (tool_use / tool_result / text /
@@ -38,6 +51,11 @@ func captureRun(ctx context.Context, opts agentcore.Options, input string, emit 
 // multiple prompts on the SAME conversation (e.g. a settlement round that reuses
 // the worker's accumulated context after the main run hit max_turns).
 func captureRunSession(ctx context.Context, s *agentcore.Session, store *transcript.Store, input string, emit func(db.Activity)) (string, harness.TerminalReason, error) {
+	out := captureRunSessionOutcome(ctx, s, store, input, emit)
+	return out.Text, out.Reason, out.Err
+}
+
+func captureRunSessionOutcome(ctx context.Context, s *agentcore.Session, store *transcript.Store, input string, emit func(db.Activity)) RunOutcome {
 	baseUsage := s.Usage()
 	ctx, auditTrace := intercept.WithTrace(ctx, input, approvalHistory(s.Messages()))
 	auditTrace.UseTranscript(store)
@@ -85,13 +103,13 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, store *transcr
 	for ev, err := range s.Prompt(ctx, input) {
 		if err != nil {
 			flush()
-			if ctx.Err() != nil { // engine/user cancellation, not a provider failure
+			if ctx.Err() != nil { // engine/user/local-budget cancellation, not a provider failure
 				sum, detail := terminalText(ctx, &harness.Terminal{Reason: reason, Err: ctx.Err()}, lastTool)
 				rec(activityWithUsage(db.Activity{Kind: "result", Summary: firstLine(sum, 400), Detail: detail}, lastUsage))
-				return finalText, reason, ctx.Err()
+				return buildCanceledOutcome(ctx, finalText, reason)
 			}
 			rec(activityWithUsage(db.Activity{Kind: "result", IsError: true, Summary: "执行出错: " + err.Error(), Detail: err.Error()}, lastUsage))
-			return finalText, reason, err
+			return RunOutcome{Text: finalText, Reason: reason, Err: err}
 		}
 		switch ev.Kind {
 		case harness.KindToolUse:
@@ -161,7 +179,61 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, store *transcr
 		}
 	}
 	flush() // safety: any unflushed text if the stream ended without KindResult
-	return finalText, reason, rerr
+	if ctx.Err() != nil && (reason == harness.ReasonAbortedStreaming || reason == harness.ReasonAbortedTools || reason == "") {
+		out := buildCanceledOutcome(ctx, finalText, reason)
+		if rerr != nil && out.Err == nil {
+			out.Err = rerr
+		}
+		return out
+	}
+	out := RunOutcome{Text: finalText, Reason: reason, Err: rerr}
+	switch reason {
+	case harness.ReasonTimeout, harness.ReasonMaxTurns:
+		if taskClockFrom(ctx).DeadlineUnix > 0 && time.Now().Unix() >= taskClockFrom(ctx).DeadlineUnix {
+			out.AbortCode = kernel.TermBudgetTask
+		} else {
+			out.AbortCode = kernel.TermBudgetRun
+		}
+	case harness.ReasonCompleted:
+		out.AbortCode = kernel.TermCompleted
+	}
+	return out
+}
+
+func buildCanceledOutcome(ctx context.Context, text string, reason harness.TerminalReason) RunOutcome {
+	cause := context.Cause(ctx)
+	out := RunOutcome{
+		Text:       text,
+		Reason:     reason,
+		AbortCause: cause,
+		Err:        ctx.Err(),
+	}
+	if errors.Is(cause, AbortRunHardTimeout) {
+		code := kernel.TermBudgetRun
+		if tc := taskClockFrom(ctx); tc.DeadlineUnix > 0 && time.Now().Unix() >= tc.DeadlineUnix {
+			code = kernel.TermBudgetTask
+		}
+		out.AbortCode = code
+		out.Err = &BudgetTimeoutError{Code: code, Cause: cause}
+		return out
+	}
+	switch {
+	case errors.Is(cause, AbortNoProgressStagnation):
+		out.AbortCode = kernel.TermNoProgress
+	case errors.Is(cause, AbortRepeatedToolFailure):
+		out.AbortCode = kernel.TermRepeatedToolFailure
+	case errors.Is(cause, AbortKilledByPlanner):
+		out.AbortCode = kernel.TermKilledByPlanner
+	case errors.Is(cause, AbortPausedByUser), errors.Is(cause, AbortPausedByOrchestrator), errors.Is(cause, AbortWorkPausedByUser):
+		out.AbortCode = kernel.TermPausedByUser
+	case errors.Is(cause, AbortTaskDeleted), errors.Is(cause, AbortWorkCancelledByUser):
+		out.AbortCode = kernel.TermCancelledByUser
+	case errors.Is(cause, AbortGoalMet):
+		out.AbortCode = kernel.TermGoalMet
+	case errors.Is(cause, AbortShutdown):
+		out.AbortCode = kernel.TermShutdown
+	}
+	return out
 }
 
 func activityWithUsage(activity db.Activity, usage *llm.Usage) db.Activity {

@@ -1837,7 +1837,7 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if body.OmitThoughtSignatures != nil {
 		p.OmitThoughtSignatures = *body.OmitThoughtSignatures
 	}
-	// 输出上限:负数无意义,归零(= 不发送该字段)。字段名开关只有 Chat Completions
+	// 输出上限:负数归零，采用所选协议的默认行为。字段名开关只有 Chat Completions
 	// 用得上——anthropic 与 openai-responses 各自定死了字段名,存下来只会误导后续读者,
 	// 故非 openai 格式一律清空。未知取值同样清空,避免把 DB CHECK 的报错甩给用户。
 	if p.MaxTokens < 0 {

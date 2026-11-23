@@ -183,7 +183,7 @@ func (r *taskLLMRuntime) nonStreaming() bool {
 }
 
 // maxTokens returns the currently-active source's per-reply output cap.
-// Unresolvable → 0, i.e. send no cap, matching the pre-setting behaviour.
+// An unresolved source returns zero to use the protocol default.
 func (r *taskLLMRuntime) maxTokens() int {
 	cfg, _ := r.activeCfg() // 未解析出配置时是零值 0
 	return cfg.MaxTokens
@@ -639,6 +639,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetCompactor(compactor)
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
 	main.SetGuard(t.Guard)
+	main.SetRunTimeout(time.Duration(s.agentRunSeconds("mainagent")) * time.Second)
+	main.SetDispatchAdHoc(func(intentID int64) error { return s.engine.RunAdHocIntent(s.ctx, t, intentID) })
 	main.SetFindingRecorder(s.evidenceStore())
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)
 	main.SetNonStreaming(mainRuntime.nonStreaming)

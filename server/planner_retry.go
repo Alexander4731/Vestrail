@@ -16,7 +16,10 @@ import (
 // Only known model/transport failures may wait indefinitely. Configuration,
 // transcript and graph errors need an explicit action instead of a retry loop.
 func retryablePlannerModelError(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || isQuotaExhaustedError(err) {
+	if err == nil || errors.Is(err, context.Canceled) ||
+		errors.Is(err, agent.ErrLocalRunBudgetExceeded) ||
+		errors.Is(err, agent.AbortRunHardTimeout) ||
+		isQuotaExhaustedError(err) {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, agent.ErrRetryBudget) || errors.Is(err, harness.ErrEmptyResponse) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {

@@ -1173,7 +1173,7 @@ export interface LLMProfile {
   pool_exclude?: boolean;
   // true（默认）= 流式(SSE) | false = 真·非流式(stream:false，一次性返回)。
   streaming?: boolean;
-  // 单次回复的输出上限(token)。0 = 不发送该字段，由服务端默认值决定。
+  // 单次回复的输出上限。0 时 OpenAI 省略上限，Anthropic 发送 32768。
   // 注意与 context_window_k 区分：后者是模型总容量，只在本地用于压缩阈值。
   max_tokens?: number;
   // 上限用哪个请求字段名，仅 format="openai" 有意义：

@@ -34,7 +34,7 @@ type ChatAgent struct {
 	guard          *guard.Guard // optional; nil disables intercept hooks for chat
 	nonStreamingFn func() bool  // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn   func() bool  // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn    func() int   // resolver: per-reply output cap (nil/0 = send no cap)
+	maxTokensFn    func() int   // resolver: per-reply output cap (nil/0 = protocol default)
 }
 
 func NewChatAgent(prov llm.Provider, model, workDir string, tx *transcript.Store, window int) *ChatAgent {
@@ -52,8 +52,7 @@ func (c *ChatAgent) nonStreaming() bool { return c.nonStreamingFn != nil && c.no
 // per run so the settings toggle takes effect without rebuilding the agent.
 func (c *ChatAgent) SetNoaEnabled(fn func() bool) { c.noaEnabledFn = fn }
 
-// SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
-// send no cap and let the endpoint decide. Read per run, like nonStreaming.
+// SetMaxTokens wires a per-run output cap resolver. Nil or zero uses the protocol default.
 func (c *ChatAgent) SetMaxTokens(fn func() int) { c.maxTokensFn = fn }
 
 func (c *ChatAgent) maxTokens() int {
@@ -161,7 +160,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		// (自定义 agent 各自一份;留空/0 用通用默认:10 轮)。
 		Settlement:   wrapupSettlement(agentKey, nil),
 		NonStreaming: c.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    c.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		MaxTokens:    c.maxTokens(),
 	}
 	if c.guard != nil {
 		opts.Hooks = c.guard.Hooks()

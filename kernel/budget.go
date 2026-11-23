@@ -1,0 +1,110 @@
+package kernel
+
+import "time"
+
+// TerminationCode names the authoritative reason an agent run stopped.
+type TerminationCode string
+
+const (
+	TermCompleted           TerminationCode = "completed"
+	TermBudgetRun           TerminationCode = "budget_run"            // 角色自身软/硬时长或 MaxTurns 耗尽
+	TermBudgetTask          TerminationCode = "budget_task"           // 任务总 deadline 耗尽
+	TermNoProgress          TerminationCode = "no_progress"           // 停滞守卫交回
+	TermRepeatedToolFailure TerminationCode = "repeated_tool_failure" // 同一工具连续失败交回
+	TermKilledByPlanner     TerminationCode = "killed_by_planner"     // Planner 主动 kill_work
+	TermPausedByUser        TerminationCode = "paused_by_user"        // 人工暂停任务/工作
+	TermCancelledByUser     TerminationCode = "cancelled_by_user"     // 人工删除任务/工作
+	TermGoalMet             TerminationCode = "goal_met"              // 目标已达成终止剩余工作
+	TermModelError          TerminationCode = "model_error"           // 真正的模型/网络传输失败
+	TermShutdown            TerminationCode = "shutdown"              // 进程关闭
+)
+
+const (
+	DefaultHardBuffer   = 15 * time.Second
+	MinSettleReserve    = 20 * time.Second
+	MaxSettleReserve    = 90 * time.Second
+	MinShortRunReserve  = 5 * time.Second
+	ShortRunThreshold   = 30 * time.Second
+)
+
+// BudgetPlan splits a run's wall-clock budget into an exploration window,
+// a bounded settlement window, and a final hard backstop buffer.
+type BudgetPlan struct {
+	Total         time.Duration // 0 = unlimited
+	Explore       time.Duration // soft explore deadline; 0 = unlimited
+	SettleReserve time.Duration // bounded wrap-up window after explore ends
+	HardBuffer    time.Duration // final hard-kill cushion after Total
+	ClampedByTask bool
+}
+
+// ComputeBudgetPlan derives a unified two-phase budget for Worker, Planner,
+// and MainAgent. ownSeconds <= 0 means the agent itself has no time cap
+// (never silently rewritten to 5 minutes).
+func ComputeBudgetPlan(ownSeconds int, taskDeadlineUnix int64, now time.Time) BudgetPlan {
+	var own time.Duration
+	if ownSeconds > 0 {
+		own = time.Duration(ownSeconds) * time.Second
+	}
+	var total time.Duration
+	var clamped bool
+	if taskDeadlineUnix > 0 {
+		rem := time.Unix(taskDeadlineUnix, 0).Sub(now)
+		if rem < time.Second {
+			rem = time.Second
+		}
+		if own <= 0 || rem <= own {
+			total = rem
+			clamped = true
+		} else {
+			total = own
+		}
+	} else {
+		total = own
+	}
+	if total <= 0 {
+		return BudgetPlan{}
+	}
+	var reserve time.Duration
+	if total <= ShortRunThreshold {
+		reserve = total / 3
+		if reserve < MinShortRunReserve && total > MinShortRunReserve {
+			reserve = MinShortRunReserve
+		}
+		if reserve >= total {
+			reserve = total / 2
+		}
+	} else {
+		reserve = total / 5
+		if reserve < MinSettleReserve {
+			reserve = MinSettleReserve
+		}
+		if reserve > MaxSettleReserve {
+			reserve = MaxSettleReserve
+		}
+	}
+	explore := total - reserve
+	if explore < time.Second {
+		explore = time.Second
+	}
+	return BudgetPlan{
+		Total:         total,
+		Explore:       explore,
+		SettleReserve: reserve,
+		HardBuffer:    DefaultHardBuffer,
+		ClampedByTask: clamped,
+	}
+}
+
+// HardDuration returns the total duration until the hard backstop fires.
+func (p BudgetPlan) HardDuration() time.Duration {
+	if p.Total <= 0 {
+		return 0
+	}
+	return p.Total + p.HardBuffer
+}
+
+// IsBudgetTerm reports whether code represents a local budget exhaustion rather
+// than a transient provider error.
+func (c TerminationCode) IsBudgetTerm() bool {
+	return c == TermBudgetRun || c == TermBudgetTask
+}

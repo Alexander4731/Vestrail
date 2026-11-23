@@ -56,7 +56,11 @@ func resolveScript(raw json.RawMessage) (runScriptInput, string, error) {
 		case ".ps1":
 			in.Interpreter = "pwsh"
 			if runtime.GOOS == "windows" {
-				in.Interpreter = "powershell"
+				if ws := actool.ActiveWindowsShell(); ws != "" {
+					in.Interpreter = ws
+				} else {
+					in.Interpreter = "powershell"
+				}
 			}
 		default:
 			in.Interpreter = "bash"
@@ -100,7 +104,7 @@ func (r *runScriptTool) ReviewInput(raw json.RawMessage) (json.RawMessage, bool,
 
 func NewRunScriptTool() actool.CoreTool {
 	return &runScriptTool{actool.Build(actool.Spec{
-		Name: "RunScript", Description: "在当前工作目录写入脚本并前台执行，原始输出留档。默认按后缀选择解释器，支持 args 和 timeout_ms。",
+		Name: "RunScript", Description: "在当前工作目录写入脚本并前台执行，原始输出留档。默认按后缀选择解释器，支持 args 和 timeout_ms。分批扫描脚本可输出一行 JSON {\"schema\":\"vestrail.batch.v1\",\"scope\":\"...\",\"range_start\":N,\"range_end\":M,\"valid\":true,\"precondition_ok\":true,\"attempted\":X,\"unique_covered\":Y,\"positive\":Z} 供引擎自动计入有效覆盖进展；复用旧结果文件时须验证 valid=true && precondition_ok=true，禁止仅凭文件存在 SKIP。",
 		Schema: obj(map[string]any{"path": str("相对脚本路径"), "content": str("完整脚本内容"), "interpreter": str("可选解释器可执行文件"), "args": str("可选参数串，按当前系统 shell 语法引用"), "timeout_ms": intp("超时毫秒，默认120000，最多600000")}, "path", "content"),
 		Permissions: func(ctx context.Context, raw json.RawMessage, pc permission.Context) permission.Decision {
 			in, command, err := resolveScript(raw)

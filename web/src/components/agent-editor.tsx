@@ -255,9 +255,9 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   if (loaded && !detail) {
     return <div className="text-muted-foreground p-6 text-center text-sm">未找到 Agent：{agentKey}</div>;
   }
-  // config is meaningless for the conversational main agent and the fixed-budget
-  // goals decomposer; every other agent (workers, custom assistants) honors it.
-  const showConfig = agentKey !== "mainagent" && agentKey !== "goals";
+  // config applies to all interactive/loop agents (worker, planner, mainagent, custom);
+  // only the fixed-budget one-shot goals decomposer hides it (F02).
+  const showConfig = agentKey !== "goals";
   // web search applies to every conversational/executing agent except the one-shot
   // goals decomposer; it's gated by the global master switch.
   const showWebSearch = agentKey !== "goals";
@@ -325,6 +325,11 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                 <Button size="sm" variant="outline" onClick={saveConfig}>
                   <SaveIcon /> 保存配置
                 </Button>
+                {showConfig && (
+                  <p className="text-muted-foreground w-full text-xs">
+                    0 表示该角色自身不限时；修改在下一轮执行生效。任务设置了总超时时取二者较小值，并自动预留收尾写回窗口。
+                  </p>
+                )}
               </div>
               {showWebSearch && (
                 <div className="flex items-center gap-3 border-t pt-3">

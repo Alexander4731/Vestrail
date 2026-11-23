@@ -7,26 +7,34 @@ import (
 )
 
 func lockTaskGraphWrite(ctx context.Context, tx *sql.Tx, expID int64) error {
+	_, _, err := lockTaskGraphWriteMode(ctx, tx, expID, false)
+	return err
+}
+
+// lockTaskGraphWriteMode locks the owning task row and checks deletion, archive,
+// and terminal status. When allowTerminalAdHoc is true, paused and terminal
+// (done/timeout/failed) tasks still permit atomic creation of a single ad-hoc
+// intent without reviving the old queue (F23/F24).
+func lockTaskGraphWriteMode(ctx context.Context, tx *sql.Tx, expID int64, allowTerminalAdHoc bool) (status string, paused bool, err error) {
 	var taskID int64
-	var status string
 	var deleted sql.NullTime
-	err := tx.QueryRowContext(ctx, `SELECT id,status,deleted_at FROM tasks WHERE exploration_id=$1 FOR UPDATE`, expID).Scan(&taskID, &status, &deleted)
+	err = tx.QueryRowContext(ctx, `SELECT id,status,COALESCE(paused,false),deleted_at FROM tasks WHERE exploration_id=$1 FOR UPDATE`, expID).Scan(&taskID, &status, &paused, &deleted)
 	if err == sql.ErrNoRows {
-		return nil
+		return "", false, nil
 	}
 	if err != nil {
-		return err
+		return "", false, err
 	}
 	if deleted.Valid {
-		return ErrTaskArchiveState
+		return status, paused, ErrTaskArchiveState
 	}
 	if err = checkTaskArchiveWriteTx(ctx, tx, taskID); err != nil {
-		return err
+		return status, paused, err
 	}
-	if IsTerminal(status) {
-		return fmt.Errorf("任务已结束，不能修改目标或新建意图")
+	if !allowTerminalAdHoc && IsTerminal(status) {
+		return status, paused, fmt.Errorf("任务已结束，不能修改目标或新建意图")
 	}
-	return nil
+	return status, paused, nil
 }
 
 func (s *ExplorationStore) AllGoalsMet() (bool, error) {

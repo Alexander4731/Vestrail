@@ -105,6 +105,7 @@ func (s *Session) ForkFrom(sourceSessionID, newSessionID string) error {
 func (s *Session) UpdateRunOptions(opts Options) {
 	s.opts.MaxTurns = opts.MaxTurns
 	s.opts.MaxDuration = opts.MaxDuration
+	s.opts.SettleDuration = opts.SettleDuration
 	s.opts.MaxTokens = opts.MaxTokens
 	s.opts.NonStreaming = opts.NonStreaming
 	s.opts.Settlement = opts.Settlement

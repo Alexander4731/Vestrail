@@ -325,7 +325,7 @@ function ProfileSheet({
   const [priority, setPriority] = React.useState("0"); // 轮询顺位;越大越先
   const [poolExclude, setPoolExclude] = React.useState(false);
   const [streaming, setStreaming] = React.useState(true); // true=流式(默认);false=非流式
-  const [maxTokens, setMaxTokens] = React.useState("0"); // 单次回复输出上限;0=不发送
+  const [maxTokens, setMaxTokens] = React.useState("0");
   const [maxTokensField, setMaxTokensField] = React.useState(NONE); // 上限用哪个字段名;NONE=max_tokens
   const [omitSignatures, setOmitSignatures] = React.useState(false);
   const [clientCompat, setClientCompat] = React.useState(false);
@@ -707,7 +707,8 @@ function ProfileSheet({
                   输出上限 · max tokens
                 </Label>
                 <p className="text-muted-foreground text-xs">
-                  单次回复最多生成多少 token，随每次请求发出。0（默认）= 不发送该字段，由服务端默认值决定。
+                  单次回复的输出上限。设为 0 时，OpenAI Chat Completions 和 Responses
+                  省略上限字段，由服务端决定。Anthropic 要求发送该字段，默认发送 32768。
                   这与上面的「上下文窗口」是两回事：那是模型总容量，只在本地用来算压缩阈值。
                   设太小会让推理模型在思考阶段就被截断，一个字答案都出不来。
                 </p>

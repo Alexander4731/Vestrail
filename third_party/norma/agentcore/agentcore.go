@@ -146,9 +146,10 @@ type Options struct {
 	SystemReminderFunc func() string
 
 	MaxTurns int
-	// MaxDuration bounds wall-clock run time, checked at the turn boundary (never
-	// mid-stream), so a run ends cleanly rather than being aborted in flight (0 = off).
+	// MaxDuration bounds wall-clock exploration time (0 = off).
 	MaxDuration time.Duration
+	// SettleDuration bounds the wrap-up settlement window after MaxDuration/MaxTurns (0 = inherit ctx).
+	SettleDuration time.Duration
 	// Settlement, when set with a Prompt, runs a bounded wrap-up phase when a budget
 	// (MaxTurns/MaxDuration) is hit — injecting the prompt and hiding DisabledTools —
 	// so a budget-terminated run checkpoints its findings. See harness.Settlement.
@@ -516,6 +517,7 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		Temperature:              s.opts.Temperature,
 		MaxTurns:                 s.opts.MaxTurns,
 		MaxDuration:              s.opts.MaxDuration,
+		SettleDuration:           s.opts.SettleDuration,
 		Settlement:               s.opts.Settlement,
 		MaxConcurrency:           s.opts.MaxConcurrency,
 		WorkingDir:               s.opts.WorkingDir,

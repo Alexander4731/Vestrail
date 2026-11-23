@@ -44,7 +44,7 @@ type Planner struct {
 	injectConstraints func() bool                            // resolver: inject task operation constraints into system prompt? (nil = yes)
 	nonStreamingFn    func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = protocol default)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
@@ -81,8 +81,7 @@ func (p *Planner) nonStreaming() bool { return p.nonStreamingFn != nil && p.nonS
 // run so the settings toggle takes effect without rebuilding the agent.
 func (p *Planner) SetNoaEnabled(fn func() bool) { p.noaEnabledFn = fn }
 
-// SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
-// send no cap and let the endpoint decide. Read per run, like nonStreaming.
+// SetMaxTokens wires a per-run output cap resolver. Nil or zero uses the protocol default.
 func (p *Planner) SetMaxTokens(fn func() int) { p.maxTokensFn = fn }
 
 func (p *Planner) maxTokens() int {
@@ -310,10 +309,11 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 任务目标：{{.Goal}}
 
-**本轮该产出几个意图（先想清楚这条）**：
-- **硬底线（最高优先）**：只要【目标未达成】且【当前没有任何 open 或 running 意图】（frontier_open=0 且 running_intents 为空），本轮就【必须】产出至少一个向目标推进的意图——没有在跑的 work 可等、也没有在排队的方向时，产出 0 意图=任务停摆；哪怕已知方向都只在 recent_done 里，也要据下面 done/exhausted/blocked 的判断另开一条或续派一条。
-- 硬底线之外，**产出 0 个意图是正常结果，但要有正当理由**（不是"少派更稳"的默认）：①**已覆盖**——你想到的方向都已被仍在 open/running 的意图处理（换措辞重复生成已存在的意图是严重错误）；②**等待依赖**——下一步依赖当前在跑 work 的产出、而它还没出来（此时硬派会让下游拿不到前置而空转，应等下次唤醒图更新后再派）。
-- 反过来：确有【未覆盖、且不依赖在跑 work】的新方向，或目标未达成且范围内仍有未测面，就该派——别把 0 意图当偷懒的默认。
+**本轮该产出几个意图（四态证据驱动原则，先想清楚这条）**：
+- **① 推进新假设 / 破除缺失前提**：只要目标未达成且存在【尚未覆盖、可证伪的新机理/独立攻击面】，或存在可主动验证/补齐的前置条件 → 派发新意图，并在 summary/brief 写清假设、范围(scope)、最小交付与停止条件。
+- **② 接力未完断点**：存在 exhausted 且留有有效断点/产物的意图 → 用 continue_intent_id 沿执行线接力，避免重建工作集。
+- **③ 等待活跃依赖**：下一步强依赖当前 open/running 意图的产出 → 产出 0 个意图是完全正常且正确的选择。
+- **④ 外部前提阻断时诚实挂起（不硬凑重复意图）**：若 frontier_open=0 且 running_intents 为空、目标尚未达成，但所有已知路线均卡在同一缺失外部前提（如缺授权凭据/人工会话）且确无独立替代机理，**禁止仅为了队列非空而换措辞重派旧方向**；请明确说明阻塞依据、缺失前提与重入条件后结束本轮，等待新证据或人工输入。反之，只要还存在本质不同的未测机理，就应继续深挖派发。
 
 **每次唤醒的决策流程**：
 
@@ -321,7 +321,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - **范围**：探索节点（goals/意图/facts/findings）只含本任务；**资产图全局共享**（多任务同一份，资产计数是全局在范围内的、非本任务独有）——出现非本任务相关的资产时忽略。
    - **血缘**：每个意图带 parents（上游：派生自哪些事实/意图）和 yields（下游：产生了哪些事实/发现），recent_facts 每条带 from_intent；据此理解"哪些事实来自哪个方向、能否综合出新方向"。
    - **否定/存疑观察**（recent_facts 里"端口关闭/不可注入"等）是 worker 的观察、不是定论：采信前先 node_detail(id) 看 evidence——evidence 扎实、confidence=observed 且手段已穷尽的才视为该方向暂时封住；evidence 缺失、只是"看起来像/只探一次"、或 confidence=inferred 的，按【尚未探明】处理，若在范围内且无其它意图覆盖，默认派一条复核意图去证实或推翻（**同一否定方向至多复核一次**；复核后仍为否定、且证据合理，就尊重该结论、不再派）。
-   - **要更深细节才按需调**：list_facts（分页，最新在前，默认 20，可 q 过滤、before 翻页，带 total/has_more）、list_findings（全部漏洞）、node_detail(id)（完整证据/详情；列表/recent_facts 只给摘要）、list_assets（pull：q 搜索、type/company_id/task_id 过滤、分页，或 id/ids 直取）、asset_neighbors。资产全局共享，别默认拉全量。
+   - **要更深细节先批量召回、少往返**：先列出要区分的假设，用**一次** list_facts(queries=[...])（支持最多 12 个关键词合并召回、按 confidence/provenance 过滤）查齐相关证据，再对真正影响决策的条目用**一次** node_detail(ids=[...])（批量最多 8 条）取全文；**禁止按单个关键词逐条往返调用几十次 list_facts**。监督在跑意图时，先看 running_intents 附带的实时一行摘要（declared_scope/steps/recent_errors/latest_action），需细查再用 get_worker_trace（默认返回最新 tail 步骤，续查用 after_step_id 游标）。资产全局共享，别默认拉全量。
 
 2. **判目标（核心职责）**：goals 字段已含目标与状态；对已被某发现/事实证明的未达成目标，调 prove_goal(goal_id, evidence_id, reason) 标 met。**当你标记的恰是最后一个未完成目标时，系统自动判定整个任务完成**——收官只由逐个 prove_goal 驱动，没有别的"一键完成"手段。
    - **量化验收核对**：coverage.pct 仅表示资产探索触达率，不能验收漏洞类别、身份矩阵或完整测试目标。测试覆盖须查看 check_coverage 的计划修订、适用数、完成数和缺口；没有计划、范围过期、自报结果或仍有缺口时不得声称测试完整。findings_total 只是登记数，不等于机器验证数。prove_goal 保存的模型评估仍须给出准确理由与适用证据。
@@ -344,9 +344,11 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    **串行利用链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认触发点"和"触发触发点"是同一步）；只有【平行、互不依赖】的维度（如枚举多个不相关端点）才用多意图并行。
 
 5. **提交**：用【一次】add_intent 批量提交筛出的新方向（intents 数组，最多 4 个最高价值的，不要逐条多次调）：
-   - **summary**：一句话自然语言描述该方向（测试目标完整地址 + 做什么 + 为什么），不套固定分类；去重主要靠它与已有意图比对。
-   - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体资产（站点/接口/参数/主机）就务必传，用于覆盖去重、连入资产链路，跨多资产就都传；纯全局侦察无具体资产才留空。
-   - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/发现也传其 id，顶层全新方向留空。
+   - **summary**：≤160 字的紧凑索引（目标 + 核心方向 + 为什么）；详细背景、参数、产物路径、验收与止损边界放 **brief** 或结构化字段（scope/hypothesis/inputs/max_tool_calls）。
+   - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——纯全局侦察无具体资产才留空。
+   - **parent_ids**：**严格只填已存在的 fact/finding 证据节点 id**（禁止填 intent/goal/hint 节点 id）；顶层全新方向留空。
+   - **continue_intent_id**：需要接力本任务已 done/exhausted 上游意图的执行线、工作目录与断点时传其 intent id（不要错填进 parent_ids）。
+   - **after_intents / resource_locks**：清理临时通道/会话等破坏性任务务必声明 resource_locks: [{resource:"...", mode:"exclusive"}] 或 after_intents，消费者声明 mode:"shared"，避免清理与消费竞争。
 
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
 
@@ -459,16 +461,13 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		tools, def = stableSessionTools(tools, def)
 	}
 	system, boundary := deferredSystem(sysBody, def)
-	roundLimit := p.runTimeout
-	if roundLimit <= 0 {
-		roundLimit = 5 * time.Minute
-	}
-	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, roundLimit)
-	ctx, cancelRun := runDeadline(ctx, maxDur)
+	// run_seconds=0 表示真正不限时（不再静默回落 5 分钟），两阶段预算预留收尾窗 (F01/F02/F03)。
+	plan := resolveBudgetPlan(p.runTimeout, tc)
+	ctx, cancelRun := runBudgetDeadline(ctx, plan)
 	defer cancelRun()
 	settle := wrapupSettlement("planner", nil)
 	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("planner", nil, clamped)
+		settle = wrapupSettlementForTask("planner", nil, plan.ClampedByTask)
 	}
 	opts := agentcore.Options{
 		Provider:        p.prov,
@@ -494,11 +493,12 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		BashEnv:                proxyEnv(p.proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:             taskDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:          cmdOutDir(taskDir),
-		MaxToolOutputChars:     defaultToolOutputChars,
-		DisableBackgroundTasks: true,       // planner 不运行后台长任务，省去 4 个后台工具 schema
-		MaxTurns:               p.maxTurns, // 0 = unlimited (configurable in agent management)
-		MaxDuration:            maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
-		Compaction:             compactionConfig(p.compactionWindow()),
+		MaxToolOutputChars:     toolOutputCharsForRole("planner"),
+		DisableBackgroundTasks: true,               // planner 不运行后台长任务，省去 4 个后台工具 schema
+		MaxTurns:               p.maxTurns,         // 0 = unlimited (configurable in agent management)
+		MaxDuration:            plan.Explore,       // 0=不限;探索窗
+		SettleDuration:         plan.SettleReserve, // 收尾预留窗
+		Compaction:             compactionConfigForRole("planner", p.compactionWindow()),
 		// 跨唤醒共享的规划待办：让串行链在多轮之间保留（session 是新的，store 不是）。
 		Todos: p.todoFor(ts.ID()),
 		// 命中【本轮】步数预算→ SDK 跑收尾:把本轮已想清楚的结论落地(该派的 add_intent、
@@ -506,7 +506,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		// clamped(被任务 deadline 夹逼)时改用 PromptByReason(见 wrapupSettlementForTask)。
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		MaxTokens:    p.maxTokens(),
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

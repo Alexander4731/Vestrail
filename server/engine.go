@@ -14,6 +14,7 @@ import (
 	"github.com/Alexander4731/Vestrail/agent"
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -93,6 +94,7 @@ func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
 type Engine struct {
 	laneBusy         sync.Map // laneKey -> intent id
 	noGainStreak     sync.Map // task id -> *atomic.Int64
+	channelPool      *channelPoolTracker
 	recoverExecution func(context.Context, *Task)
 	phases           sync.Map
 	stopping         bool // guarded by deleteMu
@@ -123,9 +125,11 @@ type Engine struct {
 	// so pausing can CANCEL an in-flight run (not just skip the next one). Recreated
 	// on resume since cancelling is one-shot. Every cancellation carries a named
 	// cause so the activity trace can identify the initiating control path.
-	execMu     sync.Mutex
-	execCancel map[string]context.CancelCauseFunc
-	execCtx    map[string]context.Context
+	execMu      sync.Mutex
+	execCancel  map[string]context.CancelCauseFunc
+	execCtx     map[string]context.Context
+	adHocCancel map[string]context.CancelCauseFunc
+	adHocCtx    map[string]context.Context
 
 	// Per-work control lets the planner kill a worker and lets the UI pause/cancel
 	// one intent without pausing the whole task. The done channel closes only after
@@ -199,6 +203,7 @@ func (e *Engine) BeginDelete(taskID string) bool {
 	e.paused.Store(taskID, true)
 	e.deleteMu.Unlock()
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
+	e.cancelAdHoc(taskID, agent.AbortTaskDeleted)
 	return true
 }
 
@@ -256,6 +261,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.deleteMu.Unlock()
 
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
+	e.cancelAdHoc(taskID, agent.AbortTaskDeleted)
 	e.runtimeMu.Lock()
 	rt := e.runtimes[taskID]
 	if rt != nil {
@@ -270,8 +276,13 @@ func (e *Engine) StopTask(taskID string) {
 	if cancel := e.execCancel[taskID]; cancel != nil {
 		cancel(agent.AbortTaskDeleted)
 	}
+	if cancel := e.adHocCancel[taskID]; cancel != nil {
+		cancel(agent.AbortTaskDeleted)
+	}
 	delete(e.execCancel, taskID)
 	delete(e.execCtx, taskID)
+	delete(e.adHocCancel, taskID)
+	delete(e.adHocCtx, taskID)
 	e.execMu.Unlock()
 
 	e.runtimeMu.Lock()
@@ -313,6 +324,40 @@ func (e *Engine) cancelExec(taskID string, cause error) {
 		cancel(cause)
 	}
 	e.execMu.Unlock()
+}
+
+func (e *Engine) cancelAdHoc(taskID string, cause error) {
+	e.execMu.Lock()
+	if cancel := e.adHocCancel[taskID]; cancel != nil {
+		cancel(cause)
+	}
+	e.execMu.Unlock()
+}
+
+// adHocContextFor returns a live execution context for a single MainAgent ad-hoc
+// intent that is independent of task-level Pause/Done status and only cancels on
+// task deletion or server shutdown (F23/F24).
+func (e *Engine) adHocContextFor(parent context.Context, taskID string) context.Context {
+	e.execMu.Lock()
+	defer e.execMu.Unlock()
+	if e.IsDeleting(taskID) {
+		c, cancel := context.WithCancelCause(parent)
+		cancel(agent.AbortTaskDeleted)
+		return c
+	}
+	if c := e.adHocCtx[taskID]; c != nil && c.Err() == nil {
+		return c
+	}
+	c, cancel := context.WithCancelCause(parent)
+	if e.adHocCtx == nil {
+		e.adHocCtx = map[string]context.Context{}
+	}
+	if e.adHocCancel == nil {
+		e.adHocCancel = map[string]context.CancelCauseFunc{}
+	}
+	e.adHocCtx[taskID] = c
+	e.adHocCancel[taskID] = cancel
+	return c
 }
 
 // Resume un-pauses a task and nudges a fresh planning round. The next exec under
@@ -402,7 +447,9 @@ func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix(
 
 func NewEngine(m *Manager) *Engine {
 	return &Engine{m: m, debounce: 2500 * time.Millisecond, bc: NewBroadcaster(),
-		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
+		channelPool: newChannelPoolTracker(),
+		execCancel:  map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
+		adHocCancel: map[string]context.CancelCauseFunc{}, adHocCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
 		runtimes: map[string]*taskRuntime{}}
 }
@@ -991,6 +1038,11 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.lifecycleSnapshot().Goal, triggers, emit)
 		lastPlanAt = time.Now()
 		switch {
+		case err != nil && ectx.Err() == nil && (errors.Is(err, agent.ErrLocalRunBudgetExceeded) || errors.Is(err, agent.AbortRunHardTimeout)):
+			// Local per-round budget ended cleanly (F01): do NOT misclassify as transient
+			// model unavailability and do NOT trigger 4s retry backoff or pauseForInput.
+			log.Printf("[planner] task %s 本轮规划到达本地预算上限，等待下一次触发: %v", t.ID, err)
+			failures = 0
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
 			failures = min(failures+1, 6)
@@ -1135,16 +1187,32 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 // must already hold one task-operation admission for the whole sequence so a delete
 // cannot observe quiescence between the LLM return and the final DB writes.
 func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, requestID, message string) bool {
+	return e.runIntentWithMode(ctx, t, name, worker, intent, requestID, message, false)
+}
+
+func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, requestID, message string, adHoc bool) bool {
 	leaseKey := laneKey{t.ID, agent.IntentLaneRoot(intent)}
 	defer e.releaseLane(leaseKey, intent.ID)
 	hasChatMessage := message != ""
-	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
+	if !adHoc {
+		e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
+	}
 	e.touch(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
-	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false)
-	ectx = agent.WithTaskObjective(ectx, t.lifecycleSnapshot().Goal) // cancellable by Pause; 带任务 deadline
+	var baseExec context.Context
+	if adHoc {
+		baseExec = e.adHocContextFor(ctx, t.ID)
+	} else {
+		baseExec = e.execContextFor(ctx, t.ID)
+	}
+	ectx := e.clockCtx(baseExec, t, false)
+	ectx = agent.WithTaskObjective(ectx, t.lifecycleSnapshot().Goal) // cancellable by Pause (or Delete for adHoc); 带任务 deadline
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
-		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
+		rollbackState := "open"
+		if adHoc {
+			rollbackState = "stopped"
+		}
+		if err := transitionIntentState(t.Store, intent.ID, "running", rollbackState); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 领取后回退失败: %v", name, t.ID, intent.ID, err)
 		}
 		return true
@@ -1162,6 +1230,18 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		complete(err)
 		return true
 	}
+	// Acquire shared channel concurrency slot if applicable and inject budget env (F21).
+	if e.channelPool != nil {
+		proxyAddr := ""
+		if e.m != nil {
+			proxyAddr = e.m.ProxyAddr()
+		}
+		if poolKey := e.channelPool.poolKeyFor(t.ID, proxyAddr, intent); poolKey != "" {
+			capTotal, activeCount, workerBudget, releasePool := e.channelPool.acquire(poolKey, intent.ID)
+			defer releasePool()
+			workCtx = agent.WithExtraBashEnv(workCtx, channelBudgetEnv(capTotal, activeCount, workerBudget))
+		}
+	}
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
 	// for THIS intent (drained before the worker's next tool call).
 	iid := intent.ID
@@ -1176,9 +1256,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	workCtx = intercept.WithRecoverySummary(workCtx, e.m.pg.RecoverySummary(workCtx, t.ID, iid))
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
+	failureGuard := newWorkerFailureGuardWithBudget(workCancel, intentMaxToolCalls(intent))
 	hooks := steerHooks{
 		inner:    t.Guard.Hooks(),
-		failures: newWorkerFailureGuard(workCancel),
+		failures: failureGuard,
 		drain:    func() (string, bool) { return e.drainSteer(iid) },
 		nudges:   &atomic.Int64{},
 		limit:    e.emptyTurnNudgeLimit(),
@@ -1198,15 +1279,30 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		totalWrites.Facts += wrote.Facts
 		totalWrites.Assets += wrote.Assets
 		totalWrites.Findings += wrote.Findings
+		if wrote.DeliveryStatus != "" {
+			totalWrites.DeliveryStatus = wrote.DeliveryStatus
+		}
+		if wrote.Checkpoint != nil {
+			totalWrites.Checkpoint = wrote.Checkpoint
+		}
+		if len(wrote.ValidBatches) > 0 {
+			totalWrites.ValidBatches = append(totalWrites.ValidBatches, wrote.ValidBatches...)
+		}
+		if wrote.FinalText != "" {
+			totalWrites.FinalText = wrote.FinalText
+		}
+		if wrote.AbortCode != "" {
+			totalWrites.AbortCode = wrote.AbortCode
+		}
 	}
 	execute()
 	// model_error 收场 → 额外重跑几次（退避后再试）。仅在意图仍属本 work、任务
-	// 未暂停/未终止/未取消【且未进入收尾】时重试；否则让位给对应分支处理(收尾期不
-	// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
+	// 未暂停/未终止/未取消【且未进入收尾】时重试；本地预算耗尽绝不重试 (F01)。
 	maxRetries, retryBackoff := e.modelErrorRetryPolicy()
 	for attempt := 1; attempt <= maxRetries &&
 		retryableWorkerModelError(reason, err) &&
-		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
+		!errors.Is(err, agent.ErrLocalRunBudgetExceeded) &&
+		workCtx.Err() == nil && ectx.Err() == nil && (adHoc || !e.IsPaused(t.ID)) && !e.isSettling(t.ID); attempt++ {
 		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
 			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
 		if sleepCtx(workCtx, retryBackoff) {
@@ -1214,19 +1310,18 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		execute()
 	}
-	// Capture kill state before detachWork cancels workCtx. kill = this work's
-	// ctx was cancelled (planner kill_work) while the TASK ctx kept running; a
-	// pause cancels the task ctx (ectx) instead. Checking workCtx.Err() AFTER
-	// unregister would always be true (unregister cancels it) → every completed
-	// work would be wrongly marked stopped.
+	// Capture workCause BEFORE detachWork cancels workCtx.
 	wrote = totalWrites
 	workCause := context.Cause(workCtx)
 	noProgress := errors.Is(workCause, agent.AbortRepeatedToolFailure) || errors.Is(workCause, agent.AbortNoProgressStagnation)
-	killed := workCtx.Err() != nil && ectx.Err() == nil && !noProgress
+	// Explicit allow-list for planner kill so local hard timeout can NEVER be misclassified as stopped (F01).
+	killed := errors.Is(workCause, agent.AbortKilledByPlanner)
+	localBudgetHit := wrote.AbortCode.IsBudgetTerm() ||
+		errors.Is(err, agent.ErrLocalRunBudgetExceeded) ||
+		errors.Is(workCause, agent.AbortRunHardTimeout) ||
+		reason == harness.ReasonTimeout ||
+		reason == harness.ReasonMaxTurns
 	action, completeWork := e.detachWork(intent.ID)
-	// A caller may stop waiting and release its in-memory reservation before the
-	// agent honors cancellation. The named context cause remains authoritative and
-	// still settles the stopped run into a recoverable state.
 	if action == "" {
 		switch {
 		case errors.Is(workCause, agent.AbortWorkPausedByUser):
@@ -1236,21 +1331,66 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 	}
 	state, blockedReason := "done", ""
+	termCode := kernel.TermCompleted
 	switch {
 	case action == "pause" || action == "cancel":
 		state = "paused"
+		if action == "cancel" {
+			termCode = kernel.TermCancelledByUser
+		} else {
+			termCode = kernel.TermPausedByUser
+		}
 	case ectx.Err() != nil && taskExecutionPaused(context.Cause(ectx)):
 		state = "open"
+		termCode = kernel.TermPausedByUser
 	case ectx.Err() != nil && e.isSettling(t.ID):
 		state = "exhausted"
-	case killed || (ectx.Err() != nil && isTerminalStatus(e.m.TaskStatus(t.ID))):
+		termCode = kernel.TermBudgetTask
+	case killed || (ectx.Err() != nil && !adHoc && isTerminalStatus(e.m.TaskStatus(t.ID))):
 		state = "stopped"
-	case noProgress, errors.Is(workCause, agent.AbortRunHardTimeout), reason == harness.ReasonTimeout, reason == harness.ReasonMaxTurns:
+		if killed {
+			termCode = kernel.TermKilledByPlanner
+		} else {
+			termCode = kernel.TermGoalMet
+		}
+	case noProgress || localBudgetHit:
 		state = "exhausted"
+		switch {
+		case errors.Is(workCause, agent.AbortNoProgressStagnation):
+			termCode = kernel.TermNoProgress
+		case errors.Is(workCause, agent.AbortRepeatedToolFailure):
+			termCode = kernel.TermRepeatedToolFailure
+		case wrote.AbortCode != "":
+			termCode = wrote.AbortCode
+		default:
+			termCode = kernel.TermBudgetRun
+		}
 	case err != nil:
 		state = "blocked"
+		termCode = kernel.TermModelError
 		if isTaskLLMChainExhausted(err) {
 			blockedReason = db.IntentBlockedLLMQuota
+		}
+	}
+	// Distinguish genuine delivery completion from explicit partial/incomplete handback (F25).
+	delivery := wrote.DeliveryStatus
+	if state == "done" {
+		switch delivery {
+		case kernel.DeliveryPartialCheckpoint, kernel.DeliveryHandedBack:
+			state = "exhausted"
+		case "":
+			if wrote.Total() == 0 && kernel.LooksLikeIncompleteHandback(wrote.FinalText) {
+				delivery = kernel.DeliveryHandedBack
+				state = "exhausted"
+			} else {
+				delivery = kernel.DeliveryComplete
+			}
+		}
+	} else if delivery == "" {
+		if state == "exhausted" && (wrote.Total() > 0 || wrote.Checkpoint != nil) {
+			delivery = kernel.DeliveryPartialCheckpoint
+		} else {
+			delivery = kernel.DeliveryHandedBack
 		}
 	}
 	for {
@@ -1280,8 +1420,6 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		if unknown {
 			if policy.Mode == "auto" {
-				// Preserve deliberate user/Planner stops. Only recovery-owned pauses
-				// may later be reopened by the coordinator.
 				if action == "" && !killed && state != "stopped" {
 					state, blockedReason = "paused", db.IntentBlockedRecovery
 				}
@@ -1299,14 +1437,72 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		log.Printf("[worker %s] task %s 意图 #%d 状态 %s 未提交: %v", name, t.ID, intent.ID, state, settleErr)
 		return true
 	}
-	e.recordWorkerGain(t.ID, state, wrote)
+	toolCalls, guardBatches := failureGuard.stats()
+	mergedBatches := append([]kernel.EvidenceBatch(nil), wrote.ValidBatches...)
+	mergedBatches = append(mergedBatches, guardBatches...)
+	receipt := kernel.RunReceipt{
+		TaskID:          wTaskID,
+		ExplorationID:   t.Store.ID(),
+		IntentID:        intent.ID,
+		TerminationCode: termCode,
+		DeliveryStatus:  delivery,
+		SettledState:    state,
+		ToolCalls:       toolCalls,
+		FactsWritten:    wrote.Facts,
+		AssetsWritten:   wrote.Assets,
+		FindingsWritten: wrote.Findings,
+		ValidBatches:    mergedBatches,
+		Checkpoint:      wrote.Checkpoint,
+		Summary:         preview(wrote.FinalText, 240),
+	}
+	if e.m != nil && e.m.pg != nil {
+		if rerr := e.m.pg.SaveIntentReceipt(context.WithoutCancel(ctx), receipt); rerr != nil {
+			log.Printf("[worker %s] task %s 意图 #%d RunReceipt 保存失败: %v", name, t.ID, intent.ID, rerr)
+		}
+	}
+	e.recordWorkerGainReceipt(t.ID, receipt)
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)
-	if state != "open" && state != "paused" {
+	skipNotify := adHoc && (e.IsPaused(t.ID) || isTerminalStatus(e.m.TaskStatus(t.ID)))
+	if !skipNotify && state != "open" && state != "paused" {
 		t.NotifyDone(intent.ID)
 	}
 
 	return true
+}
+
+// RunAdHocIntent executes ONE MainAgent-created intent on a paused or terminal
+// task in its own goroutine without reviving the task or touching its old queue (F23/F24).
+func (e *Engine) RunAdHocIntent(ctx context.Context, t *Task, intentID int64) error {
+	if t == nil || intentID <= 0 {
+		return fmt.Errorf("invalid ad-hoc intent target")
+	}
+	if !e.beginTaskOperation(t.ID) {
+		return fmt.Errorf("task is being deleted")
+	}
+	release := true
+	defer func() {
+		if release {
+			e.decInflight(t.ID)
+		}
+	}()
+	_, worker := e.snapshotFor(t)
+	if worker == nil {
+		return fmt.Errorf("worker 尚未就绪")
+	}
+	node, err := t.Store.GetNode(intentID)
+	if err != nil {
+		return err
+	}
+	if node == nil || node.Kind != db.KindIntent {
+		return fmt.Errorf("intent not found")
+	}
+	release = false
+	go func() {
+		defer e.decInflight(t.ID)
+		e.runIntentWithMode(ctx, t, "adhoc", worker, node, "", "", true)
+	}()
+	return nil
 }
 
 // runDetachedIntent runs one paused intent OUTSIDE the worker pool in its own
@@ -1405,7 +1601,34 @@ func (e *Engine) claimNext(t *Task, name string) *db.Node {
 	if err != nil {
 		return nil
 	}
+	if len(fr) == 0 {
+		return nil
+	}
+	// Preload active intents & prerequisite terminal status once for RW resource-lock
+	// and after_intents DAG checks (F22).
+	running, _ := t.Store.IntentsInState("running")
+	activeInfos := make([]kernel.IntentScheduleInfo, 0, len(fr)+len(running))
+	var depIDs []int64
+	depSeen := map[int64]bool{}
+	for _, n := range running {
+		activeInfos = append(activeInfos, intentScheduleInfoFromNode(n))
+	}
+	for _, n := range fr {
+		info := intentScheduleInfoFromNode(n)
+		activeInfos = append(activeInfos, info)
+		for _, dep := range info.AfterIntents {
+			if dep > 0 && !depSeen[dep] {
+				depSeen[dep] = true
+				depIDs = append(depIDs, dep)
+			}
+		}
+	}
+	terminalDeps, _ := t.Store.TerminalIntentIDs(depIDs)
+
 	for _, in := range fr {
+		if ok, _ := kernel.CanClaimIntent(intentScheduleInfoFromNode(in), activeInfos, terminalDeps); !ok {
+			continue
+		}
 		key, ok := e.leaseLane(t.ID, in)
 		if !ok {
 			continue

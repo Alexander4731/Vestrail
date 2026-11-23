@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/agentcore"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -171,6 +172,12 @@ func (t *ToolSet) plannerDeltaData(old, current map[int64]int, previousHashes, c
 	for _, n := range nodes {
 		var payload map[string]any
 		_ = json.Unmarshal(n.Payload, &payload)
+		if n.Kind == db.KindFact {
+			item := kernel.ProjectFactCompact(n.ID, n.State, payload, 200)
+			item["kind"] = n.Kind
+			items = append(items, item)
+			continue
+		}
 		summary := payload["summary"]
 		if summary == nil {
 			summary = payload["text"]

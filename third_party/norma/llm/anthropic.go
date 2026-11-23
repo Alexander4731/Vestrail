@@ -9,6 +9,9 @@ import (
 	"net/http"
 )
 
+// DefaultAnthropicMaxTokens supplies the required output limit when the caller leaves it unset.
+const DefaultAnthropicMaxTokens = 32768
+
 type anthropicProvider struct{ cfg Config }
 
 type anthropicSystemBlock struct {
@@ -159,7 +162,7 @@ func markLastCacheableBlock(blocks []anthropicContentBlock) bool {
 func (p *anthropicProvider) buildBody(req CompletionRequest, stream bool) ([]byte, error) {
 	maxTok := req.MaxTokens
 	if maxTok == 0 {
-		maxTok = 8192
+		maxTok = DefaultAnthropicMaxTokens
 	}
 	// Effective thinking mode: a non-empty per-request override (req.Thinking)
 	// wins over Config.ThinkingType. Thinking-type content blocks may be replayed

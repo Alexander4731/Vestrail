@@ -197,19 +197,26 @@ func idSet(ids []int64) map[int64]bool {
 	return m
 }
 
-// seedPrompts writes each built-in agent's code-default prompt body into
-// agent_prompts on startup — first-insert only (SeedPromptIfEmpty is a no-op once
-// any version exists), so the DB becomes the authoritative editable source while
-// user edits survive restarts. Runs after seedBuiltins has created the agent rows.
+// seedPrompts idempotently synchronizes built-in agent prompt templates on startup (F12):
+// - Empty prompt -> seeds code default (updated_by='system').
+// - Unmodified system prompt (updated_by='system') whose text differs from the latest
+//   code default -> appends and activates a new system version (preserving history).
+// - User-customized prompt (updated_by != 'system') -> preserved untouched.
+// Failed writes leave no completion flag so the next startup automatically retries.
 func seedPrompts(pg *db.DB) {
 	for key, tmpl := range agent.BuiltinPromptSeeds() {
 		a, err := pg.GetAgentByKey(key)
 		if err != nil || a == nil {
-			log.Printf("[prompts] seed %s 跳过: agent 不存在 (%v)", key, err)
+			log.Printf("[prompts] sync %s 跳过: agent 不存在 (%v)", key, err)
 			continue
 		}
-		if err := pg.SeedPromptIfEmpty(a.ID, tmpl); err != nil {
-			log.Printf("[prompts] seed %s 失败: %v", key, err)
+		upgraded, err := pg.SyncBuiltinPrompt(a.ID, tmpl)
+		if err != nil {
+			log.Printf("[prompts] sync %s 失败（将在下次启动自动重试）: %v", key, err)
+			continue
+		}
+		if upgraded {
+			log.Printf("[prompts] %s 内置默认提示词已同步为最新版本", key)
 		}
 	}
 }

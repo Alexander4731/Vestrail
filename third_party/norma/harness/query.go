@@ -32,13 +32,14 @@ type QueryInput struct {
 	// list (they stay in Tools and are invoked via ExecuteExtraTool). Empty = all
 	// tool schemas sent as usual.
 	DeferredTools []string
-	MaxTokens     int
+	MaxTokens     int // 0 lets the provider choose its default output limit.
 	Temperature   *float64
 	// MaxTurns bounds tool-turns (0 = off). MaxDuration bounds wall-clock time,
 	// checked at the turn boundary so a turn is never aborted mid-stream — unlike
 	// cancelling ctx, which cuts an in-flight stream/tool (0 = off).
 	MaxTurns       int
 	MaxDuration    time.Duration
+	SettleDuration time.Duration // bounded wall-clock window for settlement after MaxDuration/MaxTurns (0 = inherit ctx)
 	MaxConcurrency int
 	// NonStreaming makes each model call a single non-streaming request (via
 	// QueryDeps.CallModelSync / Provider.Complete) instead of a token stream. The
@@ -230,8 +231,11 @@ type loop struct {
 	// stays on ctx — streams are never cut mid-flight). Derived from ctx, so a parent
 	// cancellation (pause/kill/shutdown) still cancels it. Swapped to ctx once the
 	// wrap-up phase begins, so settlement tools run live, bounded only by settleMaxTurns.
-	toolCtx context.Context
-	in      QueryInput
+	toolCtx    context.Context
+	exploreCtx context.Context
+	settleCtx  context.Context
+	stopSettle context.CancelFunc
+	in         QueryInput
 	deps    QueryDeps
 	yield   func(Event, error) bool
 	sem     chan struct{} // bounds concurrent tool execution
@@ -365,10 +369,42 @@ func (l *loop) maxTokens() int {
 	if l.in.MaxTokens > 0 {
 		return l.in.MaxTokens
 	}
-	return 32768
+	return 0
+}
+
+func (l *loop) modelCallContext() context.Context {
+	if l.settling {
+		base := l.settleCtx
+		if base == nil {
+			base = l.ctx
+		}
+		return llm.WithCallPurpose(base, "settlement")
+	}
+	if l.exploreCtx != nil {
+		return l.exploreCtx
+	}
+	return l.ctx
+}
+
+func (l *loop) initSettleCtx() {
+	if l.stopSettle != nil {
+		l.stopSettle()
+		l.stopSettle = nil
+	}
+	if l.in.SettleDuration > 0 {
+		l.settleCtx, l.stopSettle = context.WithTimeout(l.ctx, l.in.SettleDuration)
+	} else {
+		l.settleCtx = l.ctx
+	}
+	l.toolCtx = l.settleCtx
 }
 
 func (l *loop) run() {
+	defer func() {
+		if l.stopSettle != nil {
+			l.stopSettle()
+		}
+	}()
 	var schemas []llm.ToolSchema
 	if l.in.Tools != nil {
 		schemas = l.in.Tools.Schemas()
@@ -381,15 +417,16 @@ func (l *loop) run() {
 	l.turnCount = 1 // the first model call is turn 1
 	l.boundaryCount = countBoundaries(l.messages)
 	l.startTime = time.Now() // wall-clock baseline for MaxDuration
-	// toolCtx carries the MaxDuration deadline so a tool that overruns the wall-clock
-	// budget is interrupted mid-flight (rather than the run only noticing at the next
-	// turn boundary, which a hung tool never reaches). On interrupt the loop enters the
-	// wrap-up phase on the live parent ctx instead of aborting — see the tools branch.
+	// exploreCtx carries the MaxDuration deadline for both in-flight tools AND
+	// exploration model calls so a slow model stream cannot overrun the soft budget
+	// and starve the settlement phase. On interrupt the loop switches to a live
+	// settleCtx (bounded by SettleDuration) to checkpoint findings cleanly.
 	l.toolCtx = l.ctx
 	if l.in.MaxDuration > 0 {
-		var stopTool context.CancelFunc
-		l.toolCtx, stopTool = context.WithDeadline(l.ctx, l.startTime.Add(l.in.MaxDuration))
-		defer stopTool()
+		var stopExplore context.CancelFunc
+		l.exploreCtx, stopExplore = context.WithDeadline(l.ctx, l.startTime.Add(l.in.MaxDuration))
+		defer stopExplore()
+		l.toolCtx = l.exploreCtx
 	}
 	iterations := 0
 	for {
@@ -420,6 +457,21 @@ func (l *loop) run() {
 		if streamErr != nil {
 			if l.ctx.Err() != nil {
 				l.finish(ReasonAbortedStreaming, l.ctx.Err(), "")
+				return
+			}
+			// Exploration soft budget expired mid-stream while parent ctx is still alive:
+			// switch immediately to the bounded settlement phase instead of failing as model_error.
+			if !l.settling && l.exploreCtx != nil && l.exploreCtx.Err() != nil {
+				if l.beginSettlement(ReasonTimeout, &schemas) {
+					l.initSettleCtx()
+					l.lastContinue = ContinueNextTurn
+					continue
+				}
+				l.finish(ReasonTimeout, nil, "")
+				return
+			}
+			if l.settling && l.settleCtx != nil && l.settleCtx.Err() != nil {
+				l.finish(l.settleReason, nil, "")
 				return
 			}
 			// Reactive recovery from prompt-too-long: one forced AutoCompact, then retry.
@@ -546,7 +598,7 @@ func (l *loop) run() {
 				return
 			}
 			if l.beginSettlement(ReasonTimeout, &schemas) {
-				l.toolCtx = l.ctx // wrap-up tools run live, bounded only by settleMaxTurns
+				l.initSettleCtx()
 				l.lastContinue = ContinueNextTurn
 				continue
 			}
@@ -579,6 +631,7 @@ func (l *loop) run() {
 				reason = ReasonTimeout
 			}
 			if l.beginSettlement(reason, &schemas) {
+				l.initSettleCtx()
 				l.lastContinue = ContinueNextTurn
 				continue
 			}
@@ -833,7 +886,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		return exec.drain()
 	}
 
-	for ev, e := range l.deps.CallModel(l.ctx, req) {
+	for ev, e := range l.deps.CallModel(l.modelCallContext(), req) {
 		if e != nil {
 			err = e
 			break
@@ -913,7 +966,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 // emission, and recorder all see identical numbers.
 func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	exec = newStreamExec(l)
-	msg, sr, usage, cerr := l.deps.CallModelSync(l.ctx, req)
+	msg, sr, usage, cerr := l.deps.CallModelSync(l.modelCallContext(), req)
 	if cerr != nil {
 		return asst, exec, "", cerr, false, false
 	}

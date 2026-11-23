@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -35,8 +36,8 @@ func NewBash() CoreTool {
 		"command":    map[string]any{"type": "string", "description": "The shell command to execute."},
 		"timeout_ms": map[string]any{"type": "integer", "description": "Timeout in ms (default 120000, max 600000)."},
 	}
-	desc := "Executes a shell command in the working directory and returns combined stdout and stderr. Use for running tests, builds, package managers, and git. Prefer the dedicated file tools for file work."
-	prompt := "The command runs through the shell, so you are not limited to one command: chain steps with && or ;, use pipes, and pass multi-line scripts or heredocs. For anything beyond a simple one-liner — loops, parsing, string/JSON handling, HTTP logic, computation — prefer writing a short script (Python, Node, shell, etc.) and executing it (e.g. via a heredoc or by writing a file then running it) rather than forcing everything into a single command. A timeout (default 120s, max 600s) applies. Avoid commands needing interactive input."
+	desc := "Executes a shell command in the working directory and returns combined stdout and stderr. Use for running tests, builds, package managers, and git. Prefer the dedicated file tools (Read/Glob/Grep/LS) for file search and reading."
+	prompt := bashPromptForPlatform(runtime.GOOS, ActiveWindowsShell())
 	if !BackgroundTasksDisabled() {
 		props["run_in_background"] = map[string]any{
 			"type":        "boolean",
@@ -56,6 +57,16 @@ func NewBash() CoreTool {
 		Permissions: bashPermissions,
 		Run:         runBash,
 	})
+}
+
+func bashPromptForPlatform(goos, winShell string) string {
+	if goos != "windows" {
+		return "The command runs through bash, so you are not limited to one command: chain steps with && or ;, use pipes, and pass multi-line scripts or heredocs. For anything beyond a simple one-liner — loops, parsing, string/JSON handling, HTTP logic, computation — prefer writing a short script (Python, Node, shell, etc.) and executing it rather than forcing everything into a single command. A timeout (default 120s, max 600s) applies. Avoid commands needing interactive input."
+	}
+	if winShell == "pwsh" {
+		return "The command runs through PowerShell 7 (pwsh) on Windows with $ErrorActionPreference='Stop' by default (use -ErrorAction SilentlyContinue or try/catch for expected non-fatal errors). You may chain steps with &&, ||, or ; and use pipes, but do NOT use bash heredocs (<<EOF); use PowerShell here-strings (@' ... '@) or write a script file (Python/Node/PS1 via Write or RunScript) for multi-line logic. Prefer native Glob/Grep/Read tools for file searching. A timeout (default 120s, max 600s) applies. Avoid commands needing interactive input."
+	}
+	return "The command runs through Windows PowerShell 5.1 (powershell.exe) with $ErrorActionPreference='Stop' by default (use -ErrorAction SilentlyContinue or try/catch for expected non-fatal errors). Do NOT use '&&', '||', or bash heredocs (<<EOF); chain statements with ';' or 'if ($?) { ... }', and write a script file (Python/Node/PS1 via Write or RunScript) for any multi-line logic. Prefer native Glob/Grep/Read tools for file searching. A timeout (default 120s, max 600s) applies. Avoid commands needing interactive input."
 }
 
 func bashPermissions(_ context.Context, input json.RawMessage, _ permission.Context) permission.Decision {
@@ -96,13 +107,13 @@ func runBash(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 		return runBashManaged(ctx, tc, in.Command, timeout, in.RunInBackground)
 	}
 	// Fallback: synchronous execution (unchanged legacy behavior).
-	return runBashSync(ctx, tc, in.Command, timeout)
+	return runBashSync(ctx, tc, prepareShellCommand(in.Command), timeout)
 }
 
 // runBashManaged runs the command through the task manager, supporting explicit
 // background launch and timeout auto-backgrounding.
 func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeout time.Duration, explicitBG bool) (Result, error) {
-	spec := SpawnSpec{Command: command, Kind: KindBash, WorkingDir: tc.WorkingDir, Description: short(command), Env: tc.Env, ExecutionContext: tc.ExecutionContext}
+	spec := SpawnSpec{Command: prepareShellCommand(command), Kind: KindBash, WorkingDir: tc.WorkingDir, Description: short(command), Env: tc.Env, ExecutionContext: tc.ExecutionContext}
 
 	if explicitBG {
 		t, err := tc.Tasks.Spawn(spec)
