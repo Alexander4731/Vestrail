@@ -144,14 +144,21 @@ func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID string, explo
 		}
 		name := strconv.FormatInt(id, 10)
 		source := filepath.Join(transcriptDir, "execution-receipts", name)
-		if info, err := os.Lstat(source); os.IsNotExist(err) {
-			continue
-		} else if err != nil {
+		if info, err := os.Lstat(source); err == nil {
+			if !info.IsDir() {
+				return nil, errors.New("invalid execution spool directory")
+			}
+			targets = append(targets, archiveFileMove{Source: source, Relative: filepath.Join("executions", name)})
+		} else if !os.IsNotExist(err) {
 			return nil, err
-		} else if !info.IsDir() {
-			return nil, errors.New("invalid execution spool directory")
 		}
-		targets = append(targets, archiveFileMove{Source: source, Relative: filepath.Join("executions", name)})
+		pending, err := filepath.Glob(filepath.Join(transcriptDir, "execution-receipts", name+"-*.pending.json"))
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range pending {
+			targets = append(targets, archiveFileMove{Source: path, Relative: filepath.Join("executions", name, filepath.Base(path))})
+		}
 	}
 	// Persist the complete plan before the first rename. Recovery can therefore
 	// roll back any prefix of the moves after an abrupt process termination.
@@ -273,6 +280,23 @@ func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int
 		id, err := strconv.ParseInt(dir.Name(), 10, 64)
 		if err != nil || id <= 0 || strconv.FormatInt(id, 10) != dir.Name() || !dir.IsDir() {
 			return nil, errors.New("invalid execution folder")
+		}
+		contents, err := os.ReadDir(filepath.Join(extractedDir, "executions", dir.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range contents {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pending.json") {
+				continue
+			}
+			name := entry.Name()
+			if !strings.HasPrefix(name, dir.Name()+"-") {
+				name = dir.Name() + "-" + name
+			}
+			sources = append(sources, restoredArchivePath{
+				Source:      filepath.Join(extractedDir, "executions", dir.Name(), entry.Name()),
+				Destination: filepath.Join(dataDir, "transcripts", "execution-receipts", name),
+			})
 		}
 		sources = append(sources, restoredArchivePath{Source: filepath.Join(extractedDir, "executions", dir.Name()), Destination: filepath.Join(dataDir, "transcripts", "execution-receipts", dir.Name())})
 	}

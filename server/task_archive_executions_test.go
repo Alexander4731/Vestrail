@@ -12,7 +12,9 @@ func TestTaskArchiveExecutionSpoolRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	own := filepath.Join(root, "transcripts", "execution-receipts", "12", "process-output.txt")
 	other := filepath.Join(root, "transcripts", "execution-receipts", "13", "process-output.txt")
-	for _, name := range []string{own, other} {
+	pending := filepath.Join(root, "transcripts", "execution-receipts", "12-fixture.pending.json")
+	otherPending := filepath.Join(root, "transcripts", "execution-receipts", "13-fixture.pending.json")
+	for _, name := range []string{own, other, pending, otherPending} {
 		if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -28,11 +30,14 @@ func TestTaskArchiveExecutionSpoolRoundTrip(t *testing.T) {
 	if err = archiveExecutionFiles(stage.payload, s, false); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.ExecutionFiles) != 1 || s.ExecutionFiles[0].RunID != "run" {
+	if len(s.ExecutionFiles) != 2 || s.ExecutionFiles[0].RunID != "run" {
 		t.Fatalf("manifest: %+v", s.ExecutionFiles)
 	}
 	if _, err = os.Stat(other); err != nil {
 		t.Fatal("other task spool moved", err)
+	}
+	if _, err = os.Stat(otherPending); err != nil {
+		t.Fatal("other task pending receipt moved", err)
 	}
 	if err = archiveExecutionFiles(stage.payload, s, true); err != nil {
 		t.Fatal(err)
@@ -53,6 +58,9 @@ func TestTaskArchiveExecutionSpoolRoundTrip(t *testing.T) {
 	}
 	if b, err := os.ReadFile(own); err != nil || string(b) != "原文" {
 		t.Fatalf("restored output: %q %v", b, err)
+	}
+	if b, err := os.ReadFile(pending); err != nil || string(b) != "原文" {
+		t.Fatalf("restored pending receipt: %q %v", b, err)
 	}
 	if err = installed.rollback(); err != nil {
 		t.Fatal(err)

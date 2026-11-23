@@ -457,7 +457,11 @@ func (e *Engine) ControlWork(ctx context.Context, intentID int64, action string)
 		e.workMu.Unlock()
 		return fmt.Errorf("%w: 意图 %d 当前没有运行中的 work（可能已结束或未被领取）", errWorkControlConflict, intentID)
 	}
-	if run.action != "" || run.settling {
+	if run.settling {
+		e.workMu.Unlock()
+		return fmt.Errorf("%w: 意图 %d 正在提交最终状态", errWorkControlConflict, intentID)
+	}
+	if run.action != "" {
 		e.workMu.Unlock()
 		return fmt.Errorf("%w: 意图 %d 正在执行 %s 操作", errWorkControlConflict, intentID, run.action)
 	}
@@ -1267,6 +1271,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			}
 		}
 		if checkErr != nil {
+			log.Printf("[settlement] task %s intent %d 等待执行结果核验: %v", t.ID, intent.ID, checkErr)
 			if sleepCtx(ctx, time.Second) {
 				completeWork(checkErr)
 				return true

@@ -126,7 +126,7 @@ func (t *Trace) bindExecution(d *db.DB, id int64, a db.InterceptAudit, toolName 
 		var pending string
 		if dir != "" {
 			raw, _ := json.Marshal(receipt)
-			pending = filepath.Join(dir, fmt.Sprintf("%x.pending.json", sha256.Sum256(raw)))
+			pending = filepath.Join(filepath.Dir(dir), fmt.Sprintf("%d-%x.pending.json", id, sha256.Sum256(raw)))
 			if err := writeReceiptFile(pending, raw); err != nil {
 				log.Printf("[execution] receipt spool %d unavailable, trying database: %v", id, err)
 				pending = ""
@@ -207,13 +207,29 @@ func snapshotExecutionOutput(src, dst string, limit int64) (stored, total int64,
 
 // ReplayExecutionReceipts only reads host-owned receipt envelopes and requires
 // exact original execution identity. It never invokes the underlying tool.
+// Runtime callers pass a task ID (empty means all tasks). Startup omits it to
+// also recover legacy envelopes stored beside per-execution process outputs.
 func ReplayExecutionReceipts(ctx context.Context, d *db.DB, transcriptDir string, taskIDs ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	taskID := ""
 	if len(taskIDs) > 0 {
 		taskID = taskIDs[0]
 	}
-	paths, err := filepath.Glob(filepath.Join(transcriptDir, "execution-receipts", "*", "*.pending.json"))
+	root := filepath.Join(transcriptDir, "execution-receipts")
+	paths, err := filepath.Glob(filepath.Join(root, "*.pending.json"))
 	if err != nil {
+		return err
+	}
+	if len(taskIDs) == 0 {
+		legacy, err := filepath.Glob(filepath.Join(root, "*", "*.pending.json"))
+		if err != nil {
+			return err
+		}
+		paths = append(paths, legacy...)
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	for _, path := range paths {

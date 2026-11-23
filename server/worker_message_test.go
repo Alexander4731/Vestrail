@@ -31,6 +31,18 @@ func TestControlWorkConflictsWhenNoWorkRegistered(t *testing.T) {
 	}
 }
 
+func TestControlWorkReportsFinalStateSubmission(t *testing.T) {
+	e := NewEngine(nil)
+	_, cancel := context.WithCancelCause(t.Context())
+	e.registerWork(42, cancel)
+	_, complete := e.detachWork(42)
+	defer complete(nil)
+	err := e.ControlWork(t.Context(), 42, "pause")
+	if !errors.Is(err, errWorkControlConflict) || !strings.Contains(err.Error(), "正在提交最终状态") {
+		t.Fatalf("control during settlement=%v", err)
+	}
+}
+
 // validWorkerMessageRequestID gates the idempotency token; keep its charset stable
 // so a client-generated UUID is always accepted and injection-y ids are rejected.
 func TestValidWorkerMessageRequestID(t *testing.T) {

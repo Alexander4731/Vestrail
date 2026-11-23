@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -13,7 +14,6 @@ import (
 	"time"
 
 	"github.com/Alexander4731/Vestrail/db"
-	"github.com/Alexander4731/Vestrail/intercept"
 	"github.com/Alexander4731/Vestrail/recovery"
 	"github.com/Autumn-27/norma/transcript"
 )
@@ -24,10 +24,8 @@ func (s *Server) recoverTaskExecutions(ctx context.Context, t *Task) {
 	}
 	defer s.engine.decInflight(t.ID)
 	d := s.m.pg
-	if err := intercept.ReplayExecutionReceipts(ctx, d, filepath.Join(s.m.dir, "transcripts")); err != nil {
-		return
-	}
 	if err := s.m.interceptor.RecoverExecutions(ctx, transcript.NewStore(filepath.Join(s.m.dir, "transcripts")), t.ID); err != nil {
+		log.Printf("[recovery] task %s execution evidence: %v", t.ID, err)
 		return
 	}
 	if err := d.QueueExecutionRecoveries(ctx, t.ID); err != nil {
