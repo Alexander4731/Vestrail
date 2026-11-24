@@ -909,6 +909,10 @@ export const api = {
     ).then((r) => ({ ...r, deliveries: arr(r.deliveries) }));
   },
   notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
+  notifyBrowserEvents: (after?: number) =>
+    get<import("@/lib/types").BrowserNotifyEventsResp>(
+      after === undefined ? `/notify/browser/events` : `/notify/browser/events?after=${after}`,
+    ),
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
 

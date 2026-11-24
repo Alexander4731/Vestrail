@@ -5,6 +5,7 @@
 // 单独放一个文件后，新增渠道只需要动这里，页面本身不必改。
 // 渠道类型的展示名与简介。放在前端是因为它只影响文案，后端不需要知道。
 export const KIND_LABEL: Record<string, string> = {
+  browser: "浏览器通知",
   dingtalk: "钉钉",
   feishu: "飞书",
   wecom: "企业微信",
@@ -31,6 +32,26 @@ export interface FieldDef {
   options?: { value: string; label: string }[];
 }
 export const CHANNEL_FIELDS: Record<string, FieldDef[]> = {
+  browser: [
+    {
+      key: "on_approval",
+      label: "高危操作待审批弹窗提醒",
+      kind: "switch",
+      help: "当某个 Worker 触发高危审批并暂停时，立刻弹出浏览器桌面通知并可一键跳转审批",
+    },
+    {
+      key: "require_interaction",
+      label: "保持通知常驻直至点击",
+      kind: "switch",
+      help: "开启后桌面通知不会自动消失，适合高危审批与严重漏洞提醒",
+    },
+    {
+      key: "sound",
+      label: "提示音提醒",
+      kind: "switch",
+      help: "收到新提醒时在页面内播放轻提示音（需浏览器允许页面音频）",
+    },
+  ],
   dingtalk: [
     {
       key: "webhook",
@@ -143,7 +164,7 @@ export const emptyForm = (kind: string): ChannelForm => ({
   mode: "realtime",
   enabled: true,
   ratePerMin: "",
-  config: {},
+  config: kind === "browser" ? { on_approval: true, require_interaction: true, sound: true } : {},
   minSeverity: "",
   includeText: "",
   excludeText: "",

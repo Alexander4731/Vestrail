@@ -45,9 +45,10 @@ type Server struct {
 	backgroundMu sync.Mutex
 	backgroundWG sync.WaitGroup
 	stopping     bool
-	m            *Manager
-	engine       *Engine
-	ctx          context.Context
+	m             *Manager
+	engine        *Engine
+	ctx           context.Context
+	browserNotify *BrowserNotifyHub
 
 	skillDir      string // root directory for skill subdirectories
 	jwtKey        []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -237,6 +238,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
+		if err := m.pg.SeedDefaultBrowserNotificationChannel(); err != nil {
+			log.Printf("[notify] seed browser channel: %v", err)
+		}
 		s.background(func() { s.evidenceStore().RunGC(s.ctx) })
 		s.seedPythonInterpreter() // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
@@ -264,6 +268,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
 	s.wireInterceptReviewer()
+	s.wireApprovalNotifications()
 	s.restoreTaskRuntimes()
 	s.background(s.reconcileConcurrency)
 	s.background(func() { newScheduler(s).Run(s.ctx) })
@@ -853,6 +858,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/notify/channels/{id}/test", s.notifyTestChannel)
 	mux.HandleFunc("GET /api/notify/deliveries", s.notifyListDeliveries)
 	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
+	mux.HandleFunc("GET /api/notify/browser/events", s.notifyBrowserEvents)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
@@ -1081,16 +1087,17 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 
 	out["active_task"] = map[string]any{
 		"id": t.ID, "description": t.lifecycleSnapshot().Description, "goal": t.lifecycleSnapshot().Goal,
-		"running":         running,
-		"paused":          paused,
-		"engine_mode":     engineMode,
-		"in_flight":       inFlight,
-		"llm_in_flight":   activeCalls,
-		"last_activity":   last,
-		"stalled":         stalled,
-		"execution_phase": phase,
-		"goals_total":     len(goals),
-		"goals_met":       goalsMet,
+		"running":                 running,
+		"paused":                  paused,
+		"engine_mode":             engineMode,
+		"in_flight":               inFlight,
+		"llm_in_flight":           activeCalls,
+		"last_activity":           last,
+		"stalled":                 stalled,
+		"execution_phase":         phase,
+		"approval_paused_workers": s.engine.ApprovalPausedWorkers(t.ID),
+		"goals_total":             len(goals),
+		"goals_met":               goalsMet,
 	}
 	writeJSON(w, 200, out)
 }

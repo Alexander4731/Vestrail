@@ -138,6 +138,11 @@ type Engine struct {
 	workMu sync.Mutex
 	work   map[int64]*workExecution
 
+	// Per-worker high-risk approval pause state: tracks workers suspended in
+	// HandleAsk without pausing the task or sibling workers.
+	approvalMu     sync.Mutex
+	approvalPaused map[int64]ApprovalPausedWorker
+
 	// steerBox queues planner course-corrections for a running work (keyed by intent
 	// id). The worker's PreToolUse hook drains it before its next tool call and hands
 	// the message to the model (blocking that call) so it re-plans — no kill needed.
@@ -1284,15 +1289,42 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 		return true
 	}
 	// Acquire shared channel concurrency slot if applicable and inject budget env (F21).
+	var channelPoolKey string
+	var channelReleaseMu sync.Mutex
+	var channelRelease func()
+	releaseChannelSlot := func() {
+		channelReleaseMu.Lock()
+		fn := channelRelease
+		channelRelease = nil
+		channelReleaseMu.Unlock()
+		if fn != nil {
+			fn()
+		}
+	}
+	acquireChannelSlot := func() {
+		if e.channelPool == nil || channelPoolKey == "" {
+			return
+		}
+		capTotal, activeCount, workerBudget, releasePool := e.channelPool.acquire(channelPoolKey, intent.ID, e.m.Workers())
+		channelReleaseMu.Lock()
+		if channelRelease != nil {
+			channelReleaseMu.Unlock()
+			releasePool()
+			return
+		}
+		channelRelease = releasePool
+		channelReleaseMu.Unlock()
+		workCtx = agent.WithExtraBashEnv(workCtx, channelBudgetEnv(capTotal, activeCount, workerBudget))
+	}
 	if e.channelPool != nil {
 		proxyAddr := ""
 		if e.m != nil {
 			proxyAddr = e.m.GlobalProxy()
 		}
 		if poolKey := e.channelPool.poolKeyFor(t.ID, proxyAddr, intent); poolKey != "" {
-			capTotal, activeCount, workerBudget, releasePool := e.channelPool.acquire(poolKey, intent.ID, e.m.Workers())
-			defer releasePool()
-			workCtx = agent.WithExtraBashEnv(workCtx, channelBudgetEnv(capTotal, activeCount, workerBudget))
+			channelPoolKey = poolKey
+			acquireChannelSlot()
+			defer releaseChannelSlot()
 		}
 	}
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
@@ -1306,6 +1338,29 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	label := fmt.Sprintf("%s · #%d", name, iid)
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
 	workCtx = intercept.WithIntent(workCtx, iid)
+	// Per-worker approval pause isolation: if THIS worker triggers a high-risk
+	// approval, suspend ONLY this worker and release its shared channel slot so
+	// sibling workers and the planner keep running without throttling.
+	workCtx = intercept.WithApprovalPauseHooks(workCtx,
+		func(notice intercept.PendingNotice) {
+			if notice.IntentID == 0 {
+				notice.IntentID = iid
+			}
+			e.markWorkerApprovalPaused(notice)
+			releaseChannelSlot()
+			taskEmit(db.Activity{
+				Kind:    "status",
+				Summary: fmt.Sprintf("Worker %s 因高危操作审批暂停（仅暂停本 Worker，任务与其余 Worker 继续运行），等待审批 #%d", name, notice.PendingID),
+				Detail:  notice.Reason,
+			})
+		},
+		func(_ int64) {
+			e.clearWorkerApprovalPaused(iid, t.ID)
+			if workCtx.Err() == nil && !e.IsPaused(t.ID) {
+				acquireChannelSlot()
+			}
+		},
+	)
 	workCtx = intercept.WithRecoverySummary(workCtx, e.m.pg.RecoverySummary(workCtx, t.ID, iid))
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。

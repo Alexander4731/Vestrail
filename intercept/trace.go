@@ -41,6 +41,11 @@ func WithIntent(ctx context.Context, id int64) context.Context {
 	return context.WithValue(ctx, intentKey{}, id)
 }
 
+func intentFromCtx(ctx context.Context) int64 {
+	id, _ := ctx.Value(intentKey{}).(int64)
+	return id
+}
+
 type completion func(status, output string, truncated bool)
 
 type tracedCall struct {

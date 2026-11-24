@@ -265,7 +265,13 @@ func (n *Notifier) send(ctx context.Context, channel notify.Channel, cfg map[str
 	route, err := n.pg.NotificationHTTPRoute(sendCtx)
 	delivered := 0
 	if err == nil {
-		delivered, err = channel.Send(notify.WithHTTPRoute(sendCtx, route), cfg, msg)
+		sendCtx = notify.WithHTTPRoute(sendCtx, route)
+		if n.s != nil {
+			sendCtx = notify.WithBrowserSink(sendCtx, func(ev notify.BrowserEvent) {
+				n.s.browserNotifyHub().Publish(ev)
+			})
+		}
+		delivered, err = channel.Send(sendCtx, cfg, msg)
 	}
 	if err == nil && delivered > 0 {
 		if delivered > len(deliveries) {

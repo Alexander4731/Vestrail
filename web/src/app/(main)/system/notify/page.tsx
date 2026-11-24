@@ -51,6 +51,37 @@ export default function NotifyPage() {
   const [httpRoute, setHTTPRoute] = React.useState("direct");
   const [baseURL, setBaseURL] = React.useState("");
   const [digestMin, setDigestMin] = React.useState("");
+  const [browserPerm, setBrowserPerm] = React.useState<NotificationPermission | "unsupported">("default");
+
+  React.useEffect(() => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setBrowserPerm("unsupported");
+      return;
+    }
+    setBrowserPerm(Notification.permission);
+  }, []);
+
+  async function requestBrowserPermission() {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      toast.error("当前浏览器不支持桌面通知 API");
+      return;
+    }
+    try {
+      const perm = await Notification.requestPermission();
+      setBrowserPerm(perm);
+      if (perm === "granted") {
+        toast.success("已开启浏览器桌面通知权限");
+        new Notification("Vestrail 浏览器通知已就绪", {
+          body: "后续发现漏洞或 Worker 触发高危审批时，将在此弹出桌面提醒。",
+          icon: "/icon.png",
+        });
+      } else if (perm === "denied") {
+        toast.error("浏览器通知权限已被拒绝，请在浏览器地址栏站点设置中重新允许");
+      }
+    } catch (e) {
+      toast.error("申请通知权限失败：" + (e as Error).message);
+    }
+  }
 
   const load = React.useCallback(() => {
     api
@@ -271,7 +302,7 @@ export default function NotifyPage() {
         <div>
           <h1 className="text-xl font-semibold tracking-tight">通知推送</h1>
           <p className="text-muted-foreground text-sm">
-            发现漏洞时推送到钉钉 / 飞书 / 企业微信等渠道 · 每个渠道可独立设推送时机与过滤规则
+            发现漏洞或 Worker 触发高危审批时推送到浏览器桌面 / 钉钉 / 飞书 / 企业微信等渠道 · 每个渠道可独立设推送时机与过滤规则
           </p>
         </div>
         {meta && (
@@ -304,6 +335,35 @@ export default function NotifyPage() {
           />
         </div>
       )}
+
+      <Card>
+        <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
+          <div className="flex items-center gap-2.5">
+            <BellIcon className="h-4 w-4 text-primary shrink-0" />
+            <div className="text-sm">
+              <span className="font-medium">浏览器桌面通知权限：</span>
+              {browserPerm === "granted" ? (
+                <Badge variant="secondary" className="ml-1.5">已授权</Badge>
+              ) : browserPerm === "denied" ? (
+                <Badge variant="destructive" className="ml-1.5">已被浏览器阻止</Badge>
+              ) : browserPerm === "unsupported" ? (
+                <Badge variant="outline" className="ml-1.5">当前环境不支持（将仅显示页内提醒）</Badge>
+              ) : (
+                <Badge variant="outline" className="ml-1.5">未授权（当前仅显示页内提醒）</Badge>
+              )}
+              <p className="text-muted-foreground text-xs mt-1">
+                配合「浏览器通知」渠道使用：Worker 触发高危审批暂停（其余 Worker 继续运行）或发现新漏洞时，跨标签页即时弹窗并一键跳转。
+              </p>
+            </div>
+          </div>
+          {browserPerm !== "granted" && browserPerm !== "unsupported" && (
+            <Button size="sm" variant="outline" onClick={() => void requestBrowserPermission()}>
+              <BellIcon className="mr-1.5 h-3.5 w-3.5" />
+              开启浏览器桌面通知
+            </Button>
+          )}
+        </CardContent>
+      </Card>
 
       <Card className="gap-3">
         <CardHeader>

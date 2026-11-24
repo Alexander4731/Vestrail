@@ -465,8 +465,8 @@ func TestEmailSMTPErrorClassification(t *testing.T) {
 }
 
 func TestRegistryCoversAllKinds(t *testing.T) {
-	// 六个渠道缺一不可——少一个会在 UI 下拉里静默消失。
-	want := []string{KindDingTalk, KindEmail, KindFeishu, KindTelegram, KindWebhook, KindWeCom}
+	// 七个渠道缺一不可——少一个会在 UI 下拉里静默消失。
+	want := []string{KindBrowser, KindDingTalk, KindEmail, KindFeishu, KindTelegram, KindWebhook, KindWeCom}
 	got := Kinds()
 	if len(got) != len(want) {
 		t.Fatalf("渠道数量应为 %d，得到 %d: %v", len(want), len(got), got)
@@ -504,3 +504,34 @@ func TestPermanentErrorUnwrap(t *testing.T) {
 type permanentSentinel struct{}
 
 func (*permanentSentinel) Error() string { return "sentinel" }
+
+func TestBrowserChannelSendAndValidate(t *testing.T) {
+	ch, ok := Get(KindBrowser)
+	if !ok {
+		t.Fatal("browser channel not registered")
+	}
+	if err := ch.Validate(map[string]any{}); err != nil {
+		t.Fatalf("empty config should be valid: %v", err)
+	}
+	if err := ch.Validate(map[string]any{"on_approval": true, "sound": false, "require_interaction": true}); err != nil {
+		t.Fatalf("valid bool config rejected: %v", err)
+	}
+	if err := ch.Validate(map[string]any{"sound": 123}); err == nil {
+		t.Fatal("non-bool sound should fail validation")
+	}
+
+	var got []BrowserEvent
+	ctx := WithBrowserSink(context.Background(), func(ev BrowserEvent) {
+		got = append(got, ev)
+	})
+	n, err := ch.Send(ctx, map[string]any{"sound": false, "require_interaction": true}, singleMsg())
+	if err != nil || n != 1 {
+		t.Fatalf("send failed: n=%d err=%v", n, err)
+	}
+	if len(got) != 1 || got[0].Kind != EventFindingCreated || got[0].Sound || !got[0].RequireInteraction {
+		t.Fatalf("unexpected browser event: %+v", got)
+	}
+	if !strings.Contains(got[0].URL, "/function/findings/detail?id=42") {
+		t.Fatalf("expected finding detail URL, got %q", got[0].URL)
+	}
+}

@@ -814,3 +814,23 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 	}
 	return d.SetSetting("intercept_default_rules_v5", "done")
 }
+
+// SeedDefaultBrowserNotificationChannel creates one built-in enabled browser
+// desktop notification channel once on first server startup / upgrade so high-risk
+// approval alerts and finding notifications work out of the box without manual
+// setup, while preserving any later user disable/delete/edits.
+func (d *DB) SeedDefaultBrowserNotificationChannel() error {
+	if v, _, _ := d.GetSetting("notify_browser_default_v1"); v == "done" {
+		return nil
+	}
+	const name = "[内置] 浏览器桌面通知"
+	if _, err := d.Exec(`
+INSERT INTO notification_channels(name, kind, enabled, config, mode, filter, rate_per_min)
+SELECT $1, 'browser', true, '{"on_approval":true,"require_interaction":true,"sound":true}'::jsonb, 'realtime', '{}'::jsonb, 60
+WHERE NOT EXISTS (SELECT 1 FROM notification_channels WHERE kind = 'browser')`,
+		name,
+	); err != nil {
+		return err
+	}
+	return d.SetSetting("notify_browser_default_v1", "done")
+}

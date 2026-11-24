@@ -19,12 +19,14 @@ const (
 	KindWebhook  = "webhook"  // 通用 Webhook：自定义方法/头/JSON 模板
 	KindTelegram = "telegram" // Telegram Bot API
 	KindEmail    = "email"    // SMTP 邮件
+	KindBrowser  = "browser"  // 浏览器桌面通知（Web Notification API + 页内提醒）
 )
 
 // 事件类型，对应 notification_events.kind。
 const (
 	EventFindingCreated       = "finding_created"
 	EventFindingStatusChanged = "finding_status_changed"
+	EventApprovalPending      = "approval_pending"
 )
 
 // InitKind 是 config 里为空的 kind 的兜底值。

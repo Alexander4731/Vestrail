@@ -1147,6 +1147,37 @@ export interface NotificationMeta {
   };
 }
 
+export interface BrowserNotifyEvent {
+  seq: number;
+  kind: "finding_created" | "finding_status_changed" | "approval_pending" | "test" | string;
+  title: string;
+  body: string;
+  severity: string;
+  url?: string;
+  tag?: string;
+  task_id?: string;
+  pending_id?: number;
+  sound: boolean;
+  require_interaction: boolean;
+  created_at: string;
+}
+
+export interface BrowserNotifyEventsResp {
+  latest_seq: number;
+  enabled: boolean;
+  items: BrowserNotifyEvent[];
+}
+
+export interface ApprovalPausedWorker {
+  task_id: string;
+  intent_id: number;
+  worker: string;
+  pending_id: number;
+  tool_name: string;
+  reason: string;
+  since: string;
+}
+
 // NotificationDelivery 是一条投递记录，用于投递历史与失败重发。
 export interface NotificationDelivery {
   id: number;

@@ -125,18 +125,28 @@ type Reviewer func(ctx context.Context, profileID int64, prompt string, input Re
 // Interceptor loads intercept rules from the database and evaluates them on
 // tool calls. It is safe for concurrent use.
 type Interceptor struct {
-	db           *db.DB
-	mu           sync.RWMutex
-	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
-	enabledTools map[string]bool // nil means not loaded yet
-	pending      *pendingManager
-	reviewer     Reviewer // nil = LLM fallback judge not wired
+	db              *db.DB
+	mu              sync.RWMutex
+	cached          []compiledRule  // sorted by priority DESC; nil means not loaded yet
+	enabledTools    map[string]bool // nil means not loaded yet
+	pending         *pendingManager
+	reviewer        Reviewer            // nil = LLM fallback judge not wired
+	pendingObserver func(PendingNotice) // optional callback on new pending approval
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
 func (i *Interceptor) SetReviewer(r Reviewer) {
 	i.mu.Lock()
 	i.reviewer = r
+	i.mu.Unlock()
+}
+
+// SetPendingObserver installs an optional callback fired whenever HandleAsk
+// persists a new pending high-risk approval (used to trigger real-time browser
+// notifications without coupling intercept to server/notify).
+func (i *Interceptor) SetPendingObserver(fn func(PendingNotice)) {
+	i.mu.Lock()
+	i.pendingObserver = fn
 	i.mu.Unlock()
 }
 
@@ -808,6 +818,30 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 
 	i.bindResult(ctx, pendingID, audit, toolName)
 	defer i.pending.remove(pendingID)
+
+	notice := PendingNotice{
+		PendingID: pendingID,
+		TaskID:    taskID,
+		IntentID:  intentFromCtx(ctx),
+		AgentName: agentName,
+		ToolName:  toolName,
+		Reason:    dec.Message,
+		CreatedAt: time.Now(),
+	}
+	if hooks, ok := approvalPauseHooksFromCtx(ctx); ok {
+		if hooks.onEnter != nil {
+			hooks.onEnter(notice)
+		}
+		if hooks.onExit != nil {
+			defer hooks.onExit(pendingID)
+		}
+	}
+	i.mu.RLock()
+	obs := i.pendingObserver
+	i.mu.RUnlock()
+	if obs != nil {
+		go obs(notice)
+	}
 	// Polling clients can decide after INSERT commits but before the channel is
 	// registered. Re-read after registration so that decision cannot be lost;
 	// later decisions will be delivered through ch.

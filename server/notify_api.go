@@ -439,7 +439,11 @@ func (s *Server) notifyTestChannel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if _, err := channel.Send(notify.WithHTTPRoute(r.Context(), route), cfg, msg); err != nil {
+	testCtx := notify.WithHTTPRoute(r.Context(), route)
+	testCtx = notify.WithBrowserSink(testCtx, func(ev notify.BrowserEvent) {
+		s.browserNotifyHub().Publish(ev)
+	})
+	if _, err := channel.Send(testCtx, cfg, msg); err != nil {
 		// 把渠道返回的原始错误如实回给用户——这是他们调试配置的唯一线索。
 		writeErr(w, 502, err.Error())
 		return

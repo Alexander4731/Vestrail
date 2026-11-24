@@ -350,8 +350,12 @@ func TestPrepareConfigUpdateStillGuardsBlankDestinationChanges(t *testing.T) {
 }
 
 func TestDestinationKeysDeclaredForEveryKind(t *testing.T) {
-	// 与 SecretKeys 同理：渠道若忘记声明目的地键，PrepareConfigUpdate 就保护不到它。
+	// 与 SecretKeys 同理：外发渠道若忘记声明目的地键，PrepareConfigUpdate 就保护不到它。
+	// KindBrowser 是本机浏览器内推渠道，无外发目的地与凭据。
 	for kind, ch := range registry {
+		if kind == KindBrowser {
+			continue
+		}
 		if len(ch.DestinationKeys()) == 0 {
 			t.Errorf("渠道 %s 未声明目的地键，改地址带出凭据的防护对它无效", kind)
 		}
@@ -362,18 +366,21 @@ func TestDestinationKeysDeclaredForEveryKind(t *testing.T) {
 }
 
 func TestSecretKeysDeclaredForEveryKind(t *testing.T) {
-	// 编译器已经强制每个渠道实现 SecretKeys，这里再确认一遍「没有渠道在掩码上
-	// 交白卷」——返回空切片的渠道意味着它的凭据会明文回显到浏览器。
+	// 编译器已经强制每个渠道实现 SecretKeys，这里再确认一遍「没有外发渠道在掩码上
+	// 交白卷」——返回空切片的外发渠道意味着它的凭据会明文回显到浏览器。
+	// false 表示该渠道经显式登记确认无凭据（如浏览器桌面通知）。
 	expect := map[string]bool{
+		KindBrowser:  false,
 		KindDingTalk: true, KindFeishu: true, KindWeCom: true,
 		KindWebhook: true, KindTelegram: true, KindEmail: true,
 	}
 	for kind, ch := range registry {
-		if !expect[kind] {
+		wantSecret, registered := expect[kind]
+		if !registered {
 			t.Errorf("渠道 %s 未在测试中登记掩码预期", kind)
 			continue
 		}
-		if len(ch.SecretKeys()) == 0 {
+		if wantSecret && len(ch.SecretKeys()) == 0 {
 			t.Errorf("渠道 %s 未声明任何凭据字段，其配置会明文回显", kind)
 		}
 	}
