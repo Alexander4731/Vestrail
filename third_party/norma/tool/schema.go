@@ -24,6 +24,19 @@ func ValidateInput(schema map[string]any, raw json.RawMessage) error {
 }
 
 func validateValue(schema map[string]any, v any, path string) error {
+	if types := toStrings(schema["type"]); len(types) > 0 {
+		for _, typ := range types {
+			variant := make(map[string]any, len(schema))
+			for key, value := range schema {
+				variant[key] = value
+			}
+			variant["type"] = typ
+			if validateValue(variant, v, path) == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("%s: expected one of %v", at(path), types)
+	}
 	typ, _ := schema["type"].(string)
 	switch typ {
 	case "object", "":
@@ -34,13 +47,18 @@ func validateValue(schema map[string]any, v any, path string) error {
 			}
 			return fmt.Errorf("%s: expected object", at(path))
 		}
+		reqSet := map[string]bool{}
 		for _, req := range toStrings(schema["required"]) {
-			if _, present := m[req]; !present {
+			reqSet[req] = true
+			if val, present := m[req]; !present || val == nil {
 				return fmt.Errorf("%s: missing required property %q", at(path), req)
 			}
 		}
 		props, _ := schema["properties"].(map[string]any)
 		for key, val := range m {
+			if val == nil && !reqSet[key] {
+				continue
+			}
 			ps, ok := props[key].(map[string]any)
 			if !ok {
 				continue // unknown property — tolerate
@@ -48,6 +66,10 @@ func validateValue(schema map[string]any, v any, path string) error {
 			if err := validateValue(ps, val, join(path, key)); err != nil {
 				return err
 			}
+		}
+	case "null":
+		if v != nil {
+			return fmt.Errorf("%s: expected null", at(path))
 		}
 	case "string":
 		if _, ok := v.(string); !ok {
@@ -82,6 +104,9 @@ func validateValue(schema map[string]any, v any, path string) error {
 }
 
 func toStrings(v any) []string {
+	if values, ok := v.([]string); ok {
+		return values
+	}
 	arr, ok := v.([]any)
 	if !ok {
 		return nil

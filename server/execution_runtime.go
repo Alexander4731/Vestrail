@@ -46,7 +46,7 @@ func (e *Engine) executionRecoveryLoop(ctx context.Context, t *Task) {
 			return
 		case <-ticker.C:
 		}
-		if e.recoverExecution == nil || e.IsPaused(t.ID) || e.IsDeleting(t.ID) {
+		if e.isSettling(t.ID) || e.recoverExecution == nil || e.IsPaused(t.ID) || e.IsDeleting(t.ID) {
 			continue
 		}
 		state := t.lifecycleSnapshot()

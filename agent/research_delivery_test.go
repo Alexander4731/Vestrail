@@ -37,7 +37,7 @@ func TestVerifiedInputBatchesSupportRemainingDelivery(t *testing.T) {
 	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, exp)
 	store := d.Exploration(exp)
 	toolset := NewToolSet(store, "worker")
-	toolset.SetExecutionContract(t.TempDir(), kernel.IntentContract{Scope: "ports 51-100"})
+	toolset.SetExecutionContract(t.TempDir(), kernel.IntentContract{Scope: "ports 51-100", Deliverable: kernel.BatchSchemaV1})
 	id, err := store.AddNode(db.KindFact, map[string]any{"summary": "fixture observations"}, 5, "confirmed", "fixture", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -204,5 +204,78 @@ func TestWorkerRequestsMissingFinalReceiptAsContinuation(t *testing.T) {
 	stop, blocking, _ := hooks.Stop(t.Context(), nil)
 	if stop || len(blocking) != 1 {
 		t.Fatal("missing receipt terminated instead of requesting a continuation")
+	}
+}
+
+func TestFinishWorkPreservesPriorCheckpointAndReturnsGain(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	exp, err := d.CreateExploration(t.Name(), "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, exp)
+	ts := NewToolSet(d.Exploration(exp), "worker")
+	ts.updateWrites(func(w *WriteCounts) {
+		w.Checkpoint = &kernel.Checkpoint{RemainingScope: "remaining fixture"}
+		w.ResearchGain.Evidence = 1
+	})
+	result, err := ts.finishWork().Call(t.Context(), json.RawMessage(`{"delivery_status":"partial_checkpoint","summary":"handoff"}`), nil)
+	if err != nil || result.IsError {
+		t.Fatalf("result=%s err=%v", result.Flatten(), err)
+	}
+	var out struct {
+		Gain kernel.ResearchGain `json:"research_gain"`
+	}
+	if err := json.Unmarshal([]byte(result.Flatten()), &out); err != nil {
+		t.Fatal(err)
+	}
+	if ts.Writes().Checkpoint == nil || ts.Writes().Checkpoint.RemainingScope != "remaining fixture" || out.Gain.Evidence != 1 {
+		t.Fatalf("writes=%+v gain=%+v", ts.Writes(), out.Gain)
+	}
+}
+
+func TestWorkerPromptsMentionFinishWork(t *testing.T) {
+	for _, prompt := range []string{workerDefaultTmpl, workerFocusContract, settleWrapUpPrompt, workerTaskTimeoutDefault} {
+		if !strings.Contains(prompt, "finish_work") {
+			t.Fatal("worker prompt lacks finish_work")
+		}
+	}
+}
+
+func TestScopeBatchAndArtifactBoundaries(t *testing.T) {
+	batch := kernel.EvidenceBatch{Schema: kernel.BatchSchemaV1, Valid: true, PreconditionOK: true, Attempted: 10, UniqueCovered: 10, RangeStart: 100, RangeEnd: 109, Method: "tcp", Target: "fixture"}
+	if err := ValidateScopeBatches("ports 1-10 and ports 100-110", []kernel.EvidenceBatch{batch}); err != nil {
+		t.Fatal(err)
+	}
+	batch.RangeEnd = 111
+	if err := ValidateScopeBatches("ports 1-10 and ports 100-110", []kernel.EvidenceBatch{batch}); err == nil {
+		t.Fatal("out-of-scope range accepted")
+	}
+	batch.RangeStart, batch.RangeEnd = 0, 0
+	if err := ValidateScopeBatches("ports 1-10", []kernel.EvidenceBatch{batch}); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	for _, body := range []string{"log mentions vestrail.batch.v1 as documentation", `[{"schema":"vestrail.batch.v1","valid":true,"precondition_ok":true,"attempted":1,"unique_covered":1,"range_start":1,"range_end":1}]`} {
+		path := filepath.Join(dir, "artifact.log")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, batches, err := VerifyArtifact(t.Context(), dir, kernel.ArtifactRef{Path: path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(body, "[") && len(batches) != 1 {
+			t.Fatal("JSON array batch lost")
+		}
+	}
+	tracker := kernel.NewCoverageTracker("ports 1-10")
+	batch.RangeStart, batch.RangeEnd = 1, 10
+	tracker.Add(batch)
+	batch.Method, batch.RangeEnd, batch.Attempted, batch.UniqueCovered = "http_probe", 1, 1, 1
+	tracker.Add(batch)
+	if !tracker.CoversRange(1, 10) {
+		t.Fatal("secondary method suppressed full coverage")
 	}
 }

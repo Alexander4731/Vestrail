@@ -76,7 +76,7 @@ func (s *Server) recoverTaskExecutions(ctx context.Context, t *Task) {
 				return
 			}
 			dir := filepath.Join(s.m.dir, "tasks", t.ID)
-			goal := t.Goal
+			goal := t.lifecycleSnapshot().Goal
 			if e.IntentID > 0 {
 				if node, getErr := t.Store.GetNode(e.IntentID); getErr == nil && node != nil {
 					goal += "\n" + string(node.Payload)

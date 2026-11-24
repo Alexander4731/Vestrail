@@ -19,7 +19,7 @@ import (
 // sortFindingsForExport 按严重等级降序、再按时间倒序排,与汇总报告的分组一致。
 func sortFindingsForExport(fs []*db.DBFinding) {
 	sort.SliceStable(fs, func(i, j int) bool {
-		ri, rj := sevRank[fs[i].Severity], sevRank[fs[j].Severity]
+		ri, rj := sevRank(fs[i].Severity), sevRank(fs[j].Severity)
 		if ri != rj {
 			return ri < rj // sevRank 越小越严重
 		}
@@ -125,7 +125,11 @@ var unsafeFilenameChars = regexp.MustCompile(`[^\p{Han}\p{L}\p{N}._-]+`)
 // `critical_SQL注入_#123.md`。去掉路径分隔符与控制字符,避免 zip 内非法路径。
 func FindingFilename(f *db.DBFinding) string {
 	sev := nz(f.Severity, "info")
-	title := findingTitle(f)
+	titleRunes := []rune(findingTitle(f))
+	if len(titleRunes) > 80 {
+		titleRunes = titleRunes[:80]
+	}
+	title := string(titleRunes)
 	name := fmt.Sprintf("%s_%s_#%d", sev, title, f.ID)
 	name = unsafeFilenameChars.ReplaceAllString(name, "_")
 	name = strings.Trim(name, "._")
@@ -134,9 +138,6 @@ func FindingFilename(f *db.DBFinding) string {
 	}
 	// 防御性:再剥一层路径,杜绝 zip slip。
 	name = path.Base(name)
-	if len(name) > 120 {
-		name = name[:120]
-	}
 	return name + ".md"
 }
 

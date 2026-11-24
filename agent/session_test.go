@@ -146,3 +146,60 @@ func TestSessionCompletedToolTurnPersistsExactResults(t *testing.T) {
 		})
 	}
 }
+
+func TestCompleteToolTurnInterleavedParallelCalls(t *testing.T) {
+	events := []llm.StreamEvent{
+		{Type: llm.SEToolUseStart, ToolID: "a", ToolName: "Probe", ToolIndex: 1, ToolIndexSet: true},
+		{Type: llm.SEToolInputJSON, Text: `{"value":`, ToolIndex: 1, ToolIndexSet: true},
+		{Type: llm.SEToolUseStart, ToolID: "b", ToolName: "Probe", ToolIndex: 2, ToolIndexSet: true},
+		{Type: llm.SEToolInputJSON, Text: `{"value":2}`, ToolIndex: 2, ToolIndexSet: true},
+		{Type: llm.SEToolInputJSON, Text: `1}`, ToolIndex: 1, ToolIndexSet: true},
+		{Type: llm.SEMessageDelta, StopReason: "tool_use"},
+		{Type: llm.SEMessageStop},
+	}
+	stream := func(yield func(llm.StreamEvent, error) bool) {
+		for _, ev := range events {
+			if !yield(ev, nil) {
+				return
+			}
+		}
+	}
+	acc := llm.NewAccumulator()
+	for ev, err := range completeToolTurn(t.Context(), stream) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		acc.Add(ev)
+	}
+	calls := acc.Message().ToolUses()
+	if len(calls) != 2 || string(calls[0].Input) != `{"value":1}` || string(calls[1].Input) != `{"value":2}` {
+		t.Fatalf("calls=%+v", calls)
+	}
+}
+
+func TestCompleteToolTurnFailPreservesCumulativeUsage(t *testing.T) {
+	stream := func(yield func(llm.StreamEvent, error) bool) {
+		for _, ev := range []llm.StreamEvent{
+			{Type: llm.SEMessageStart, Usage: llm.Usage{InputTokens: 10}},
+			{Type: llm.SEToolUseStart, ToolID: "a", ToolName: "Probe"},
+			{Type: llm.SEMessageDelta, Usage: llm.Usage{InputTokens: 10, OutputTokens: 3}, CumulativeUsage: true},
+		} {
+			if !yield(ev, nil) {
+				return
+			}
+		}
+		yield(llm.StreamEvent{}, io.ErrUnexpectedEOF)
+	}
+	var usage llm.Usage
+	failed := false
+	for ev, err := range completeToolTurn(t.Context(), stream) {
+		if err != nil {
+			failed = true
+			break
+		}
+		ev.FoldUsage(&usage)
+	}
+	if !failed || usage.InputTokens != 10 || usage.OutputTokens != 3 {
+		t.Fatalf("usage=%+v failed=%v", usage, failed)
+	}
+}

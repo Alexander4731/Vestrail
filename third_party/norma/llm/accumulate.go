@@ -42,7 +42,7 @@ func (a *Accumulator) Add(ev StreamEvent) {
 		}
 		a.thinkBuf.WriteString(ev.Text)
 	case SEThinkingSignature:
-		a.thinkSig = ev.Text
+		a.thinkSig += ev.Text
 	case SEToolUseStart:
 		a.flushText()
 		a.flushThinking()

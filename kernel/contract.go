@@ -10,6 +10,7 @@ import (
 
 // ArtifactRef identifies an upstream artifact together with its evidence provenance (F07/F08).
 type ArtifactRef struct {
+	Kind       string `json:"kind,omitempty"`
 	Path       string `json:"path"`
 	Provenance string `json:"provenance"` // target_response | source_code | derived_diff | guess_wordlist | history_log
 	Valid      bool   `json:"valid"`
@@ -40,14 +41,25 @@ type IntentContract struct {
 
 var portScopeRange = regexp.MustCompile(`(?i)(?:端口(?:段|范围)?|ports?(?:\s+range)?)\s*[:：]?\s*(\d{1,5})\s*[-–—]\s*(\d{1,5})`)
 
+// PortScopeRanges returns every valid inclusive port range in the contract.
+func PortScopeRanges(scope string) [][2]int {
+	var ranges [][2]int
+	for _, match := range portScopeRange.FindAllStringSubmatch(scope, -1) {
+		start, _ := strconv.Atoi(match[1])
+		end, _ := strconv.Atoi(match[2])
+		if start <= end && end <= 65535 {
+			ranges = append(ranges, [2]int{start, end})
+		}
+	}
+	return ranges
+}
+
 func PortScopeBounds(scope string) (start, end int64, ok bool) {
-	m := portScopeRange.FindStringSubmatch(scope)
-	if len(m) == 0 {
+	ranges := PortScopeRanges(scope)
+	if len(ranges) != 1 {
 		return 0, 0, false
 	}
-	start, _ = strconv.ParseInt(m[1], 10, 64)
-	end, _ = strconv.ParseInt(m[2], 10, 64)
-	return start, end, start <= end && end <= 65535
+	return int64(ranges[0][0]), int64(ranges[0][1]), true
 }
 
 // PortScopeContext preserves target/method text while comparing range slices.
@@ -57,7 +69,7 @@ func PortScopeContext(scope string) (string, bool) {
 		return "", false
 	}
 	m := matches[0]
-	return strings.Join(strings.Fields(scope[:m[0]]+"ports"+scope[m[1]:]), " "), true
+	return strings.ToLower(strings.Join(strings.Fields(scope[:m[0]]+" ports "+scope[m[1]:]), " ")), true
 }
 
 const (
@@ -212,4 +224,14 @@ func HasFreshParentEvidence(newParents []int64, existingIntentID int64, existing
 		}
 	}
 	return false
+}
+
+// SameCoverageScope compares a target and method independently of a port slice.
+func SameCoverageScope(current, previous string) bool {
+	if strings.Join(strings.Fields(current), " ") == strings.Join(strings.Fields(previous), " ") {
+		return true
+	}
+	currentContext, currentBounded := PortScopeContext(current)
+	previousContext, previousBounded := PortScopeContext(previous)
+	return currentBounded && previousBounded && currentContext == previousContext
 }

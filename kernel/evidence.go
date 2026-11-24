@@ -113,7 +113,7 @@ var factRangeCount = regexp.MustCompile(
 	`(?:^|[\n。!?！？;；])[ \t　]*(?:[-*][ \t]+)?` +
 		`(?:(?:闭区间|区间|端口段|端口范围|扫描范围|全范围|范围)[ \t　]*[:：]?[ \t　]*)?` +
 		`(` + factRangeNumber + `)[ \t　]*[-–][ \t　]*(` + factRangeNumber +
-		`)[ \t　]*(?:[,，][ \t　]*)?共[ \t　]*(` + factRangeNumber + `)[ \t　]*(?:个[ \t　]*)?(?:端口|项)`,
+		`)[ \t　]*(?:[,，][ \t　]*)?共(?:扫描|检测|测试|覆盖|包含|探测)[ \t　]*(` + factRangeNumber + `)[ \t　]*(?:个[ \t　]*)?(?:端口|项)`,
 )
 
 // ValidateFactRangeConsistency checks explicit inclusive-range totals in fact text.

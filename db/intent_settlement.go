@@ -58,9 +58,12 @@ WHERE exploration_id=$1 AND id=$2 AND kind='intent' AND state='running'`, s.expI
 		}
 		alreadySaved := false
 		if changed == 0 {
-			if err := query(ctx, `SELECT EXISTS(SELECT 1 FROM intent_run_receipts WHERE exploration_id=$1 AND intent_id=$2 AND receipt_json=$3::jsonb)`, s.expID, id, string(raw)).Scan(&alreadySaved); err != nil {
+			if err := query(ctx, `SELECT EXISTS(SELECT 1 FROM intent_run_receipts WHERE exploration_id=$1 AND intent_id=$2 AND receipt_json=$3::jsonb)`, s.expID, id, string(jsonbClean(raw))).Scan(&alreadySaved); err != nil {
 				return err
 			}
+		}
+		if changed == 0 && !alreadySaved {
+			return fmt.Errorf("%w: intent %d already settled with a different receipt", ErrIntentStateConflict, id)
 		}
 		if !alreadySaved {
 			if _, err := exec(ctx, intentReceiptInsertSQL, receiptArguments(r, raw)...); err != nil {

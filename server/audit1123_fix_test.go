@@ -143,7 +143,7 @@ func TestAuditFix_ExhaustedNetGainKeepsConcurrency(t *testing.T) {
 		}
 	}
 	for id := int64(1); id <= 4; id++ {
-		if !e.resources.tryAcquire(intentResourceRequest{intentID: id, taskID: "task-f20", locks: map[string]bool{}}) {
+		if !e.resources.tryAcquire(intentResourceRequest{intentID: id, taskID: "task-f20", locks: map[string]bool{}}, true) {
 			t.Fatal("independent work must remain admissible")
 		}
 	}
@@ -170,6 +170,7 @@ func TestAuditFix_PerIntentToolBudgetEnforced(t *testing.T) {
 		if blocked, reason := g.before("Bash", []byte(fmt.Sprintf(`{"command":"cmd %d"}`, i))); blocked {
 			t.Fatalf("call %d unexpectedly blocked: %s", i+1, reason)
 		}
+		g.recordAdmittedProbe("Bash")
 		g.after("Bash", []byte(fmt.Sprintf(`{"command":"cmd %d"}`, i)), false, []byte(`"ok"`))
 	}
 	if blocked, _ := g.before("Bash", []byte(`{"command":"cmd 7"}`)); !blocked {

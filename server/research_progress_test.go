@@ -9,8 +9,11 @@ import (
 	"testing"
 
 	"github.com/Alexander4731/Vestrail/agent"
+	"github.com/Alexander4731/Vestrail/guard"
 	"github.com/Alexander4731/Vestrail/kernel"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 func TestRepeatedCommandCommentsEnterSettlement(t *testing.T) {
@@ -124,5 +127,90 @@ func TestCoverageBaselinePreservesTargetAndMethod(t *testing.T) {
 	}
 	if sameCoverageScope("other.test ports 51-100 tcp", "example.test ports 1-100 tcp") || sameCoverageScope("example.test ports 51-100 udp", "example.test ports 1-100 tcp") {
 		t.Fatal("different target or method reused prior coverage")
+	}
+}
+
+type blockingPreHook struct {
+	harness.HookRunner
+	block bool
+}
+
+func (h *blockingPreHook) PreToolUse(context.Context, string, []byte) (bool, string, []byte) {
+	if h.block {
+		return true, "denied by intercept", nil
+	}
+	return false, "", nil
+}
+
+func (h *blockingPreHook) PostToolUse(context.Context, string, []byte, []byte, bool) {}
+
+func (h *blockingPreHook) Stop(context.Context, []llm.Message) (bool, []string, string) {
+	return false, nil, ""
+}
+
+func TestTrackAFiresForRunScriptWithReviewDescriber(t *testing.T) {
+	t.Setenv("VESTRAIL_OPT_PROGRESS_GUARD", "1")
+	g := newWorkerFailureGuard(nil)
+	var requested kernel.TerminationCode
+	g.setSettlementRequester(func(code kernel.TerminationCode) { requested = code })
+	hooks := guard.WithToolReview(steerHooks{failures: g}, []actool.CoreTool{agent.NewRunScriptTool()})
+	raw := []byte(`{"path":"probe.py","content":"print(1)"}`)
+	blockedAt := 0
+	for i := 1; i <= 10; i++ {
+		blocked, _, _ := hooks.PreToolUse(t.Context(), "RunScript", raw)
+		if blocked {
+			blockedAt = i
+			if requested != "" {
+				break
+			}
+			continue
+		}
+		hooks.PostToolUse(t.Context(), "RunScript", raw, []byte("exit 1"), true)
+	}
+	if blockedAt == 0 || requested != kernel.TermRepeatedToolFailure {
+		t.Fatalf("Track A did not fire for RunScript under WithToolReview: blockedAt=%d requested=%q", blockedAt, requested)
+	}
+}
+
+func TestDistinctNegativeProbesNotFalseStagnant(t *testing.T) {
+	t.Setenv("VESTRAIL_OPT_PROGRESS_GUARD", "1")
+	g := newWorkerFailureGuard(nil)
+	var requested kernel.TerminationCode
+	g.setSettlementRequester(func(code kernel.TerminationCode) { requested = code })
+	for i := 1; i <= 60; i++ {
+		input := []byte(fmt.Sprintf(`{"url":"https://fixture.invalid/item-%d"}`, i))
+		if deny, _ := g.before("WebFetch", input); deny {
+			t.Fatalf("distinct probe %d unexpectedly blocked", i)
+		}
+		g.after("WebFetch", input, false, []byte(`"404 Not Found"`))
+	}
+	if requested != "" || g.stagnantTurns != 0 {
+		t.Fatalf("false stagnation on distinct negative probes: requested=%q stagnant=%d", requested, g.stagnantTurns)
+	}
+}
+
+func TestBlockedCallDoesNotBurnMaxToolCalls(t *testing.T) {
+	t.Setenv("VESTRAIL_OPT_PROGRESS_GUARD", "1")
+	g := newWorkerFailureGuardWithBudget(nil, 2)
+	inner := &blockingPreHook{block: true}
+	hooks := steerHooks{inner: inner, failures: g}
+	for i := 0; i < 5; i++ {
+		if blocked, _, _ := hooks.PreToolUse(t.Context(), "Bash", []byte(`{"command":"echo denied"}`)); !blocked {
+			t.Fatal("expected inner hook to block")
+		}
+	}
+	inner.block = false
+	for i := 0; i < 5; i++ {
+		if blocked, _, _ := hooks.PreToolUse(t.Context(), "Read", []byte(`{"file_path":"a.txt"}`)); blocked {
+			t.Fatal("read-only tool should not burn max_tool_calls")
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if blocked, reason, _ := hooks.PreToolUse(t.Context(), "Bash", []byte(fmt.Sprintf(`{"command":"echo %d"}`, i))); blocked {
+			t.Fatalf("admitted probe %d blocked prematurely: %s", i+1, reason)
+		}
+	}
+	if blocked, _, _ := hooks.PreToolUse(t.Context(), "Bash", []byte(`{"command":"echo 3"}`)); !blocked {
+		t.Fatal("third admitted probe should hit max_tool_calls=2")
 	}
 }

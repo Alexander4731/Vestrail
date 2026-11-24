@@ -559,7 +559,8 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	}
 	pg := s.m.pg
 	maxTurns := s.agentMaxTurns(c.AgentKey)
-	maxDuration := time.Duration(s.agentRunSeconds(c.AgentKey)) * time.Second
+	runSeconds, budgetPolicy := s.agentRunBudget(c.AgentKey)
+	maxDuration := time.Duration(runSeconds) * time.Second
 	webSearch := false
 	if a, err := pg.GetAgentByKey(c.AgentKey); err == nil && a != nil {
 		webSearch = a.WebSearch
@@ -572,7 +573,7 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	}
 	// On a manual stop ctx is cancelled; Chat already emits a clean "已手动停止"
 	// step, so skip the raw-error entry — only surface genuine failures.
-	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
+	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit, budgetPolicy); err != nil {
 		finishReason = err.Error()
 		if ctx.Err() == nil {
 			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,

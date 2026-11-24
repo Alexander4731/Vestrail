@@ -31,7 +31,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/Alexander4731/Vestrail/db"
-	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
@@ -136,13 +135,16 @@ const TrafficSearchDescription = "查询记录代理已抓取的目标流量（�
 
 // Traffic runs the recording proxy and owns the file tree + index.
 type Traffic struct {
-	dir          string
-	addr         string
-	db           *sql.DB
-	wmu          sync.Mutex // serializes record() vs DeleteHost (incl. blob GC)
-	seq          atomic.Int64
-	proxy        *mproxy.Proxy
-	requestSlots chan struct{}
+	dir            string
+	addr           string
+	db             *sql.DB
+	wmu            sync.Mutex // serializes record() vs DeleteHost (incl. blob GC)
+	seq            atomic.Int64
+	proxy          *mproxy.Proxy
+	slotMu         sync.Mutex
+	requestBuckets map[string]*requestBucket
+	requestCap     int
+	tunnelSlots    chan struct{}
 	// fts reports whether the full-text index is available. False on a driver
 	// build without FTS5: recording and metadata search still work, body search
 	// degrades to unsupported rather than erroring.
@@ -197,20 +199,22 @@ func Open(dir, addr string) (*Traffic, error) {
 	if err != nil {
 		return nil, err
 	}
-	capTotal := kernel.DefaultSharedChannelCap
+	capTotal := 8
 	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("VESTRAIL_SHARED_CHANNEL_CAP"))); err == nil && n > 0 {
 		capTotal = n
 	}
-	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{}), requestSlots: make(chan struct{}, capTotal)}
+	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{}), requestBuckets: map[string]*requestBucket{}, requestCap: capTotal, tunnelSlots: make(chan struct{}, 32)}
 	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
 	}
 
 	p, err := mproxy.NewProxy(&mproxy.Options{
-		Addr:        addr,
-		SslInsecure: true,
-		CaRootPath:  filepath.Join(dir, "_ca"),
+		Addr:                  addr,
+		SslInsecure:           true,
+		DialTimeout:           15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		CaRootPath:            filepath.Join(dir, "_ca"),
 	})
 	if err != nil {
 		db.Close()
@@ -399,40 +403,92 @@ type sink struct {
 	t *Traffic
 }
 
-// Requestheaders reserves capacity before forwarding. Intercepted CONNECT is
-// only a TLS envelope; its inner HTTP flows acquire their own slots. Passthrough
-// CONNECT holds one slot until the tunnel closes.
+type requestBucket struct {
+	slots chan struct{}
+	users int // admitted requests plus waiting callers
+}
+
+// Requestheaders separates long CONNECT tunnels from ordinary HTTP admission.
 func (s *sink) Requestheaders(f *mproxy.Flow) {
-	if s.t.requestSlots == nil || f.Request == nil || f.Request.Raw() == nil {
+	if f.Request == nil || f.Request.Raw() == nil {
 		return
 	}
 	if f.Request.Method == http.MethodConnect && f.ConnContext != nil && f.ConnContext.Intercept {
 		return
 	}
-	if !s.t.acquireRequest(f.Request.Raw().Context()) {
-		if f.Request.Method != http.MethodConnect {
-			f.Response = &mproxy.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{"X-Vestrail-Resource-Wait": []string{"cancelled"}}, Body: []byte("shared channel admission cancelled")}
+	key := ""
+	if upstream := s.t.upstream.Load(); upstream != nil {
+		key = "proxy:" + upstream.String()
+	} else {
+		key = f.Request.URL.Host
+		if f.Request.URL.Port() == "" {
+			port := "80"
+			if f.Request.URL.Scheme == "https" || f.Request.Method == http.MethodConnect {
+				port = "443"
+			}
+			key = net.JoinHostPort(f.Request.URL.Hostname(), port)
 		}
+	}
+	release, ok := s.t.acquireRequest(f.Request.Raw().Context(), key, f.Request.Method == http.MethodConnect)
+	if !ok {
+		f.Response = &mproxy.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{"X-Vestrail-Resource-Wait": []string{"cancelled"}}, Body: []byte("channel admission cancelled")}
 		return
 	}
-	go func() {
-		<-f.Done()
-		<-s.t.requestSlots
-	}()
+	go func() { <-f.Done(); release() }()
 }
 
-func (t *Traffic) acquireRequest(ctx context.Context) bool {
-	select {
-	case t.requestSlots <- struct{}{}:
-		if ctx.Err() != nil {
-			<-t.requestSlots
-			return false
+func (t *Traffic) acquireRequest(ctx context.Context, key string, tunnel bool) (func(), bool) {
+	if ctx.Err() != nil || t.stopping() {
+		return nil, false
+	}
+	t.slotMu.Lock()
+	var slots chan struct{}
+	forget := func() {}
+	if tunnel {
+		if t.tunnelSlots == nil {
+			t.tunnelSlots = make(chan struct{}, 32)
 		}
-		return true
+		slots = t.tunnelSlots
+	} else {
+		if t.requestBuckets == nil {
+			t.requestBuckets = map[string]*requestBucket{}
+		}
+		bucket := t.requestBuckets[key]
+		if bucket == nil {
+			capacity := t.requestCap
+			if capacity <= 0 {
+				capacity = 8
+			}
+			bucket = &requestBucket{slots: make(chan struct{}, capacity)}
+			t.requestBuckets[key] = bucket
+		}
+		bucket.users++
+		slots = bucket.slots
+		forget = func() {
+			t.slotMu.Lock()
+			bucket.users--
+			if bucket.users == 0 {
+				delete(t.requestBuckets, key)
+			}
+			t.slotMu.Unlock()
+		}
+	}
+	t.slotMu.Unlock()
+	select {
+	case slots <- struct{}{}:
+		var once sync.Once
+		release := func() { once.Do(func() { <-slots; forget() }) }
+		if ctx.Err() != nil || t.stopping() {
+			release()
+			return nil, false
+		}
+		return release, true
 	case <-ctx.Done():
-		return false
+		forget()
+		return nil, false
 	case <-t.closed:
-		return false
+		forget()
+		return nil, false
 	}
 }
 

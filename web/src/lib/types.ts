@@ -413,12 +413,28 @@ export interface Company {
 // ---- Exploration graph (per task) ----
 export type ExploreKind = "task" | "begin" | "goal" | "intent" | "fact" | "finding" | "hint" | "digest";
 export type GoalState = "open" | "met" | "abandoned";
-export type IntentState = "open" | "running" | "paused" | "done" | "blocked" | "exhausted" | "stopped";
+export type IntentState = "open" | "running" | "paused" | "done" | "blocked" | "exhausted" | "stopped" | "deleted";
 export type FindingState = "confirmed" | "dismissed";
 export type HintState = "active" | "consumed";
 export type ExploreRel = "spawns" | "derived_from" | "yields" | "proves" | "covers";
 
+export interface IntentReceiptSummary {
+  run_seq: number;
+  delivery_status: "complete" | "partial_checkpoint" | "precondition_blocked" | "handed_back" | "";
+  termination_code: string;
+  has_net_gain: boolean;
+  research_gain?: { evidence: number; coverage: number; artifacts: number; assets?: number };
+  checkpoint?: { completed_scope?: string; remaining_scope?: string; next_action?: string; valid_artifacts?: { path: string }[]; invalid_artifacts?: string[] };
+}
+
+export interface IntentReceiptRecord extends IntentReceiptSummary {
+  receipt: Record<string, unknown>;
+  created_at: string;
+}
+
 export interface TaskNode {
+  blocked_reason?: string;
+  latest_receipt?: IntentReceiptSummary;
   id: string;
   type: ExploreKind;
   payload?: string;

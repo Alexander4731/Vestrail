@@ -101,6 +101,14 @@ func (s *ptySession) append(p []byte) {
 	}
 }
 
+func (s *ptySession) readTail(n int) string {
+	s.mu.Lock()
+	from := max(int64(0), s.total-int64(n))
+	s.mu.Unlock()
+	tail, _, _ := s.readSince(from, 0, n, true)
+	return tail
+}
+
 func (s *ptySession) tailStr(n int) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -368,11 +376,7 @@ func (m *Manager) readLoop(s *ptySession) {
 // task-notification with the tail, so the model is woken between turns to review it.
 func (m *Manager) dispatchWaiter(s *ptySession, quiet, grace, timeout time.Duration) {
 	by := s.waitComplete(m.rootCtx, quiet, grace, timeout, s.prompt, "")
-	from := s.total - 4096
-	if from < 0 {
-		from = 0
-	}
-	tail, _, _ := s.readSince(from, 0, 4096, true)
+	tail := s.readTail(4096)
 	status := TaskCompleted
 	if !s.running() {
 		status = TaskCompleted
@@ -399,11 +403,7 @@ func (m *Manager) monitorWaiter(s *ptySession, pats []*regexp.Regexp) {
 		case <-m.rootCtx.Done():
 			return
 		case <-s.done:
-			from := s.total - 4096
-			if from < 0 {
-				from = 0
-			}
-			tail, _, _ := s.readSince(from, 0, 4096, true)
+			tail := s.readTail(4096)
 			m.enqueueSessNote(s, KindMonitor, TaskCompleted,
 				fmt.Sprintf("监听会话 %s（%s）已结束(exit %s)。\n%s", s.id, short(s.command), fmtExit(s.exit()), tail))
 			return

@@ -770,6 +770,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/llm/resolution", s.taskLLMResolutionHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/intents/{iid}/control", s.controlIntent)
 	mux.HandleFunc("POST /api/tasks/{id}/intents/{iid}/messages", s.sendWorkerMessage)
+	mux.HandleFunc("GET /api/tasks/{id}/intents/{iid}/receipts", s.intentReceipts)
 	mux.HandleFunc("POST /api/tasks/{id}/intents/{iid}/rerun", s.rerunIntent)    // 重跑单条 blocked/exhausted/stopped 意图
 	mux.HandleFunc("POST /api/tasks/{id}/intents/rerun-blocked", s.rerunBlocked) // 批量重跑本任务全部 blocked 意图
 	mux.HandleFunc("POST /api/active", s.setActive)
@@ -1994,7 +1995,7 @@ func (s *Server) frontier(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fr, _ := t.Store.Frontier(atoiDefault(r.URL.Query().Get("limit"), 100))
-	writeJSON(w, 200, taskNodeDTOs(fr))
+	writeJSON(w, 200, s.taskNodeDTOs(fr))
 }
 
 func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
@@ -2335,7 +2336,7 @@ func (s *Server) findingLineage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"nodes": taskNodeDTOs(nodes), "edges": edgeDTOs(edges)})
+	writeJSON(w, 200, map[string]any{"nodes": s.taskNodeDTOs(nodes), "edges": edgeDTOs(edges)})
 }
 
 // patchFinding partially updates a finding: any subset of {status, severity}.
@@ -2470,7 +2471,7 @@ func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		writeJSON(w, 200, taskNodeDTOs(in))
+		writeJSON(w, 200, s.taskNodeDTOs(in))
 		return
 	}
 	// Paged form: ?before=<id> (or ?page as a marker) → {items, has_more} so the
@@ -2503,7 +2504,7 @@ func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
 		in = in[:limit]
 		hasMore = true
 	}
-	writeJSON(w, 200, map[string]any{"items": taskNodeDTOs(in), "has_more": hasMore})
+	writeJSON(w, 200, map[string]any{"items": s.taskNodeDTOs(in), "has_more": hasMore})
 }
 
 func inheritedIntentResult(state string) bool {
@@ -2613,7 +2614,7 @@ func (s *Server) explorationGraph(w http.ResponseWriter, r *http.Request) {
 		nodes = append(nodes, sourceNodes...)
 		edges = append(edges, sourceEdges...)
 	}
-	writeJSON(w, 200, map[string]any{"nodes": taskNodeDTOs(nodes), "edges": edgeDTOs(edges)})
+	writeJSON(w, 200, map[string]any{"nodes": s.taskNodeDTOs(nodes), "edges": edgeDTOs(edges)})
 }
 
 // explorationNodes serves the 播报板: this task's own exploration nodes as a
@@ -2676,11 +2677,11 @@ func (s *Server) explorationNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	refs := make(map[string]TaskNodeDTO, len(neighbours))
-	for _, n := range neighbours {
-		refs[i64s(n.ID)] = taskNodeDTO(n)
+	for _, node := range s.taskNodeDTOs(neighbours) {
+		refs[node.ID] = node
 	}
 	writeJSON(w, 200, map[string]any{
-		"items":  taskNodeDTOs(nodes),
+		"items":  s.taskNodeDTOs(nodes),
 		"total":  total,
 		"page":   page,
 		"size":   size,
@@ -4033,4 +4034,41 @@ func atoiDefault(s string, d int) int {
 		return n
 	}
 	return d
+}
+
+func (s *Server) intentReceipts(w http.ResponseWriter, r *http.Request) {
+	task, ok := s.m.Task(r.PathValue("id"))
+	if !ok {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	intentID, err := strconv.ParseInt(r.PathValue("iid"), 10, 64)
+	if err != nil || intentID <= 0 {
+		writeErr(w, 400, "bad intent id")
+		return
+	}
+	node, err := task.Store.GetNode(intentID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if node == nil || node.Kind != db.KindIntent {
+		writeErr(w, 404, "intent not found")
+		return
+	}
+	records, err := s.m.pg.IntentReceipts(r.Context(), task.Store.ID(), intentID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	type receiptDTO struct {
+		IntentReceiptSummaryDTO
+		Receipt   kernel.RunReceipt `json:"receipt"`
+		CreatedAt string            `json:"created_at"`
+	}
+	out := make([]receiptDTO, 0, len(records))
+	for _, record := range records {
+		out = append(out, receiptDTO{IntentReceiptSummaryDTO: intentReceiptSummaryDTO(record), Receipt: record.Receipt, CreatedAt: rfc3339(record.CreatedAt)})
+	}
+	writeJSON(w, 200, out)
 }

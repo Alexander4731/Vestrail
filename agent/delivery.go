@@ -90,7 +90,9 @@ func VerifyArtifact(ctx context.Context, dir string, ref kernel.ArtifactRef) (ke
 		if readErr == bufio.ErrBufferFull {
 			continue
 		}
-		if ref.Provenance != "source_code" && (lineHasSchema || bytes.Contains(line, []byte(kernel.BatchSchemaV1))) {
+		trimmed := bytes.TrimSpace(line)
+		structured := json.Valid(trimmed) && bytes.HasPrefix(trimmed, []byte("{"))
+		if ref.Provenance != "source_code" && (ref.Kind == "batch_log" && len(trimmed) > 0 || structured && lineHasSchema) {
 			parsed := kernel.ExtractEvidenceBatches(string(line))
 			if lineTooLong || len(parsed) != 1 {
 				parseErr = fmt.Errorf("产物批次数据无法解析: %s", path)
@@ -119,8 +121,23 @@ func VerifyArtifact(ctx context.Context, dir string, ref kernel.ArtifactRef) (ke
 		var whole kernel.EvidenceBatch
 		if info.Size() <= int64(preview.Len()) && json.Unmarshal(preview.Bytes(), &whole) == nil && whole.Schema == kernel.BatchSchemaV1 {
 			batches = []kernel.EvidenceBatch{whole}
+		} else if info.Size() <= int64(preview.Len()) && json.Valid(preview.Bytes()) && bytes.HasPrefix(bytes.TrimSpace(preview.Bytes()), []byte("[")) {
+			var items []kernel.EvidenceBatch
+			if err := json.Unmarshal(preview.Bytes(), &items); err == nil {
+				batches = nil
+				for _, item := range items {
+					if item.Schema == kernel.BatchSchemaV1 {
+						batches = append(batches, item)
+					}
+				}
+			} else if ref.Kind == "batch_log" {
+				return ref, nil, err
+			}
 		} else if parseErr != nil {
 			return ref, nil, parseErr
+		}
+		if ref.Kind == "batch_log" && len(batches) == 0 {
+			return ref, nil, fmt.Errorf("产物缺少有效批次: %s", path)
 		}
 	}
 	for _, batch := range batches {
@@ -133,26 +150,40 @@ func VerifyArtifact(ctx context.Context, dir string, ref kernel.ArtifactRef) (ke
 }
 
 func ValidateScopeBatches(scope string, batches []kernel.EvidenceBatch) error {
-	start, end, bounded := kernel.PortScopeBounds(scope)
-	if !bounded {
+	ranges := kernel.PortScopeRanges(scope)
+	if len(ranges) == 0 {
 		return nil
 	}
 	for _, b := range batches {
-		if b.Valid && b.PreconditionOK && b.UniqueCovered > 0 && (b.RangeStart < start || b.RangeEnd > end) {
-			return fmt.Errorf("批次范围 %d–%d 超出意图端口范围 %d–%d", b.RangeStart, b.RangeEnd, start, end)
+		if b.RangeStart == 0 && b.RangeEnd == 0 {
+			continue
+		}
+		if !b.Valid || !b.PreconditionOK || b.UniqueCovered <= 0 {
+			continue
+		}
+		contained := false
+		for _, bounds := range ranges {
+			if b.RangeStart >= int64(bounds[0]) && b.RangeEnd <= int64(bounds[1]) {
+				contained = true
+				break
+			}
+		}
+		if !contained {
+			return fmt.Errorf("批次范围 %d–%d 超出意图声明的端口范围", b.RangeStart, b.RangeEnd)
 		}
 	}
 	return nil
 }
 
 func CompleteScopeCovered(scope string, batches []kernel.EvidenceBatch) bool {
-	start, end, bounded := kernel.PortScopeBounds(scope)
-	if !bounded {
-		return true
-	}
 	tracker := kernel.NewCoverageTracker(scope)
 	tracker.Seed(batches)
-	return tracker.CoversRange(start, end)
+	for _, bounds := range kernel.PortScopeRanges(scope) {
+		if !tracker.CoversRange(int64(bounds[0]), int64(bounds[1])) {
+			return false
+		}
+	}
+	return true
 }
 
 func (t *ToolSet) noteEvidenceRead(ctx context.Context, ids []int64) {
@@ -192,6 +223,9 @@ func (t *ToolSet) finishWork() actool.CoreTool {
 			return actool.Errorf("未知交付状态"), nil
 		}
 		written := t.Writes()
+		if req.Checkpoint == nil {
+			req.Checkpoint = written.Checkpoint
+		}
 		if len(req.EvidenceIDs) == 0 {
 			req.EvidenceIDs = written.EvidenceIDs
 		}
@@ -234,20 +268,44 @@ func (t *ToolSet) finishWork() actool.CoreTool {
 		if req.Checkpoint != nil {
 			acceptedArtifacts = len(req.Checkpoint.ValidArtifacts)
 		}
-		if req.Status == kernel.DeliveryComplete && (len(req.EvidenceIDs) == 0 && acceptedArtifacts == 0 && written.Assets == 0 || !CompleteScopeCovered(t.contract.Scope, batches)) {
+		hasRangeBatch := false
+		for _, batch := range batches {
+			if batch.RangeStart > 0 || batch.RangeEnd > 0 {
+				hasRangeBatch = true
+				break
+			}
+		}
+		requiresBatchCoverage := hasRangeBatch || strings.Contains(strings.ToLower(t.contract.Deliverable), kernel.BatchSchemaV1)
+		if req.Status == kernel.DeliveryComplete && (len(req.EvidenceIDs) == 0 && acceptedArtifacts == 0 && written.Assets == 0 || requiresBatchCoverage && !CompleteScopeCovered(t.contract.Scope, batches)) {
 			return actool.Errorf("最小交付尚缺证据、有效产物或完整覆盖，请提交 partial_checkpoint / handed_back"), nil
 		}
 		if ctx.Err() != nil {
 			return actool.Errorf("交付已超过执行预算，请保留现有证据后重试"), nil
 		}
 		t.updateWrites(func(w *WriteCounts) {
-			w.DeliveryStatus, w.Checkpoint = req.Status, req.Checkpoint
+			w.DeliveryStatus = req.Status
+			if req.Checkpoint != nil {
+				w.Checkpoint = req.Checkpoint
+			}
+			seen := map[int64]bool{}
+			for _, id := range w.EvidenceIDs {
+				seen[id] = true
+			}
+			for _, id := range req.EvidenceIDs {
+				if !seen[id] {
+					w.EvidenceIDs = append(w.EvidenceIDs, id)
+					seen[id] = true
+				}
+			}
 			w.DeliveryFinalized, w.FinalText = true, req.Summary
 			w.ValidBatches = append([]kernel.EvidenceBatch(nil), batches...)
 			w.ResearchGain.Artifacts = max(w.ResearchGain.Artifacts, artifacts)
 		})
+		latest := t.Writes()
+		finalGain := latest.ResearchGain
+		finalGain.Assets = latest.Assets
 		harness.RequestCompletion(ctx, req.Summary)
-		return jsonResult(map[string]any{"delivery_status": req.Status, "checkpoint": req.Checkpoint, "research_gain": kernel.ResearchGain{}})
+		return jsonResult(map[string]any{"delivery_status": req.Status, "checkpoint": latest.Checkpoint, "research_gain": finalGain})
 	})
 }
 

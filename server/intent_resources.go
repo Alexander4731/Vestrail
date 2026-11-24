@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,12 +14,7 @@ import (
 )
 
 func sameCoverageScope(current, previous string) bool {
-	if strings.Join(strings.Fields(current), " ") == strings.Join(strings.Fields(previous), " ") {
-		return true
-	}
-	currentContext, currentBounded := kernel.PortScopeContext(current)
-	previousContext, previousBounded := kernel.PortScopeContext(previous)
-	return currentBounded && previousBounded && currentContext == previousContext
+	return kernel.SameCoverageScope(current, previous)
 }
 
 type intentResourceRequest struct {
@@ -40,10 +36,18 @@ func newIntentResourceTracker() *intentResourceTracker {
 	return &intentResourceTracker{held: map[int64]intentResourceRequest{}, waiting: map[int64]intentResourceRequest{}, changed: make(chan struct{})}
 }
 
+func normalizeResourceKey(taskID, resource string) string {
+	key := strings.ToLower(strings.TrimSpace(resource))
+	if key == "" || strings.HasPrefix(key, "channel:") || strings.HasPrefix(key, "proxy:") {
+		return key
+	}
+	return fmt.Sprintf("task:%s/%s", taskID, key)
+}
+
 func resourceRequest(taskID string, in *db.Node, expected string) intentResourceRequest {
 	r := intentResourceRequest{taskID: taskID, intentID: in.ID, priority: in.Priority, state: expected, locks: map[string]bool{}}
 	for _, lock := range intentScheduleInfoFromNode(in).ResourceLocks {
-		key := strings.ToLower(strings.TrimSpace(lock.Resource))
+		key := normalizeResourceKey(taskID, lock.Resource)
 		if key == "" {
 			continue
 		}
@@ -64,13 +68,15 @@ func requestsConflict(a, b intentResourceRequest) bool {
 	return false
 }
 
-func (p *intentResourceTracker) tryAcquire(r intentResourceRequest) bool {
+func (p *intentResourceTracker) tryAcquire(r intentResourceRequest, registerWaiter bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, held := p.held[r.intentID]; held {
 		return false
 	}
-	p.waiting[r.intentID] = r
+	if registerWaiter {
+		p.waiting[r.intentID] = r
+	}
 	for _, holder := range p.held {
 		if requestsConflict(r, holder) {
 			return false
@@ -159,10 +165,12 @@ func (e *Engine) pruneResourceWaiters(t *Task) {
 	}
 }
 
+var errIntentResourcesBusy = errors.New("intent resources are busy")
+
 // tryClaimIntent reserves the whole lane/resource set before the state CAS.
-func (e *Engine) tryClaimIntent(ctx context.Context, t *Task, in *db.Node, expected, owner string, terminal map[int64]bool) (bool, error) {
+func (e *Engine) tryClaimIntent(ctx context.Context, t *Task, in *db.Node, expected, owner string, activeIntentIDs map[int64]bool, registerWaiter bool) (bool, error) {
 	info := intentScheduleInfoFromNode(in)
-	if ok, _ := kernel.CanClaimIntent(info, nil, terminal); !ok {
+	if ok, _ := kernel.CanClaimIntent(info, nil, activeIntentIDs); !ok {
 		e.resources.forgetWaiting(in.ID)
 		return false, nil
 	}
@@ -171,9 +179,9 @@ func (e *Engine) tryClaimIntent(ctx context.Context, t *Task, in *db.Node, expec
 		e.resources.forgetWaiting(in.ID)
 		return false, nil
 	}
-	if !e.resources.tryAcquire(resourceRequest(t.ID, in, expected)) {
+	if !e.resources.tryAcquire(resourceRequest(t.ID, in, expected), registerWaiter) {
 		e.releaseLane(key, in.ID)
-		return false, nil
+		return false, errIntentResourcesBusy
 	}
 	claimed, err := t.Store.ClaimIntentSnapshot(ctx, in, expected, owner)
 	if err != nil || !claimed {
@@ -185,16 +193,16 @@ func (e *Engine) tryClaimIntent(ctx context.Context, t *Task, in *db.Node, expec
 	return true, nil
 }
 
-func (e *Engine) awaitIntentAdmission(ctx context.Context, t *Task, in *db.Node, expected, owner string) (*db.Node, error) {
-	admitted := false
-	defer func() {
-		if !admitted {
-			e.resources.forgetWaiting(in.ID)
-		}
-	}()
+var ErrTaskSettling = fmt.Errorf("任务正在收尾，停止接收新的执行")
+
+func (e *Engine) awaitIntentAdmission(ctx context.Context, t *Task, in *db.Node, expected, owner string, adHoc bool) (*db.Node, error) {
+	defer e.resources.forgetWaiting(in.ID)
 	for {
 		if ctx.Err() != nil {
 			return nil, context.Cause(ctx)
+		}
+		if !adHoc && e.isSettling(t.ID) {
+			return nil, ErrTaskSettling
 		}
 		changed := e.resources.change()
 		node, err := t.Store.GetNode(in.ID)
@@ -205,14 +213,13 @@ func (e *Engine) awaitIntentAdmission(ctx context.Context, t *Task, in *db.Node,
 			e.resources.forgetWaiting(in.ID)
 			return nil, fmt.Errorf("%w: 意图等待期间状态已变化", db.ErrIntentStateConflict)
 		}
-		deps, err := t.Store.TerminalIntentIDs(intentScheduleInfoFromNode(node).AfterIntents)
+		deps, err := t.Store.ActiveIntentIDs()
 		if err != nil {
 			return nil, err
 		}
-		if ok, err := e.tryClaimIntent(ctx, t, node, expected, owner, deps); err != nil {
+		if ok, err := e.tryClaimIntent(ctx, t, node, expected, owner, deps, true); err != nil && !errors.Is(err, errIntentResourcesBusy) {
 			return nil, err
 		} else if ok {
-			admitted = true
 			return node, nil
 		}
 		select {

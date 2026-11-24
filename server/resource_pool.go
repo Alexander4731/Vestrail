@@ -32,7 +32,7 @@ func sharedChannelCap() int {
 
 // acquire registers intentID on poolKey and returns the total cap, active worker
 // count, and per-worker concurrency budget together with a release closure (F21).
-func (p *channelPoolTracker) acquire(poolKey string, intentID int64) (capTotal, activeCount, workerBudget int, release func()) {
+func (p *channelPoolTracker) acquire(poolKey string, intentID int64, configuredWorkers ...int) (capTotal, activeCount, workerBudget int, release func()) {
 	if p == nil || strings.TrimSpace(poolKey) == "" {
 		return 0, 0, 0, func() {}
 	}
@@ -47,7 +47,11 @@ func (p *channelPoolTracker) acquire(poolKey string, intentID int64) (capTotal, 
 	p.mu.Unlock()
 
 	capTotal = sharedChannelCap()
-	workerBudget = kernel.WorkerConcurrencyBudget(capTotal, activeCount)
+	workers := activeCount
+	if len(configuredWorkers) > 0 {
+		workers = max(workers, configuredWorkers[0])
+	}
+	workerBudget = kernel.WorkerConcurrencyBudget(capTotal, workers)
 	var once sync.Once
 	release = func() {
 		once.Do(func() {
@@ -75,7 +79,7 @@ func (p *channelPoolTracker) poolKeyFor(taskID, proxyAddr string, intent *db.Nod
 	if strings.TrimSpace(proxyAddr) != "" {
 		return "proxy:" + strings.TrimSpace(proxyAddr)
 	}
-	return ""
+	return "task:" + taskID
 }
 
 func channelBudgetEnv(capTotal, activeCount, workerBudget int) []string {

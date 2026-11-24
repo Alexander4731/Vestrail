@@ -33,10 +33,15 @@ func enableNoa(opts *agentcore.Options, enabled func() bool, archiveRoot, sessio
 	if opts.OnWarn == nil {
 		opts.OnWarn = onWarn
 	}
+	win := 0
+	if opts.Compaction != nil {
+		win = opts.Compaction.ContextWindow
+	}
 	if err := noaadapter.Enable(opts, noaadapter.Options{
-		ArchiveBaseDir: filepath.Join(archiveRoot, "noa"),
-		SessionID:      sessionID,
-		OnWarn:         onWarn,
+		ModelContextLimit: win,
+		ArchiveBaseDir:    filepath.Join(archiveRoot, "noa"),
+		SessionID:         sessionID,
+		OnWarn:            onWarn,
 	}); err != nil {
 		if onWarn != nil {
 			onWarn("noa 压缩启用失败,回退内置压缩:" + err.Error())

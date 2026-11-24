@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"time"
 
 	"github.com/Alexander4731/Vestrail/kernel"
 )
@@ -24,6 +25,23 @@ CREATE TABLE IF NOT EXISTS intent_run_receipts (
 );
 CREATE INDEX IF NOT EXISTS idx_intent_run_receipts_lookup
     ON intent_run_receipts (exploration_id, intent_id, id DESC);
+
+DO $$ BEGIN
+ DELETE FROM intent_run_receipts r
+ WHERE NOT EXISTS (SELECT 1 FROM explorations e WHERE e.id=r.exploration_id)
+    OR NOT EXISTS (SELECT 1 FROM exploration_nodes n WHERE n.id=r.intent_id AND n.exploration_id=r.exploration_id AND n.kind='intent');
+ DELETE FROM intent_run_receipts r USING intent_run_receipts newer
+ WHERE r.exploration_id=newer.exploration_id AND r.intent_id=newer.intent_id AND r.run_seq=newer.run_seq AND r.id<newer.id;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='intent_run_receipts'::regclass AND conname='fk_receipts_exploration') THEN
+  ALTER TABLE intent_run_receipts ADD CONSTRAINT fk_receipts_exploration FOREIGN KEY(exploration_id) REFERENCES explorations(id) ON DELETE CASCADE;
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='intent_run_receipts'::regclass AND conname='fk_receipts_intent') THEN
+  ALTER TABLE intent_run_receipts ADD CONSTRAINT fk_receipts_intent FOREIGN KEY(intent_id) REFERENCES exploration_nodes(id) ON DELETE CASCADE;
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='intent_run_receipts'::regclass AND conname='uq_receipts_run') THEN
+  ALTER TABLE intent_run_receipts ADD CONSTRAINT uq_receipts_run UNIQUE(exploration_id,intent_id,run_seq);
+ END IF;
+END $$;
 `
 
 const intentReceiptInsertSQL = `
@@ -51,8 +69,19 @@ func (d *DB) SaveIntentReceipt(ctx context.Context, r kernel.RunReceipt) error {
 	if err != nil {
 		return err
 	}
-	_, err = d.ExecContext(ctx, intentReceiptInsertSQL, receiptArguments(r, raw)...)
-	return err
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var locked int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='intent' FOR UPDATE`, r.IntentID, r.ExplorationID).Scan(&locked); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, intentReceiptInsertSQL, receiptArguments(r, raw)...); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // LatestIntentReceipt returns the most recent RunReceipt persisted for (explorationID, intentID).
@@ -85,4 +114,60 @@ func (s *ExplorationStore) LatestIntentReceipt(ctx context.Context, intentID int
 		return nil, nil
 	}
 	return s.db.LatestIntentReceipt(ctx, s.expID, intentID)
+}
+
+// IntentRunReceipt combines the durable sequence with the original execution receipt.
+type IntentRunReceipt struct {
+	IntentID   int64
+	RunSeq     int
+	HasNetGain bool
+	CreatedAt  time.Time
+	Receipt    kernel.RunReceipt
+}
+
+func scanIntentRunReceipt(sc interface{ Scan(...any) error }) (IntentRunReceipt, error) {
+	var receipt IntentRunReceipt
+	var raw []byte
+	if err := sc.Scan(&receipt.IntentID, &receipt.RunSeq, &receipt.HasNetGain, &receipt.CreatedAt, &raw); err != nil {
+		return receipt, err
+	}
+	err := json.Unmarshal(raw, &receipt.Receipt)
+	return receipt, err
+}
+
+func (d *DB) IntentReceipts(ctx context.Context, explorationID, intentID int64) ([]IntentRunReceipt, error) {
+	rows, err := d.QueryContext(ctx, `SELECT intent_id,run_seq,has_net_gain,created_at,receipt_json FROM intent_run_receipts WHERE exploration_id=$1 AND intent_id=$2 ORDER BY run_seq DESC`, explorationID, intentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []IntentRunReceipt{}
+	for rows.Next() {
+		receipt, err := scanIntentRunReceipt(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, receipt)
+	}
+	return out, rows.Err()
+}
+
+func (d *DB) LatestIntentReceipts(ctx context.Context, ids []int64) (map[int64]IntentRunReceipt, error) {
+	out := map[int64]IntentRunReceipt{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := d.QueryContext(ctx, `SELECT DISTINCT ON(intent_id) intent_id,run_seq,has_net_gain,created_at,receipt_json FROM intent_run_receipts WHERE intent_id=ANY($1) ORDER BY intent_id,run_seq DESC`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		receipt, err := scanIntentRunReceipt(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[receipt.IntentID] = receipt
+	}
+	return out, rows.Err()
 }

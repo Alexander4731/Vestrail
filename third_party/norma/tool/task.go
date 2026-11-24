@@ -432,7 +432,10 @@ func (m *Manager) RunForeground(ctx context.Context, spec SpawnSpec, timeout tim
 		return t, false, "", nil
 	case <-ctx.Done():
 		m.Kill(t.ID)
-		<-t.done
+		select {
+		case <-t.done:
+		case <-time.After(5 * time.Second):
+		}
 		out, _ := m.Output(t.ID, 0)
 		return t, false, out, ctx.Err()
 	}

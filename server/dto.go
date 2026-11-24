@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
@@ -177,29 +179,45 @@ func trafficDTOs(ex []traffic.ExchangeMeta) []TrafficExchangeDTO {
 
 // ---- TaskNode (frontend "TaskNode") — frontier, intents, exploration graph nodes ----
 
+type IntentReceiptSummaryDTO struct {
+	RunSeq          int                    `json:"run_seq"`
+	DeliveryStatus  kernel.DeliveryStatus  `json:"delivery_status"`
+	TerminationCode kernel.TerminationCode `json:"termination_code"`
+	HasNetGain      bool                   `json:"has_net_gain"`
+	ResearchGain    *kernel.ResearchGain   `json:"research_gain,omitempty"`
+	Checkpoint      *kernel.Checkpoint     `json:"checkpoint,omitempty"`
+}
+
+func intentReceiptSummaryDTO(record db.IntentRunReceipt) IntentReceiptSummaryDTO {
+	return IntentReceiptSummaryDTO{RunSeq: record.RunSeq, DeliveryStatus: record.Receipt.DeliveryStatus, TerminationCode: record.Receipt.TerminationCode, HasNetGain: record.HasNetGain, ResearchGain: record.Receipt.ResearchGain, Checkpoint: record.Receipt.Checkpoint}
+}
+
 type TaskNodeDTO struct {
-	ID           string `json:"id"`
-	Type         string `json:"type"` // db Node.Kind
-	Payload      string `json:"payload,omitempty"`
-	Priority     int    `json:"priority"`
-	State        string `json:"state"`
-	Origin       string `json:"origin"`
-	TS           string `json:"ts"`
-	SourceTaskID string `json:"source_task_id,omitempty"`
-	Inherited    bool   `json:"inherited,omitempty"`
-	DeleteReason string `json:"delete_reason,omitempty"` // 意图假删除(state='deleted')时的删除原因
+	BlockedReason string                   `json:"blocked_reason,omitempty"`
+	LatestReceipt *IntentReceiptSummaryDTO `json:"latest_receipt,omitempty"`
+	ID            string                   `json:"id"`
+	Type          string                   `json:"type"` // db Node.Kind
+	Payload       string                   `json:"payload,omitempty"`
+	Priority      int                      `json:"priority"`
+	State         string                   `json:"state"`
+	Origin        string                   `json:"origin"`
+	TS            string                   `json:"ts"`
+	SourceTaskID  string                   `json:"source_task_id,omitempty"`
+	Inherited     bool                     `json:"inherited,omitempty"`
+	DeleteReason  string                   `json:"delete_reason,omitempty"` // 意图假删除(state='deleted')时的删除原因
 }
 
 func taskNodeDTO(n *db.Node) TaskNodeDTO {
 	d := TaskNodeDTO{
-		ID:           i64s(n.ID),
-		Type:         n.Kind,
-		Payload:      rawString(n.Payload),
-		DeleteReason: n.DeleteReason,
-		Priority:     n.Priority,
-		State:        n.State,
-		Origin:       n.Origin,
-		TS:           rfc3339(n.CreatedAt),
+		ID:            i64s(n.ID),
+		Type:          n.Kind,
+		Payload:       rawString(n.Payload),
+		DeleteReason:  n.DeleteReason,
+		BlockedReason: n.BlockedReason,
+		Priority:      n.Priority,
+		State:         n.State,
+		Origin:        n.Origin,
+		TS:            rfc3339(n.CreatedAt),
 	}
 	if n.SourceTaskID > 0 {
 		d.SourceTaskID = i64s(n.SourceTaskID)
@@ -672,6 +690,34 @@ func idStrings(in []int64) []string {
 	out := make([]string, 0, len(in))
 	for _, v := range in {
 		out = append(out, i64s(v))
+	}
+	return out
+}
+
+// taskNodeDTOs loads all visible intent receipt summaries in one query.
+func (s *Server) taskNodeDTOs(nodes []*db.Node) []TaskNodeDTO {
+	out := taskNodeDTOs(nodes)
+	if s.m == nil || s.m.pg == nil {
+		return out
+	}
+	var ids []int64
+	for _, node := range nodes {
+		if node.Kind == db.KindIntent {
+			ids = append(ids, node.ID)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	receipts, err := s.m.pg.LatestIntentReceipts(ctx, ids)
+	if err != nil {
+		log.Printf("[intents] latest receipts: %v", err)
+		return out
+	}
+	for i, node := range nodes {
+		if record, ok := receipts[node.ID]; ok {
+			summary := intentReceiptSummaryDTO(record)
+			out[i].LatestReceipt = &summary
+		}
 	}
 	return out
 }

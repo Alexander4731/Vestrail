@@ -246,7 +246,7 @@ func TestEnableAppendsResidentPromptOnly(t *testing.T) {
 	if err := Enable(&opts, Options{ArchiveBaseDir: t.TempDir(), SessionID: "s"}); err != nil {
 		t.Fatalf("Enable: %v", err)
 	}
-	prompt := strings.Join(opts.AppendSystemPrompt, "\n")
+	prompt := strings.Join(opts.SystemPrompt, "\n")
 	for _, want := range []string{"NOA TAGS", "COMPRESSION SUMMARIES IN CONTEXT", "THE ARCHIVE"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("resident prompt is missing %q", want)

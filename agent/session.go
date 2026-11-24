@@ -48,7 +48,7 @@ func completeToolTurn(ctx context.Context, stream iter.Seq2[llm.StreamEvent, err
 			// forwarding any tool input or a successful stop reason to the SDK.
 			for _, ev := range pending {
 				if ev.Type == llm.SEMessageStart || ev.Type == llm.SEMessageDelta {
-					if !yield(llm.StreamEvent{Type: llm.SEMessageDelta, Usage: ev.Usage}, nil) {
+					if !yield(llm.StreamEvent{Type: llm.SEMessageDelta, Usage: ev.Usage, CumulativeUsage: ev.CumulativeUsage}, nil) {
 						return
 					}
 				}
@@ -84,9 +84,10 @@ func completeToolTurn(ctx context.Context, stream iter.Seq2[llm.StreamEvent, err
 		}
 		// Validate the whole batch before dispatching its first call. The SDK
 		// otherwise replaces malformed/truncated arguments with an empty object.
-		var input strings.Builder
+		buffers := map[int]*strings.Builder{}
+		var order []int
+		lastIdx := -1
 		callIDs := map[string]bool{}
-		validate := func() bool { return input.Len() == 0 || json.Valid([]byte(input.String())) }
 		for _, ev := range pending {
 			switch ev.Type {
 			case llm.SEToolUseStart:
@@ -95,18 +96,31 @@ func completeToolTurn(ctx context.Context, stream iter.Seq2[llm.StreamEvent, err
 					return
 				}
 				callIDs[ev.ToolID] = true
-				if !validate() {
-					fail(fmt.Errorf("model returned incomplete or invalid tool arguments"))
+				idx := ev.ToolIndex
+				if !ev.ToolIndexSet {
+					idx = len(order)
+				}
+				if buffers[idx] != nil {
+					fail(fmt.Errorf("model returned a duplicate tool call index"))
 					return
 				}
-				input.Reset()
+				buffers[idx] = &strings.Builder{}
+				order = append(order, idx)
+				lastIdx = idx
 			case llm.SEToolInputJSON:
-				input.WriteString(ev.Text)
+				if ev.ToolIndexSet && buffers[ev.ToolIndex] != nil {
+					buffers[ev.ToolIndex].WriteString(ev.Text)
+				} else if lastIdx >= 0 {
+					buffers[lastIdx].WriteString(ev.Text)
+				}
 			}
 		}
-		if !validate() {
-			fail(fmt.Errorf("model returned incomplete or invalid tool arguments"))
-			return
+		for _, idx := range order {
+			b := buffers[idx]
+			if b.Len() > 0 && !json.Valid([]byte(b.String())) {
+				fail(fmt.Errorf("model returned incomplete or invalid tool arguments"))
+				return
+			}
 		}
 		for _, ev := range pending {
 			if !yield(ev, nil) {

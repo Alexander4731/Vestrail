@@ -57,7 +57,7 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 		case "add_hint", "add_task_hint":
 			note = "\n交接已确认漏洞时，在对应提示的 traffic_refs 中保留已核实流量的 ID、用途、说明和顺序（单条放顶层，批量放对应 hints 元素），并在 text 中说明它证明的具体漏洞。调用方不能只交接文字而丢弃已有流量引用。未核实的候选不能作为证据传递。"
 		case "get_finding_traffic", "bind_finding_traffic", "list_findings", "list_task_findings", "node_detail", "get_task_node_detail", "update_finding_report":
-			note = findingIDGuidance
+			note = "\n漏洞编号字段遵循系统提示中的漏洞编号约定。"
 		}
 		if note != "" {
 			out[i] = DecorateTool(tool, tool.Description()+note, tool.InputSchema())

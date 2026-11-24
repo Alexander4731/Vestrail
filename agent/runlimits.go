@@ -117,7 +117,7 @@ func resumeSession(s *agentcore.Session, id string) error {
 }
 
 var finalPlannerAllowed = map[string]bool{
-	"graph_overview": true, "list_goals": true, "list_facts": true,
+	"graph_overview": true, "list_goals": true, "list_facts": true, "node_detail": true, "expand_digest": true,
 	"list_findings": true, "get_worker_output": true, "get_worker_trace": true,
 	"search_all_worker_traces": true, "prove_goal": true, "goal_met": true,
 }
@@ -128,7 +128,10 @@ func (h finalPlannerHooks) PreToolUse(ctx context.Context, name string, input []
 	if !finalPlannerAllowed[name] {
 		return true, "终局判定仅允许读取证据和确认目标", nil
 	}
-	return h.HookRunner.PreToolUse(ctx, name, input)
+	if h.HookRunner != nil {
+		return h.HookRunner.PreToolUse(ctx, name, input)
+	}
+	return false, "", nil
 }
 
 func finalPlannerTools(tools []actool.CoreTool) []actool.CoreTool {

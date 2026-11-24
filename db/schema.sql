@@ -1457,3 +1457,10 @@ DO $$ BEGIN
 END $$;
 
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS omit_thought_signatures BOOLEAN NOT NULL DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_act_node_tool_result
+ ON activity (exploration_id, node_id, id DESC) WHERE kind='tool_result';
+
+CREATE INDEX IF NOT EXISTS idx_expnodes_evidence_key
+ ON exploration_nodes (exploration_id, (payload->>'evidence_key'))
+ WHERE kind IN ('fact','finding') AND state <> 'deleted' AND payload ? 'evidence_key';

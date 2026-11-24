@@ -57,6 +57,7 @@ type taskLLMRuntime struct {
 type taskLLMError struct {
 	taskID         string
 	chainExhausted bool
+	noWorkerReplay bool
 	cause          error
 }
 
@@ -72,6 +73,11 @@ func (e *taskLLMError) Unwrap() error { return e.cause }
 func isTaskLLMRuntimeError(err error) bool {
 	var target *taskLLMError
 	return errors.As(err, &target)
+}
+
+func isNoWorkerReplayError(err error) bool {
+	var target *taskLLMError
+	return errors.As(err, &target) && target.noWorkerReplay
 }
 
 func isTaskLLMChainExhausted(err error) bool {
@@ -129,7 +135,7 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	}
 	if len(pt.LLMProfileIDs) > 0 {
 		if pt.ActiveLLMProfileID == nil {
-			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
+			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, noWorkerReplay: true, cause: errors.New("all selected profiles are quota exhausted")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
 		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
@@ -295,7 +301,7 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 			hooks.transition(selection, transition, callErr)
 		}
 		if !transition.Stale && transition.NextProfileID == nil {
-			return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
+			return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, noWorkerReplay: true, cause: callErr}
 		}
 		// 没有任何输出交付给调用方,换下一个 profile 重放同一逻辑请求是安全的。
 	}
@@ -388,7 +394,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 					// Output may already have driven tool execution. Report the persistence
 					// failure, but classify it as router-handled so the worker does not
 					// replay the entire intent and duplicate those side effects.
-					yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, cause: cause})
+					yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, noWorkerReplay: true, cause: cause})
 				} else {
 					yield(llm.StreamEvent{}, cause)
 				}
@@ -398,7 +404,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				hooks.transition(selection, transition, streamErr)
 			}
 			if committed || (!transition.Stale && transition.NextProfileID == nil) {
-				yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: streamErr})
+				yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, noWorkerReplay: true, cause: streamErr})
 				return
 			}
 			// No event reached the caller, so replaying the same logical request on

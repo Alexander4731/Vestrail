@@ -254,6 +254,10 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				var id int64
 				var err error
 
+				svcIP := item.ServiceIP
+				if svcIP == "" {
+					svcIP = item.IP
+				}
 				switch typ {
 				case "root_domain":
 					id, err = t.as.UpsertRootDomain(db.UpsertRootDomainReq{
@@ -294,10 +298,6 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					// distinguish HTTP vs other by presence of url
 					if item.URL != "" {
 						// agent may send "ip" or "service_ip" for the enrichment IP; accept both
-						svcIP := item.ServiceIP
-						if svcIP == "" {
-							svcIP = item.IP
-						}
 						id, err = t.as.UpsertHTTPService(db.UpsertHTTPServiceReq{
 							URL:           item.URL,
 							Technologies:  item.Technologies,
@@ -325,7 +325,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 						URL:    item.URL,
 						Method: item.Method,
 						Params: item.Params,
-						IP:     item.ServiceIP,
+						IP:     svcIP,
 						TaskID: taskID,
 					})
 

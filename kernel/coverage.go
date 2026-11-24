@@ -9,17 +9,21 @@ import (
 
 type coverageInterval struct{ start, end int64 }
 
+type scopeKey struct {
+	scope, target, method, pre, batchKey string
+}
+
 // CoverageTracker counts accepted object-set increments, independent of batch
 // labels. Sparse partial ranges need explicit coverage evidence and remain
 // uncredited until their actual covered slice is known.
 type CoverageTracker struct {
 	scope  string
-	ranges map[string][]coverageInterval
-	scopes map[string]int64
+	ranges map[scopeKey][]coverageInterval
+	scopes map[scopeKey]int64
 }
 
 func NewCoverageTracker(scope string) *CoverageTracker {
-	return &CoverageTracker{scope: scope, ranges: map[string][]coverageInterval{}, scopes: map[string]int64{}}
+	return &CoverageTracker{scope: scope, ranges: map[scopeKey][]coverageInterval{}, scopes: map[scopeKey]int64{}}
 }
 
 func (t *CoverageTracker) Seed(batches []EvidenceBatch) {
@@ -28,19 +32,25 @@ func (t *CoverageTracker) Seed(batches []EvidenceBatch) {
 	}
 }
 
-// CoversRange requires continuous coverage for every observed target/method group.
+// CoversRange requires a complete method for each observed scope and target.
 func (t *CoverageTracker) CoversRange(start, end int64) bool {
-	if len(t.ranges) == 0 {
-		return false
-	}
-	for _, ranges := range t.ranges {
-		covered := false
+	groups := map[[2]string]bool{}
+	for key, ranges := range t.ranges {
+		group := [2]string{key.scope, key.target}
+		if _, seen := groups[group]; !seen {
+			groups[group] = false
+		}
 		for _, r := range ranges {
 			if r.start <= start && r.end >= end {
-				covered = true
+				groups[group] = true
 				break
 			}
 		}
+	}
+	if len(groups) == 0 {
+		return false
+	}
+	for _, covered := range groups {
 		if !covered {
 			return false
 		}
@@ -56,10 +66,22 @@ func (t *CoverageTracker) Add(b EvidenceBatch) int64 {
 	if scope == "" {
 		scope = strings.TrimSpace(b.Scope)
 	}
-	identity := strings.Join([]string{scope, strings.ToLower(strings.TrimSpace(b.Target)), strings.ToLower(strings.TrimSpace(b.Method)), strings.TrimSpace(b.Precondition)}, "\x00")
+	identity := scopeKey{
+		scope:  strings.ToLower(strings.Join(strings.Fields(scope), " ")),
+		target: strings.ToLower(strings.TrimSpace(b.Target)),
+		method: strings.ToLower(strings.TrimSpace(b.Method)),
+		pre:    strings.TrimSpace(b.Precondition),
+	}
 	if b.RangeStart == 0 && b.RangeEnd == 0 {
 		if scope == "" {
 			return 0
+		}
+		identity.batchKey = b.BatchKey
+		if identity.batchKey == "" {
+			identity.batchKey = b.Scope
+		}
+		if identity.batchKey == "" {
+			identity.batchKey = b.ArtifactPath
 		}
 		if _, seen := t.scopes[identity]; seen {
 			return 0

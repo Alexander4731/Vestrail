@@ -128,14 +128,45 @@ func TestProxyEnforcesActualSharedRequestCapacity(t *testing.T) {
 }
 
 func TestCancelledRequestDoesNotConsumeSlot(t *testing.T) {
-	traffic := &Traffic{requestSlots: make(chan struct{}, 1), closed: make(chan struct{})}
-	traffic.requestSlots <- struct{}{}
+	traffic := &Traffic{requestCap: 1, closed: make(chan struct{})}
+	release, ok := traffic.acquireRequest(t.Context(), "fixture:80", false)
+	if !ok {
+		t.Fatal("fixture capacity unavailable")
+	}
+	defer release()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if traffic.acquireRequest(ctx) {
+	if _, ok := traffic.acquireRequest(ctx, "fixture:80", false); ok {
 		t.Fatal("cancelled request admitted")
 	}
-	if len(traffic.requestSlots) != 1 {
-		t.Fatal("existing slot was released")
+	if len(traffic.requestBuckets["fixture:80"].slots) != 1 {
+		t.Fatal("existing slot released")
+	}
+}
+
+func TestRequestBucketsAndTunnelsAreIndependent(t *testing.T) {
+	traffic := &Traffic{requestCap: 1, closed: make(chan struct{})}
+	release, ok := traffic.acquireRequest(t.Context(), "host-a:80", false)
+	if !ok {
+		t.Fatal("first host rejected")
+	}
+	defer release()
+	other, ok := traffic.acquireRequest(t.Context(), "host-b:80", false)
+	if !ok {
+		t.Fatal("independent host blocked")
+	}
+	other()
+	tunnel, ok := traffic.acquireRequest(t.Context(), "host-a:80", true)
+	if !ok {
+		t.Fatal("tunnel blocked by HTTP request")
+	}
+	tunnel()
+	release()
+	if len(traffic.requestBuckets) != 0 {
+		t.Fatal("idle buckets retained")
+	}
+	close(traffic.closed)
+	if _, ok := traffic.acquireRequest(t.Context(), "host-a:80", true); ok {
+		t.Fatal("closed proxy admitted tunnel")
 	}
 }

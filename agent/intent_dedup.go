@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/Alexander4731/Vestrail/db"
@@ -75,6 +76,12 @@ func (t *ToolSet) checkIntentDuplicate(in intentItem) error {
 			}
 			if receipt != nil && receipt.HasNetGain() && continuationCoversRemaining(in.Scope, receipt) {
 				return nil
+			}
+			if (receipt == nil || !receipt.HasNetGain()) && strings.TrimSpace(in.Scope) != "" {
+				var previous intentItem
+				if json.Unmarshal(up.Payload, &previous) == nil && !kernel.SameCoverageScope(in.Scope, previous.Scope) {
+					return nil
+				}
 			}
 			if receipt != nil && receipt.HasNetGain() {
 				return fmt.Errorf("意图 #%d 接力须限定 checkpoint.remaining_scope 的未完成部分；重新验证已覆盖范围须提供新证据", contID)

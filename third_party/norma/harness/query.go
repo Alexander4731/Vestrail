@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"iter"
 	"strconv"
@@ -248,9 +249,10 @@ type loop struct {
 	startTime       time.Time // loop start, for MaxDuration (wall-clock budget)
 
 	// settlement (wrap-up) phase state, entered when a budget is hit
-	settling     bool
-	settleReason TerminalReason // the budget reason to finish with after wrap-up
-	settleTurn   int
+	disabledTools map[string]bool
+	settling      bool
+	settleReason  TerminalReason // the budget reason to finish with after wrap-up
+	settleTurn    int
 
 	// recovery / continuation state
 	maxOutputTokensOverride      int
@@ -469,7 +471,11 @@ func (l *loop) run() {
 
 		// Non-destructive proactive compaction (MicroCompact → AutoCompact).
 		if l.in.Compactor != nil {
+			previousBoundary := llm.LastBoundaryIndex(l.messages)
 			l.messages = l.in.Compactor.Pre(l.modelCallContext(), l.messages, l.lastInputTokens)
+			if llm.LastBoundaryIndex(l.messages) != previousBoundary {
+				l.lastInputTokens = 0
+			}
 			l.recordNewBoundary()
 		}
 		if !l.settling && l.exploreCtx != nil && l.exploreCtx.Err() != nil {
@@ -520,6 +526,7 @@ func (l *loop) run() {
 				l.hasAttemptedReactiveCompact = true
 				if msgs, ok := l.in.Compactor.Reactive(l.modelCallContext(), l.messages); ok {
 					l.messages = msgs
+					l.lastInputTokens = 0
 					l.recordNewBoundary()
 					l.lastContinue = ContinueReactiveCompactRetry
 					continue
@@ -719,7 +726,7 @@ func (l *loop) settleMaxTurns() int {
 }
 
 // beginSettlement enters the wrap-up phase when configured: injects the caller's
-// prompt as a user turn and hides DisabledTools, so a budget-terminated run can
+// prompt as a user turn and disables execution of DisabledTools, so a run can
 // checkpoint its findings. Returns false when no settlement is configured (caller
 // then finishes immediately).
 func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema) bool {
@@ -737,8 +744,9 @@ func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema)
 	l.settling = true
 	l.settleReason = reason
 	l.settleTurn = 0
-	if len(s.DisabledTools) > 0 {
-		*schemas = filterToolSchemas(*schemas, s.DisabledTools)
+	l.disabledTools = make(map[string]bool, len(s.DisabledTools))
+	for _, name := range s.DisabledTools {
+		l.disabledTools[name] = true
 	}
 	return true
 }
@@ -929,6 +937,14 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		return l.completeAndExecute(req)
 	}
 	exec = newStreamExec(l)
+	defer func() {
+		if err != nil || consumerStopped || aborted {
+			exec.abortAndWait()
+		} else {
+			exec.cancel()
+			exec.wg.Wait()
+		}
+	}()
 	acc := llm.NewAccumulator()
 
 	var indexedTools bool
@@ -993,14 +1009,14 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		}
 		acc.Add(ev)
 	}
-	if !finalizeTool() {
-		return asst, exec, "", nil, true, false
-	}
 	l.usage.Add(acc.Usage)
 	asst = acc.Message()
 	stopReason = acc.StopReason
 	if err != nil {
 		return asst, exec, stopReason, err, false, false
+	}
+	if !finalizeTool() {
+		return asst, exec, stopReason, nil, true, false
 	}
 	if indexedTools {
 		for _, block := range asst.Content {
@@ -1033,6 +1049,14 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 // emission, and recorder all see identical numbers.
 func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	exec = newStreamExec(l)
+	defer func() {
+		if err != nil || consumerStopped || aborted {
+			exec.abortAndWait()
+		} else {
+			exec.cancel()
+			exec.wg.Wait()
+		}
+	}()
 	msg, sr, usage, cerr := l.deps.CallModelSync(l.modelCallContext(), req)
 	if cerr != nil {
 		return asst, exec, "", cerr, false, false
@@ -1069,34 +1093,4 @@ func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, 
 	return asst, exec, stopReason, nil, false, ab
 }
 
-func jsonValid(s string) bool {
-	// minimal check used only to guard tool input assembly
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
-	}
-	depth := 0
-	inStr := false
-	esc := false
-	for _, r := range s {
-		if inStr {
-			if esc {
-				esc = false
-			} else if r == '\\' {
-				esc = true
-			} else if r == '"' {
-				inStr = false
-			}
-			continue
-		}
-		switch r {
-		case '"':
-			inStr = true
-		case '{', '[':
-			depth++
-		case '}', ']':
-			depth--
-		}
-	}
-	return depth == 0 && !inStr
-}
+func jsonValid(s string) bool { return json.Valid([]byte(s)) }

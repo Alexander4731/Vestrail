@@ -151,6 +151,7 @@ func runScript(ctx context.Context, raw json.RawMessage, tc *actool.ToolContext)
 	if err := root.WriteFile(in.Path, []byte(in.Content), 0o700); err != nil {
 		return actool.Errorf(err.Error()), nil
 	}
+	_ = root.Close()
 	if ctx.Err() != nil {
 		return actool.Errorf("脚本已保存，执行已取消"), nil
 	}
@@ -162,6 +163,7 @@ func runScript(ctx context.Context, raw json.RawMessage, tc *actool.ToolContext)
 	if task == nil {
 		return actool.Errorf("脚本已保存，启动失败：" + fmt.Sprint(runErr)), nil
 	}
+	defer tc.Tasks.Forget(task.ID)
 	if !finished {
 		tc.Tasks.Kill(task.ID)
 		select {
@@ -182,7 +184,6 @@ func runScript(ctx context.Context, raw json.RawMessage, tc *actool.ToolContext)
 		return actool.Errorf("脚本已退出，但完整输出读取失败：" + err.Error()), nil
 	}
 	output = string(fullOutput)
-	tc.Tasks.Forget(task.ID)
 	if runErr == nil && info.Status != actool.TaskFailed {
 		if preview, merged := kernel.CompactBatchOutput(output); len(output) > 4096 && merged {
 			output = actool.CapturePreview(tc, output, preview)

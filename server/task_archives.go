@@ -241,11 +241,12 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		log.Printf("[task-archive] task %s: %s", taskID, warning)
 		_ = s.m.pg.AppendTaskArchiveWarning(job.ID, warning)
 	}
+	s.m.forgetTask(taskID, job.TaskID)
 	s.engine.StopTask(taskID)
 	s.taskAgentMu.Lock()
 	delete(s.taskAgents, taskID)
 	s.taskAgentMu.Unlock()
-	s.m.forgetTask(taskID, job.TaskID)
+	go s.reconcileConcurrency()
 	return nil
 }
 

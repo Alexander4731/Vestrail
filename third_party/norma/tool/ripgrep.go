@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Ripgrep integration: the Grep tool prefers the ripgrep binary when available
@@ -51,7 +53,7 @@ func resolveRipgrep() string {
 	if p, err := exec.LookPath("rg"); err == nil {
 		return p
 	}
-	if os.Getenv("NORMA_RIPGREP_NO_INSTALL") != "" {
+	if os.Getenv("VESTRAIL_AUTO_INSTALL_RG") != "1" || os.Getenv("NORMA_RIPGREP_NO_INSTALL") != "" {
 		return ""
 	}
 	return installRipgrepViaNpm()
@@ -61,20 +63,22 @@ func installRipgrepViaNpm() string {
 	if _, err := exec.LookPath("npm"); err != nil {
 		return "" // no npm → Go fallback
 	}
-	cmd := exec.Command("npm", "install", "-g", "@vscode/ripgrep")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "npm", "install", "-g", "@vscode/ripgrep")
 	if err := cmd.Run(); err != nil {
 		return ""
 	}
 	if p, err := exec.LookPath("rg"); err == nil {
 		return p
 	}
-	return npmGlobalRipgrep()
+	return npmGlobalRipgrep(ctx)
 }
 
 // npmGlobalRipgrep locates the rg binary vendored by @vscode/ripgrep in the npm
 // global root (it exposes no `rg` command, so we resolve the path directly).
-func npmGlobalRipgrep() string {
-	out, err := exec.Command("npm", "root", "-g").Output()
+func npmGlobalRipgrep(ctx context.Context) string {
+	out, err := exec.CommandContext(ctx, "npm", "root", "-g").Output()
 	if err != nil {
 		return ""
 	}
@@ -102,7 +106,7 @@ type ripgrepReq struct {
 // runWithRipgrep runs the query through the rg binary and formats the result.
 // Returns ok=false when rg failed for a real reason (not "no matches"), so the
 // caller falls back to the Go implementation.
-func runWithRipgrep(rg string, r ripgrepReq, tc *ToolContext) (Result, bool) {
+func runWithRipgrep(ctx context.Context, rg string, r ripgrepReq, tc *ToolContext) (Result, bool) {
 	args := []string{"--color", "never"}
 	if r.ignoreCase {
 		args = append(args, "-i")
@@ -145,7 +149,7 @@ func runWithRipgrep(rg string, r ripgrepReq, tc *ToolContext) (Result, bool) {
 	// `-e pattern --` keeps a pattern/path starting with '-' from being read as a flag.
 	args = append(args, "-e", r.pattern, "--", target)
 
-	cmd := exec.Command(rg, args...)
+	cmd := exec.CommandContext(ctx, rg, args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {

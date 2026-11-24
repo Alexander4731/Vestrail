@@ -1270,6 +1270,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const isMain = active.role === "mainagent";
   const isPlanner = active.role === "planner";
   const isSystem = active.role === "system";
+  const activeIntent = active.intent_id ? allIntents.find((intent) => intent.id === active.intent_id) : undefined;
+  const activeReceipt = activeIntent?.latest_receipt;
   const activeKey = keyForSession(active);
   const activeState = store[activeKey];
   // A main turn is serialized per task (chat lock), so "busy" is task-wide: while any
@@ -1737,6 +1739,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           label={active.role === "worker" ? `Worker #${active.intent_id} · ${activeDisplayTitle}` : activeDisplayTitle}
         >
           <div className="flex min-h-0 flex-1 min-w-0 flex-col overflow-hidden rounded-lg border bg-card">
+            {activeIntent?.blocked_reason && <p role="status" className="border-b px-3 py-2 text-sm text-amber-700 break-words dark:text-amber-400">{activeIntent.blocked_reason}</p>}
             <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-2 sm:px-4 sm:py-2.5">
               {(() => {
                 const isWorker = active.role === "worker";
@@ -1756,6 +1759,42 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                   titleEl
                 );
               })()}
+              {activeReceipt && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Badge variant="outline">
+                      {({
+                        complete: "已完成",
+                        partial_checkpoint: "部分交付",
+                        precondition_blocked: "前提阻塞",
+                        handed_back: "已交回",
+                        "": "未提交交付",
+                      } as Record<string, string>)[activeReceipt.delivery_status] ?? (activeReceipt.delivery_status || "未提交交付")} · 第 {activeReceipt.run_seq} 次
+                    </Badge>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-sm space-y-1">
+                    <div>{activeReceipt.termination_code || "unknown"} · {activeReceipt.has_net_gain ? "有新增结果" : "无新增结果"}</div>
+                    {activeReceipt.checkpoint?.remaining_scope && (
+                      <div className="text-xs opacity-90">剩余范围：{activeReceipt.checkpoint.remaining_scope}</div>
+                    )}
+                    {activeReceipt.checkpoint?.next_action && (
+                      <div className="text-xs opacity-90">下一步：{activeReceipt.checkpoint.next_action}</div>
+                    )}
+                  </TooltipContent>
+                </Tooltip>
+              )}
+              {activeIntent && !active.inherited && ["blocked", "exhausted", "stopped"].includes(activeIntent.state) && (
+                <Button size="sm" variant="outline" disabled={controllingIntent === activeIntent.id} onClick={async () => {
+                  setControllingIntent(activeIntent.id);
+                  try {
+                    await api.rerunIntent(taskId, activeIntent.id);
+                    patchIntentState(activeIntent.id, "open");
+                    toast.success("已重开意图，等待领取");
+                  } catch (error) {
+                    toast.error(error instanceof Error ? error.message : "重跑失败");
+                  } finally { setControllingIntent(null); }
+                }}><RotateCwIcon className="size-3.5" />重跑</Button>
+              )}
               <SideQuestionButton side={side} />
               {activeResolution && (
                 <Tooltip>

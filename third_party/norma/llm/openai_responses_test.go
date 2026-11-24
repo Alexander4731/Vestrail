@@ -172,3 +172,50 @@ func event(name, data string) string { return "event: " + name + "\ndata: " + da
 
 // sse2 joins named SSE frames into one response body.
 func sse2(frames ...string) string { return strings.Join(frames, "\n") + "\n" }
+
+func TestResponsesStreamEmitsMessageStopAndOverflowError(t *testing.T) {
+	for _, terminal := range []string{"response.completed", "response.incomplete"} {
+		t.Run(terminal, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Write([]byte(sse2(event(terminal, `{"response":{"usage":{"input_tokens":10}}}`))))
+			}))
+			defer srv.Close()
+			p := &openaiResponsesProvider{cfg: Config{BaseURL: srv.URL}}
+			var kinds []string
+			for ev, err := range p.Stream(t.Context(), CompletionRequest{}) {
+				if err != nil {
+					t.Fatal(err)
+				}
+				kinds = append(kinds, string(ev.Type))
+			}
+			if len(kinds) != 2 || kinds[0] != string(SEMessageDelta) || kinds[1] != string(SEMessageStop) {
+				t.Fatalf("events=%v", kinds)
+			}
+		})
+	}
+	_, _, err := parseResponsesFrame("response.failed", `{"response":{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}},"error":{"message":"fallback"}}`)
+	if err == nil || !strings.Contains(err.Error(), "maximum context length exceeded") {
+		t.Fatalf("overflow error=%v", err)
+	}
+}
+
+func TestResponsesParallelOutputIndex(t *testing.T) {
+	acc := NewAccumulator()
+	for _, frame := range []struct{ event, data string }{
+		{"response.output_item.added", `{"output_index":3,"item":{"type":"function_call","call_id":"a","name":"Probe"}}`},
+		{"response.function_call_arguments.delta", `{"output_index":3,"delta":"{\"a\":"}`},
+		{"response.output_item.added", `{"output_index":5,"item":{"type":"function_call","call_id":"b","name":"Probe"}}`},
+		{"response.function_call_arguments.delta", `{"output_index":5,"delta":"{}"}`},
+		{"response.function_call_arguments.delta", `{"output_index":3,"delta":"1}"}`},
+	} {
+		ev, ok, err := parseResponsesFrame(frame.event, frame.data)
+		if err != nil || !ok || !ev.ToolIndexSet {
+			t.Fatalf("event=%+v ok=%v err=%v", ev, ok, err)
+		}
+		acc.Add(ev)
+	}
+	calls := acc.Message().ToolUses()
+	if len(calls) != 2 || string(calls[0].Input) != `{"a":1}` || string(calls[1].Input) != `{}` {
+		t.Fatalf("calls=%+v", calls)
+	}
+}

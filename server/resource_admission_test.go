@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,7 @@ func TestExclusiveResourceHasOneConcurrentOwner(t *testing.T) {
 		go func(id int64) {
 			defer wg.Done()
 			<-start
-			if p.tryAcquire(intentResourceRequest{intentID: id, taskID: "task", priority: 5, locks: map[string]bool{"resource": true}}) {
+			if p.tryAcquire(intentResourceRequest{intentID: id, taskID: "task", priority: 5, locks: map[string]bool{"resource": true}}, true) {
 				owners.Add(1)
 			}
 		}(id)
@@ -54,7 +55,7 @@ func TestResourceClaimFindsRunnableIntentAfterBlockedPage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if !e.resources.tryAcquire(intentResourceRequest{intentID: -1, taskID: "other", locks: map[string]bool{"channel:fixture": true}}) {
+	if !e.resources.tryAcquire(intentResourceRequest{intentID: -1, taskID: "other", locks: map[string]bool{"channel:fixture": true}}, true) {
 		t.Fatal("fixture reservation failed")
 	}
 	defer e.resources.release(-1)
@@ -114,8 +115,8 @@ func TestConcurrentResourceAndStateClaimHasOneWinner(t *testing.T) {
 			defer wg.Done()
 			copy := *node
 			<-start
-			won, err := e.tryClaimIntent(t.Context(), task, &copy, "open", fmt.Sprint(i), nil)
-			if err != nil {
+			won, err := e.tryClaimIntent(t.Context(), task, &copy, "open", fmt.Sprint(i), nil, true)
+			if err != nil && !errors.Is(err, errIntentResourcesBusy) {
 				t.Error(err)
 			}
 			if won {
@@ -188,7 +189,7 @@ func TestAdHocDispatchRunsOneIntentWithoutRevivingOldQueue(t *testing.T) {
 			if err := e.RunAdHocIntent(ctx, task, id); err != nil {
 				t.Fatal(err)
 			}
-			for e.inflightCount(task.ID) > 0 && ctx.Err() == nil {
+			for e.taskOperationCount(task.ID) > 0 && ctx.Err() == nil {
 				time.Sleep(10 * time.Millisecond)
 			}
 			if ctx.Err() != nil {
@@ -209,20 +210,86 @@ func TestWaitingWriterIsNotAHolderAndCanBeCancelled(t *testing.T) {
 	reader := intentResourceRequest{intentID: 1, taskID: "a", priority: 5, locks: map[string]bool{"resource": false}}
 	writer := intentResourceRequest{intentID: 2, taskID: "b", priority: 5, locks: map[string]bool{"resource": true}}
 	later := intentResourceRequest{intentID: 3, taskID: "c", priority: 5, locks: map[string]bool{"resource": false}}
-	if !p.tryAcquire(reader) || p.tryAcquire(writer) || p.tryAcquire(later) {
+	if !p.tryAcquire(reader, true) || p.tryAcquire(writer, true) || p.tryAcquire(later, true) {
 		t.Fatal("unexpected admission order")
 	}
 	p.forgetWaiting(writer.intentID)
-	if !p.tryAcquire(later) {
+	if !p.tryAcquire(later, true) {
 		t.Fatal("cancelled writer retained queue ownership")
 	}
 	p.release(reader.intentID)
 	p.release(later.intentID)
-	if !p.tryAcquire(writer) {
+	if !p.tryAcquire(writer, true) {
 		t.Fatal("writer could not acquire released resource")
 	}
 	p.forgetWaiting(writer.intentID)
-	if p.tryAcquire(later) {
+	if p.tryAcquire(later, true) {
 		t.Fatal("forgetWaiting released an active holder")
+	}
+}
+
+func TestResourceTrackerCrossTaskIsolation(t *testing.T) {
+	tracker := newIntentResourceTracker()
+	node := func(id int64, resource string) *db.Node {
+		raw, _ := json.Marshal(map[string]any{"resource_locks": []kernel.ResourceLock{{Resource: resource, Mode: "exclusive"}}})
+		return &db.Node{ID: id, Payload: raw}
+	}
+	if !tracker.tryAcquire(resourceRequest("task-a", node(1, "logical-key"), "open"), false) || !tracker.tryAcquire(resourceRequest("task-b", node(2, "logical-key"), "open"), false) {
+		t.Fatal("logical locks crossed task boundary")
+	}
+	if !tracker.tryAcquire(resourceRequest("task-a", node(3, "channel:shared"), "open"), false) || tracker.tryAcquire(resourceRequest("task-b", node(4, "channel:shared"), "open"), false) {
+		t.Fatal("shared channel isolation failed")
+	}
+}
+
+func TestResourceTrackerNoGhostWaiterAfterTaskDone(t *testing.T) {
+	tracker := newIntentResourceTracker()
+	holder := intentResourceRequest{taskID: "holder", intentID: 1, locks: map[string]bool{"channel:shared": true}}
+	blocked := intentResourceRequest{taskID: "finished", intentID: 2, priority: 10, locks: holder.locks}
+	if !tracker.tryAcquire(holder, false) || tracker.tryAcquire(blocked, false) {
+		t.Fatal("fixture admission invalid")
+	}
+	if len(tracker.pending("finished")) != 0 {
+		t.Fatal("nonblocking probe left a waiter")
+	}
+	if tracker.tryAcquire(blocked, true) {
+		t.Fatal("held channel admitted waiter")
+	}
+	tracker.forgetWaitingTask("finished")
+	tracker.release(1)
+	blocked.intentID, blocked.priority = 3, 0
+	if !tracker.tryAcquire(blocked, false) {
+		t.Fatal("finished task starved later intent")
+	}
+}
+
+func TestResourceTrackerBusyLaneDoesNotStarveOtherLane(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	task, err := m.CreateTask(t.Name(), "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.DeleteTask(task.ID, DeleteTaskOptions{})
+	engine := NewEngine(m)
+	first, err := task.Store.AddIntent(map[string]any{"summary": "busy lane", "resource_locks": []kernel.ResourceLock{{Resource: "fixture", Mode: "exclusive"}}}, 10, nil, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := task.Store.AddIntent(map[string]any{"summary": "runnable lane", "resource_locks": []kernel.ResourceLock{{Resource: "fixture", Mode: "exclusive"}}}, 5, nil, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.laneBusy.Store(laneKey{taskID: task.ID, root: first}, int64(-1))
+	claimed := engine.claimNextContext(t.Context(), task, "worker")
+	if claimed == nil || claimed.ID != second {
+		t.Fatalf("claimed=%+v wanted=%d", claimed, second)
+	}
+	engine.releaseIntentResources(task, claimed)
+	if len(engine.resources.pending(task.ID)) != 0 {
+		t.Fatal("busy lane left a global waiter")
 	}
 }

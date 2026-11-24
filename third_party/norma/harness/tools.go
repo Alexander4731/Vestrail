@@ -27,6 +27,9 @@ func acceptsRawInput(t tool.CoreTool) bool {
 // executor's goroutines (read-only access to loop config; permission/hook
 // callbacks are the host's responsibility to make safe).
 func (l *loop) execOne(baseCtx context.Context, use llm.ContentBlock, emitProgress func(tool.ProgressInfo)) (llm.ContentBlock, []llm.Message) {
+	if l.disabledTools[use.Name] {
+		return llm.ToolResultText(use.ID, "当前已进入收尾结算阶段，禁止继续执行探测/脚本工具，请立刻调用 finish_work 提交交付回执。", true), nil
+	}
 	callCtx := tool.WithExecutionCallID(l.ctx, use.ID)
 	execCtx := tool.WithExecutionToolName(tool.WithExecutionCallID(baseCtx, use.ID), use.Name)
 	t, ok := l.in.Tools.Get(use.Name)

@@ -443,12 +443,21 @@ func TestTaskLLMStreamMarkFailureAfterToolStartSkipsWorkerReplay(t *testing.T) {
 
 func TestTaskLLMRuntimeErrorSkipsWorkerReplay(t *testing.T) {
 	partialStreamErr := &taskLLMError{
+		noWorkerReplay: true,
 		taskID:         "7",
 		chainExhausted: false,
 		cause:          errors.New("insufficient_quota after partial output"),
 	}
 	if retryableWorkerModelError(harness.ReasonModelError, partialStreamErr) {
 		t.Fatal("worker must not replay an intent after the task router handled a mid-stream quota error")
+	}
+	transientStreamErr := &taskLLMError{
+		noWorkerReplay: false,
+		taskID:         "7",
+		cause:          errors.New("unexpected EOF"),
+	}
+	if !retryableWorkerModelError(harness.ReasonModelError, transientStreamErr) {
+		t.Fatal("transient non-quota taskLLMError should allow worker model_error retry")
 	}
 	if !retryableWorkerModelError(harness.ReasonModelError, errors.New("temporary network error")) {
 		t.Fatal("ordinary model errors should retain the existing worker retry behavior")

@@ -20,6 +20,9 @@ func ValidateAgentBudget(p kernel.BudgetPolicy) error {
 
 // SetAgentRunBudget commits the run duration and its phase policy together.
 func (d *DB) SetAgentRunBudget(key string, runSeconds *int, policy *kernel.BudgetPolicy) error {
+	if runSeconds != nil && (*runSeconds < 0 || int64(*runSeconds) > math.MaxInt32) {
+		return fmt.Errorf("run_seconds 必须在 0 到 %d 之间", math.MaxInt32)
+	}
 	if policy != nil {
 		if err := ValidateAgentBudget(*policy); err != nil {
 			return err
@@ -31,11 +34,26 @@ func (d *DB) SetAgentRunBudget(key string, runSeconds *int, policy *kernel.Budge
 	}
 	defer tx.Rollback()
 	if runSeconds != nil {
-		if _, err := tx.Exec(`UPDATE agents SET run_seconds=$2 WHERE key=$1`, key, max(0, *runSeconds)); err != nil {
+		result, err := tx.Exec(`UPDATE agents SET run_seconds=$2 WHERE key=$1`, key, *runSeconds)
+		if err != nil {
 			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 0 {
+			return fmt.Errorf("agent %s 不存在", key)
 		}
 	}
 	if policy != nil {
+		var exists bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM agents WHERE key=$1)`, key).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("agent %s 不存在", key)
+		}
 		raw, err := json.Marshal(policy)
 		if err != nil {
 			return err

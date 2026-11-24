@@ -48,11 +48,11 @@ func TestEnableAttachesAllThreePieces(t *testing.T) {
 		t.Fatalf("the Compress tool was not registered; tools = %v", toolNames(opts.Tools))
 	}
 
-	joined := strings.Join(opts.AppendSystemPrompt, "\n")
+	joined := strings.Join(opts.SystemPrompt, "\n")
 	if !strings.Contains(joined, noa.SystemPromptHeader) {
 		t.Fatal("the resident prompt was not appended")
 	}
-	if opts.DynamicBoundary < len(opts.SystemPrompt)+1 {
+	if opts.DynamicBoundary != len(opts.SystemPrompt) {
 		t.Fatalf("DynamicBoundary = %d, want it to cover the noa section — otherwise the prompt is re-billed every request",
 			opts.DynamicBoundary)
 	}

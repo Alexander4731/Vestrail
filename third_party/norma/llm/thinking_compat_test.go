@@ -87,3 +87,63 @@ func TestThinkingFallbackRejectsUnrelatedErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestThinkingFallbackCachedAndDoesNotRetryNonThinkingErrors(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{true: "stream", false: "complete"}[stream], func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				switch calls {
+				case 1:
+					w.WriteHeader(400)
+					w.Write([]byte(`{"error":{"code":"extra_forbidden","message":"Extra inputs are not permitted: thinking"}}`))
+					return
+				case 2:
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+						return
+					}
+					w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+					return
+				default:
+					w.WriteHeader(500)
+					w.Write([]byte(`{"error":{"message":"upstream failure"}}`))
+				}
+			}))
+			defer srv.Close()
+			p, err := NewProvider(Config{Format: FormatOpenAI, BaseURL: srv.URL, Model: "test", ThinkingType: "enabled", ReasoningEffort: "high", MaxRetries: -1, EmptyResponseRetries: -1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := CompletionRequest{Thinking: "disabled", Messages: []Message{UserText("summarize")}}
+			if stream {
+				for _, err := range p.Stream(t.Context(), req) {
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				var secondErr error
+				for _, err := range p.Stream(t.Context(), req) {
+					if err != nil {
+						secondErr = err
+					}
+				}
+				if secondErr == nil {
+					t.Fatal("expected HTTP 500 error on cached fallback call")
+				}
+			} else {
+				if _, _, _, err := p.Complete(t.Context(), req); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, _, err := p.Complete(t.Context(), req); err == nil {
+					t.Fatal("expected HTTP 500 error on cached fallback call")
+				}
+			}
+			if calls != 3 {
+				t.Fatalf("calls=%d, want 3 (no double retry on non-thinking error after fallback cached)", calls)
+			}
+		})
+	}
+}

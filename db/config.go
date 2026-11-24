@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"github.com/Alexander4731/Vestrail/kernel"
@@ -471,15 +473,22 @@ type Agent struct {
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id,(SELECT value FROM settings WHERE settings.key='agent_budget.' || agents.key)`
+const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,1200),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id,(SELECT value FROM settings WHERE settings.key='agent_budget.' || agents.key)`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
 	var prof sql.NullInt64 // llm_profile_id 可空:未绑定时为 NULL
 	var budget sql.NullString
 	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof, &budget)
-	if err == nil && budget.Valid {
-		err = json.Unmarshal([]byte(budget.String), &a.BudgetPolicy)
+	if err == nil && budget.Valid && strings.TrimSpace(budget.String) != "" {
+		decodeErr := json.Unmarshal([]byte(budget.String), &a.BudgetPolicy)
+		if decodeErr == nil {
+			decodeErr = ValidateAgentBudget(a.BudgetPolicy)
+		}
+		if decodeErr != nil {
+			log.Printf("[agents] %s 预算配置无效，使用默认值: %v", a.Key, decodeErr)
+			a.BudgetPolicy = kernel.BudgetPolicy{}
+		}
 	}
 	if err == nil && prof.Valid {
 		v := prof.Int64
@@ -588,8 +597,25 @@ func (d *DB) UpdateAgentMeta(key, name, description string) error {
 // builtin=false guard. agent_prompts / agent_prompt_vars / visibility rows cascade
 // via FK; tools.agents bindings for the key are cleaned by the caller.
 func (d *DB) DeleteAgent(key string) error {
-	_, err := d.Exec(`DELETE FROM agents WHERE key=$1 AND builtin=false`, key)
-	return err
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`DELETE FROM agents WHERE key=$1 AND builtin=false`, key)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed > 0 {
+		if _, err := tx.Exec(`DELETE FROM settings WHERE key='agent_budget.' || $1`, key); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // SetAgentMaxTurns updates an agent's max_turns (0 = unlimited).

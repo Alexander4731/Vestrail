@@ -16,6 +16,9 @@ import (
 // arrival order; progress is yielded as soon as it arrives.
 type streamExec struct {
 	l       *loop
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	aborted bool            // guarded by mu
 	toolCtx context.Context // captured before dispatch; never inherits a later settlement deadline
 	mu      sync.Mutex
 	tools   []*tracked
@@ -45,7 +48,8 @@ func newStreamExec(l *loop) *streamExec {
 	if ctx == nil {
 		ctx = l.ctx
 	}
-	return &streamExec{l: l, toolCtx: ctx, notify: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(ctx)
+	return &streamExec{l: l, toolCtx: ctx, cancel: cancel, notify: make(chan struct{}, 1)}
 }
 
 func (e *streamExec) ping() {
@@ -81,6 +85,10 @@ func (e *streamExec) canStartLocked(safe bool) bool {
 // tool that cannot start blocks the tools behind it.
 func (e *streamExec) processQueue() {
 	e.mu.Lock()
+	if e.aborted {
+		e.mu.Unlock()
+		return
+	}
 	var start []*tracked
 	for _, t := range e.tools {
 		if t.status != stQueued {
@@ -89,18 +97,36 @@ func (e *streamExec) processQueue() {
 		if e.canStartLocked(t.safe) {
 			t.status = stExecuting
 			start = append(start, t)
+			e.wg.Add(1)
 		} else if !t.safe {
 			break
 		}
 	}
 	e.mu.Unlock()
 	for _, t := range start {
-		go e.run(t)
+		go e.runAsync(t)
 	}
 }
 
+func (e *streamExec) abortAndWait() {
+	e.mu.Lock()
+	e.aborted = true
+	e.cancel()
+	e.mu.Unlock()
+	e.wg.Wait()
+}
+
 func (e *streamExec) run(t *tracked) {
-	e.l.sem <- struct{}{} // bound concurrent tool execution
+	select {
+	case e.l.sem <- struct{}{}:
+	case <-e.toolCtx.Done():
+		e.mu.Lock()
+		t.result = llm.ToolResultText(t.block.ID, "tool execution interrupted", true)
+		t.status = stCompleted
+		e.mu.Unlock()
+		e.ping()
+		return
+	} // bound concurrent tool execution
 	defer func() { <-e.l.sem }()
 	res, extra := e.l.execOne(e.toolCtx, t.block, func(p tool.ProgressInfo) {
 		e.mu.Lock()
@@ -120,6 +146,11 @@ func (e *streamExec) run(t *tracked) {
 	e.mu.Unlock()
 	e.ping()
 	e.processQueue() // a slot freed
+}
+
+func (e *streamExec) runAsync(t *tracked) {
+	defer e.wg.Done()
+	e.run(t)
 }
 
 // drain yields all ready progress and completed results in FIFO order. Stops at

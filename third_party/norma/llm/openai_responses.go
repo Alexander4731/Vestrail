@@ -89,6 +89,7 @@ func (p *openaiResponsesProvider) buildBody(req CompletionRequest, stream bool) 
 // replay (mirrors the Chat Completions adapter's default and avoids echoing
 // provider-specific reasoning state the Responses API manages itself).
 func toResponsesInput(msgs []Message) []orInputItem {
+	msgs = PairToolBlocks(msgs)
 	var out []orInputItem
 	for _, m := range msgs {
 		role := string(m.Role)
@@ -181,6 +182,10 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 			if !yield(ev, nil) {
 				return
 			}
+			if ev.Type == SEMessageDelta && ev.StopReason != "" {
+				yield(StreamEvent{Type: SEMessageStop}, nil)
+				return
+			}
 		}
 	}
 }
@@ -200,8 +205,13 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 			Name      string `json:"name"`
 			Arguments string `json:"arguments"`
 		} `json:"item"`
-		Delta    string `json:"delta"` // *_text.delta / function_call_arguments.delta
-		Response struct {
+		OutputIndex int    `json:"output_index"`
+		Delta       string `json:"delta"` // *_text.delta / function_call_arguments.delta
+		Response    struct {
+			Error *struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
 			Status            string `json:"status"`
 			IncompleteDetails *struct {
 				Reason string `json:"reason"`
@@ -222,7 +232,7 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 	switch kind {
 	case "response.output_item.added":
 		if f.Item.Type == "function_call" {
-			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name}, true, nil
+			return StreamEvent{Type: SEToolUseStart, ToolID: f.Item.CallID, ToolName: f.Item.Name, ToolIndex: f.OutputIndex, ToolIndexSet: true}, true, nil
 		}
 	case "response.output_text.delta":
 		if f.Delta != "" {
@@ -234,7 +244,7 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 		}
 	case "response.function_call_arguments.delta":
 		if f.Delta != "" {
-			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta}, true, nil
+			return StreamEvent{Type: SEToolInputJSON, Text: f.Delta, ToolIndex: f.OutputIndex, ToolIndexSet: true}, true, nil
 		}
 	case "response.completed", "response.incomplete":
 		ev := StreamEvent{Type: SEMessageDelta, StopReason: "end_turn"}
@@ -248,7 +258,9 @@ func parseResponsesFrame(event, data string) (StreamEvent, bool, error) {
 		return ev, true, nil
 	case "response.failed", "error":
 		msg := "stream error"
-		if f.Error != nil {
+		if f.Response.Error != nil && f.Response.Error.Message != "" {
+			msg = f.Response.Error.Message
+		} else if f.Error != nil && f.Error.Message != "" {
 			msg = f.Error.Message
 		}
 		return StreamEvent{}, false, fmt.Errorf("openai-responses: %s", msg)

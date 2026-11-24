@@ -239,6 +239,15 @@ func (p *Planner) runEpoch(ctx context.Context, st *plannerEpochState, ts *db.Ex
 	st.roundsInEpoch++
 	st.versions = versions
 	st.fieldHashes = currentHashes
+	if err == nil && ctx.Err() == nil {
+		postVersions, versionErr := ts.ContentVersions()
+		if versionErr == nil {
+			st.versions = postVersions
+			if postOverview := tsx.graphOverviewData(); postOverview["error"] == nil {
+				st.fieldHashes = snapshotFieldHashes(postOverview)
+			}
+		}
+	}
 	retained := fresh
 	if err != nil || ctx.Err() != nil || taskClockFrom(ctx).Final {
 		st.close()

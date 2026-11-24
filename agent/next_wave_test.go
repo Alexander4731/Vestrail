@@ -15,6 +15,7 @@ import (
 
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/guard"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -609,7 +610,7 @@ func TestAddIntentBatchSchemaExposesBriefAndContinue(t *testing.T) {
 		}
 	}
 	required, ok := items["required"].([]string)
-	if !ok || !reflect.DeepEqual(required, []string{"summary", "scope", "deliverable", "max_tool_calls"}) {
+	if !ok || !reflect.DeepEqual(required, []string{"summary", "scope", "deliverable"}) {
 		t.Fatalf("batch summary not required: %v", items["required"])
 	}
 }
@@ -730,5 +731,51 @@ func TestPlannerDeltaClearsRemovedHeavyFields(t *testing.T) {
 		if _, exists := delta[key]; !exists {
 			t.Fatalf("removed null field %s was not cleared", key)
 		}
+	}
+}
+
+func TestForkFallbackPreservesHandoffSuffix(t *testing.T) {
+	t.Setenv("VESTRAIL_OPT_LANE_WORKER", "1")
+	pg, graph, taskID := waveGraph(t)
+	provider := &waveProvider{run: func(_ llm.CompletionRequest, call int) []llm.StreamEvent {
+		return []llm.StreamEvent{
+			{Type: llm.SEToolUseStart, ToolID: fmt.Sprint(call), ToolName: "finish_work"},
+			{Type: llm.SEToolInputJSON, Text: `{"delivery_status":"partial_checkpoint","summary":"fixture checkpoint"}`},
+			{Type: llm.SEMessageDelta, StopReason: "tool_use"},
+		}
+	}}
+	store := transcript.NewStore(t.TempDir())
+	worker := NewWorker(provider, "fixture", t.TempDir(), store, 200000, 5)
+	worker.SetRunTimeout(time.Minute)
+	source := waveIntent(t, graph, map[string]any{"summary": "source"})
+	if _, _, err := worker.Execute(t.Context(), "worker", taskID, nil, graph, source, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetNodeState(source.ID, "exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	receipt := kernel.RunReceipt{TaskID: taskID, ExplorationID: graph.ID(), IntentID: source.ID, SettledState: "exhausted", DeliveryStatus: kernel.DeliveryPartialCheckpoint, Checkpoint: &kernel.Checkpoint{NextAction: "unique handoff next action"}}
+	if err := pg.SaveIntentReceipt(t.Context(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	child := waveIntent(t, graph, map[string]any{"summary": "child", "continue_intent_id": source.ID, "lane_root_id": source.ID, "lane_depth": 2})
+	ctx := WithRunBudgetObserver(t.Context(), func(time.Time) {
+		if err := os.Remove(store.MainPath(WorkerSessionID(graph.ID(), source.ID))); err != nil {
+			t.Fatal(err)
+		}
+	})
+	ctx = WithExtraBashEnv(ctx, []string{"VESTRAIL_WORKER_CONCURRENCY_BUDGET=2"})
+	fallback := false
+	if _, _, err := worker.Execute(ctx, "worker", taskID, nil, graph, child, nil, func(activity db.Activity) {
+		if strings.Contains(activity.Summary, "接力失败") {
+			fallback = true
+		}
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	request := provider.requests[len(provider.requests)-1]
+	input := request.Messages[len(request.Messages)-1].Text()
+	if !fallback || !strings.Contains(input, "unique handoff next action") || !strings.Contains(input, "VESTRAIL_WORKER_CONCURRENCY_BUDGET=2") {
+		t.Fatalf("fallback=%v input=%s", fallback, input)
 	}
 }

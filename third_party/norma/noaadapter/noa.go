@@ -42,10 +42,16 @@ func Enable(opts *agentcore.Options, o Options) error {
 
 	opts.Compactor = &Compactor{sess: sess}
 	opts.Tools = append(opts.Tools, newCompressTool(sess))
-	opts.AppendSystemPrompt = append(opts.AppendSystemPrompt, noa.BuildSystemPrompt(noa.Sections{}))
-	// The prompt section is fully static, so it belongs in the cacheable prefix.
-	// Left past the boundary it would be re-billed every single request.
-	opts.DynamicBoundary = len(opts.SystemPrompt) + len(opts.AppendSystemPrompt)
+	boundary := opts.DynamicBoundary
+	if boundary <= 0 || boundary > len(opts.SystemPrompt) {
+		boundary = len(opts.SystemPrompt)
+	}
+	prompt := noa.BuildSystemPrompt(noa.Sections{})
+	system := append([]string(nil), opts.SystemPrompt[:boundary]...)
+	system = append(system, prompt)
+	system = append(system, opts.SystemPrompt[boundary:]...)
+	opts.SystemPrompt = system
+	opts.DynamicBoundary = boundary + 1
 	return nil
 }
 

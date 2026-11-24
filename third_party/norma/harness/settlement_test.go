@@ -18,7 +18,8 @@ func TestSettlementOnBudgetHit(t *testing.T) {
 	var toolsSeen [][]string
 	turns := [][]llm.StreamEvent{
 		toolTurn("a", "Bash", `{"command":"echo 1"}`), // turn 1 → hits MaxTurns=1
-		textTurn("已写回事实并总结"),                          // settlement turn → natural stop
+		toolTurn("blocked", "Bash", `{"command":"echo blocked"}`),
+		textTurn("已写回事实并总结"), // settlement turn → natural stop
 	}
 	call := func(_ context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
 		names := make([]string, 0, len(req.Tools))
@@ -60,14 +61,25 @@ func TestSettlementOnBudgetHit(t *testing.T) {
 	if !found {
 		t.Fatalf("收尾提示未被注入到对话")
 	}
+	blocked := false
+	for _, message := range term.Messages {
+		for _, block := range message.Content {
+			if block.Type == llm.BlockToolResult && block.ToolUseID == "blocked" {
+				blocked = block.IsError
+			}
+		}
+	}
+	if !blocked {
+		t.Fatal("disabled tool executed during settlement")
+	}
 	if len(toolsSeen) < 2 {
 		t.Fatalf("应至少 2 次模型调用(主+收尾)，得 %d", len(toolsSeen))
 	}
 	if !contains(toolsSeen[0], "Bash") {
 		t.Fatalf("主阶段应能看到 Bash: %v", toolsSeen[0])
 	}
-	if contains(toolsSeen[1], "Bash") {
-		t.Fatalf("收尾阶段应屏蔽 Bash: %v", toolsSeen[1])
+	if !contains(toolsSeen[1], "Bash") {
+		t.Fatalf("收尾阶段须保留静态工具 schema: %v", toolsSeen[1])
 	}
 }
 

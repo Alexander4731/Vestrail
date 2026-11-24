@@ -336,7 +336,8 @@ func (s *ExplorationStore) DeleteGoal(id int64) error {
 func (s *ExplorationStore) ResetRunningIntents() (int64, error) {
 	res, err := s.db.Exec(`WITH interrupted AS (
 SELECT n.id, n.owner='adhoc' AS adhoc, EXISTS(SELECT 1 FROM intercept_pending ip JOIN tasks t ON ip.task_id=t.id::text
- WHERE t.exploration_id=$1 AND (ip.audit->>'intent_id' IS NULL OR ip.audit->>'intent_id'=n.id::text)
+ WHERE t.exploration_id=$1 AND (ip.audit->>'intent_id'=n.id::text
+ OR (ip.audit->>'intent_id' IS NULL AND COALESCE(ip.audit->>'worker',ip.agent_name,'') NOT IN ('planner','mainagent','auto')))
  AND ip.audit->>'execution_status' IN ('unknown','awaiting_result')) AS unresolved
 FROM exploration_nodes n WHERE n.exploration_id=$1 AND n.kind='intent'
  AND (n.state='running' OR (n.state='open' AND n.owner='adhoc')))
@@ -371,7 +372,7 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 // (batch rerun after e.g. an LLM/network outage that blocked many at once). Returns the
 // number reopened. Workers resume from their transcripts; kept graph writes remain.
 func (s *ExplorationStore) ReopenBlockedIntents() (int64, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', owner=NULL, completed_at=NULL, blocked_reason=NULL
 WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
 	if err != nil {
 		return 0, err
@@ -395,7 +396,8 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, termin
 func (s *ExplorationStore) CompareAndSetIntentState(id int64, expected, state string) (bool, error) {
 	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
 	res, err := s.db.Exec(`UPDATE exploration_nodes
-SET state=$1, blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
+SET state=$1, owner=CASE WHEN $1='open' THEN NULL ELSE owner END,
+blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.expID, expected, terminal)
 	if err != nil {
 		return false, err
@@ -572,6 +574,9 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	// 每个被删意图:token rollup(保留不可逆计量)后清 activity。rollup 行 node_id 为 NULL,
 	// 不会被下面按 node_id 的删除命中。
 	for _, iid := range intentIDs {
+		if _, err := tx.Exec(`DELETE FROM intent_run_receipts WHERE exploration_id=$1 AND intent_id=$2`, s.expID, iid); err != nil {
+			return out, err
+		}
 		tokenBuckets, err := intentTokenRollup(tx, s.expID, iid)
 		if err != nil {
 			return out, err

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/Alexander4731/Vestrail/agent"
 	"github.com/Alexander4731/Vestrail/db"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
 )
@@ -177,6 +179,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 			delete(s.taskAgents, id)
 			s.taskAgentMu.Unlock()
 			deleted = true
+			go s.reconcileConcurrency()
 			writeCommittedTaskDelete(w, result, err)
 			return
 		}
@@ -191,6 +194,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	delete(s.taskAgents, id)
 	s.taskAgentMu.Unlock()
 	deleted = true
+	go s.reconcileConcurrency()
 	writeJSON(w, 200, result)
 }
 
@@ -206,7 +210,7 @@ func (s *Server) waitTaskQuiescent(ctx context.Context, taskID string) error {
 		s.chatMu.Lock()
 		chatBusy := s.chatBusy[taskID]
 		s.chatMu.Unlock()
-		if s.engine.inflightCount(taskID) == 0 && !chatBusy {
+		if s.engine.taskOperationCount(taskID) == 0 && !chatBusy {
 			return nil
 		}
 		select {
@@ -374,6 +378,10 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if req.RunSeconds != nil && (*req.RunSeconds < 0 || int64(*req.RunSeconds) > math.MaxInt32) {
+		writeErr(w, 400, "run_seconds 必须在 0 到 2147483647 之间")
+		return
+	}
 	budget := a.BudgetPolicy
 	budgetChanged := req.SettleSeconds != nil || req.HardBufferSeconds != nil
 	if req.SettleSeconds != nil {
@@ -419,7 +427,11 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.RunSeconds != nil || budgetChanged {
-		if err := pg.SetAgentRunBudget(a.Key, req.RunSeconds, &budget); err != nil {
+		var policy *kernel.BudgetPolicy
+		if budgetChanged {
+			policy = &budget
+		}
+		if err := pg.SetAgentRunBudget(a.Key, req.RunSeconds, policy); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -471,10 +483,10 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]any{"ok": true}
 	if req.MaxTurns != nil {
-		resp["max_turns"] = *req.MaxTurns
+		resp["max_turns"] = max(0, *req.MaxTurns)
 	}
 	if req.RunSeconds != nil {
-		resp["run_seconds"] = *req.RunSeconds
+		resp["run_seconds"] = max(0, *req.RunSeconds)
 	}
 	if budgetChanged {
 		resp["settle_seconds"] = budget.SettleSeconds

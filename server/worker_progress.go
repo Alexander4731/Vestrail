@@ -169,7 +169,7 @@ func (g *workerFailureGuard) before(name string, input []byte) (bool, string) {
 		return false, ""
 	}
 	// Track C: per-intent explicit tool budget (F17).
-	if g.maxProbeTools > 0 && g.probeToolCount >= g.maxProbeTools {
+	if !readOnlyProgressTool(name) && g.maxProbeTools > 0 && g.probeToolCount >= g.maxProbeTools {
 		g.mu.Unlock()
 		g.requestSettlement(kernel.TermBudgetRun)
 		return true, fmt.Sprintf("【工具预算已达上限】本意图限定最多 %d 次探测/操作工具调用，当前已用完。请立即使用 record_fact / report_finding / insert_assets 写回已有结论与断点并总结结束。", g.maxProbeTools)
@@ -194,7 +194,6 @@ func (g *workerFailureGuard) before(name string, input []byte) (bool, string) {
 	// Track A: repeated identical tool failure guard.
 	entry := g.entries[key]
 	if entry.failures < 3 {
-		g.probeToolCount++
 		g.mu.Unlock()
 		return false, ""
 	}
@@ -259,7 +258,7 @@ func (g *workerFailureGuard) after(name string, input []byte, isError bool, resu
 					g.stagnantTurns++
 				}
 			} else if g.progress {
-				fp := responseFingerprint(name, unwrapped, isError)
+				fp := responseFingerprintWithInput(name, input, unwrapped, isError)
 				seen := false
 				for _, old := range g.recentFPs {
 					if old == fp {
@@ -302,6 +301,23 @@ func (g *workerFailureGuard) after(name string, input []byte, isError bool, resu
 	}
 	entry.failures++
 	g.entries[key] = entry
+}
+
+func readOnlyProgressTool(name string) bool {
+	switch name {
+	case "Read", "Grep", "Glob", "LS", "list_facts", "node_detail", "list_assets", "traffic_search", "traffic_get", "traffic_blob":
+		return true
+	}
+	return false
+}
+
+func (g *workerFailureGuard) recordAdmittedProbe(name string) {
+	if progressWrite(name) || readOnlyProgressTool(name) {
+		return
+	}
+	g.mu.Lock()
+	g.probeToolCount++
+	g.mu.Unlock()
 }
 
 func progressProbe(name string) bool {
@@ -405,7 +421,7 @@ func responseFingerprintWithInput(name string, input []byte, result []byte, isEr
 	}
 	h.Write([]byte{0})
 	if len(input) > 0 {
-		h.Write(normalizedResponse(canonicalInputBytes(input)))
+		h.Write(normalizedResponse(canonicalProbeInput(name, input)))
 	}
 	h.Write([]byte{0})
 	clean := normalizedResponse(bytes.TrimSpace(result))
@@ -427,4 +443,56 @@ func responseFingerprintWithInput(name string, input []byte, result []byte, isEr
 func formatReceiptSummary(r kernel.RunReceipt) string {
 	return strings.TrimSpace(fmt.Sprintf("state=%s term=%s delivery=%s tools=%d facts=%d assets=%d findings=%d batches=%d",
 		r.SettledState, r.TerminationCode, r.DeliveryStatus, r.ToolCalls, r.FactsWritten, r.AssetsWritten, r.FindingsWritten, len(r.ValidBatches)))
+}
+
+// canonicalProbeInput ignores unquoted shell comments while retaining quoted targets.
+func canonicalProbeInput(name string, input []byte) []byte {
+	if name != "Bash" {
+		return canonicalInputBytes(input)
+	}
+	var parameters map[string]any
+	if json.Unmarshal(input, &parameters) != nil {
+		return canonicalInputBytes(input)
+	}
+	command, ok := parameters["command"].(string)
+	if !ok {
+		return canonicalInputBytes(input)
+	}
+	var clean strings.Builder
+	var quote rune
+	escaped, comment := false, false
+	previous := rune(' ')
+	for _, character := range command {
+		if comment {
+			if character == '\n' {
+				comment = false
+				clean.WriteRune(character)
+			}
+		} else if escaped {
+			clean.WriteRune(character)
+			escaped = false
+		} else if character == '\\' && quote != '\'' {
+			clean.WriteRune(character)
+			escaped = true
+		} else if quote != 0 {
+			clean.WriteRune(character)
+			if character == quote {
+				quote = 0
+			}
+		} else if character == '\'' || character == '"' || character == '`' {
+			quote = character
+			clean.WriteRune(character)
+		} else if character == '#' && (previous == ' ' || previous == '\t' || previous == '\n') {
+			comment = true
+		} else {
+			clean.WriteRune(character)
+		}
+		previous = character
+	}
+	parameters["command"] = strings.TrimSpace(clean.String())
+	canonical, err := json.Marshal(parameters)
+	if err != nil {
+		return canonicalInputBytes(input)
+	}
+	return canonical
 }

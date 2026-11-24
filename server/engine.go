@@ -82,7 +82,7 @@ var errWorkControlConflict = errors.New("work control conflict")
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && isRetryableStreamError(err)
+	return reason == harness.ReasonModelError && !isNoWorkerReplayError(err) && isRetryableStreamError(err)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -147,12 +147,13 @@ type Engine struct {
 	plannerRound sync.Map // taskID -> int, planner round counter (for UI round separators)
 
 	// 任务级超时(见 docs/任务级超时与收尾设计.md):
-	settling     sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
-	deadline     sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
-	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
-	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
-	runDeadlines sync.Map // *activeRunDeadline -> time.Time, current run's configured hard deadline
-	coordStarted sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
+	settling      sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
+	deadline      sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
+	stamped       sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
+	adHocInflight sync.Map // independent operator runs; included in deletion and shutdown
+	inflight      sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
+	runDeadlines  sync.Map // *activeRunDeadline -> time.Time, current run's configured hard deadline
+	coordStarted  sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
 
 	// resolve returns a task's dedicated planner/worker (wired by the server as the
 	// authoritative task-router). nil,nil means this task is deliberately unavailable
@@ -260,6 +261,7 @@ func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
 // state for a successfully deleted task. The delete barrier remains installed
 // until cleanup finishes, so no new task operation can race the teardown.
 func (e *Engine) StopTask(taskID string) {
+	defer e.resources.forgetWaitingTask(taskID)
 	e.deleteMu.Lock()
 	e.deleting.Store(taskID, true)
 	e.deleteMu.Unlock()
@@ -312,6 +314,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.deadline.Delete(taskID)
 	e.stamped.Delete(taskID)
 	e.inflight.Delete(taskID)
+	e.adHocInflight.Delete(taskID)
 	e.coordStarted.Delete(taskID)
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
@@ -651,6 +654,13 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 	return false
 }
 
+func rawToolInputFromCtx(ctx context.Context, fallback []byte) []byte {
+	if input := intercept.RawToolInput(ctx); len(input) > 0 {
+		return input
+	}
+	return fallback
+}
+
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	if h.drain != nil {
 		if msg, ok := h.drain(); ok {
@@ -659,14 +669,22 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 		}
 	}
 	if h.failures != nil {
-		if blocked, reason := h.failures.before(name, input); blocked {
+		if blocked, reason := h.failures.before(name, rawToolInputFromCtx(ctx, input)); blocked {
 			return true, reason, nil
 		}
 	}
+	var updated []byte
 	if h.inner != nil {
-		return h.inner.PreToolUse(ctx, name, input)
+		blocked, reason, next := h.inner.PreToolUse(ctx, name, input)
+		if blocked {
+			return true, reason, next
+		}
+		updated = next
 	}
-	return false, "", nil
+	if h.failures != nil {
+		h.failures.recordAdmittedProbe(name)
+	}
+	return false, "", updated
 }
 
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
@@ -902,6 +920,7 @@ func onlyDoneTriggers(evs []agent.TriggerEvent) bool {
 const plannerSaturatedCooldown = 45 * time.Second
 
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
+	defer e.resources.forgetWaitingTask(t.ID)
 	var previousPlanner *agent.Planner
 	defer func() {
 		if previousPlanner != nil {
@@ -915,6 +934,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	heartbeat := time.NewTimer(interval)
 	defer heartbeat.Stop()
 	nextRound := interval
+	timerSrc, nextTimerSrc := "heartbeat", "heartbeat"
 	failures, emptyRounds := 0, 0
 	var retryAt time.Time
 	var lastPlanAt time.Time
@@ -925,7 +945,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。src 仅用于日志区分触发来源。
 	runRound := func(src string) {
 		nextRound = interval
+		nextTimerSrc = "heartbeat"
 		if wait := time.Until(retryAt); wait > 0 && !e.IsPaused(t.ID) {
+			nextTimerSrc = "backoff"
 			nextRound = wait // notifications cannot bypass the provider cooldown
 			return
 		}
@@ -953,6 +975,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			previousPlanner = planner
 		}
 		if planner == nil {
+			nextTimerSrc = "readiness"
 			nextRound = 2 * time.Second
 			return // recheck readiness without waiting the ten-minute heartbeat
 		}
@@ -976,6 +999,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		graphState, graphErr := t.Store.GraphProgress()
 		if graphErr != nil {
+			nextRound, nextTimerSrc = 5*time.Second, "retry"
 			return
 		}
 		if src == "heartbeat" && !lastPlanAt.IsZero() && graphState == lastGraphState {
@@ -996,6 +1020,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
 					log.Printf("[goalless] task %s 收尾落 done 失败: %v", t.ID, err)
 				} else if won {
+					e.resources.forgetWaitingTask(t.ID)
 					e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
 						Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
 				}
@@ -1011,6 +1036,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if src == "edge" && e.debounce >= 500*time.Millisecond && !lastPlanAt.IsZero() {
 			if rem := plannerSaturatedCooldown - time.Since(lastPlanAt); rem > 0 && onlyDoneTriggers(t.peekTriggers()) {
 				if openCount, err := t.Store.CountOpenIntents(); err == nil && openCount >= e.m.Workers() {
+					nextTimerSrc = "cooldown"
 					if rem < nextRound {
 						nextRound = rem
 					}
@@ -1044,13 +1070,21 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		before, progressErr := t.Store.GraphProgress()
 		if progressErr != nil {
-			nextRound = 5 * time.Second
+			nextRound, nextTimerSrc = 5*time.Second, "retry"
 			return
 		}
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.lifecycleSnapshot().Goal, triggers, emit)
 		lastPlanAt = time.Now()
 		if err == nil {
 			lastGraphState = graphState
+		}
+		if err == nil && met {
+			verified, verifyErr := t.Store.AllGoalsMet()
+			if verifyErr != nil {
+				nextRound, nextTimerSrc = 5*time.Second, "retry"
+				return
+			}
+			met = verified
 		}
 		switch {
 		case err != nil && ectx.Err() == nil && (errors.Is(err, agent.ErrLocalRunBudgetExceeded) || errors.Is(err, agent.AbortRunHardTimeout)):
@@ -1063,6 +1097,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			failures = min(failures+1, 6)
 			if retryablePlannerModelError(err) {
 				nextRound = plannerModelBackoff(failures)
+				nextTimerSrc = "backoff"
 				retryAt = time.Now().Add(nextRound)
 				endBackoff = intercept.BeginPhase(ectx, "backoff")
 				e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
@@ -1076,11 +1111,6 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		case met:
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
 			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
-			verified, verifyErr := t.Store.AllGoalsMet()
-			if verifyErr != nil || !verified {
-				log.Printf("[planner] task %s 完成条件未通过: %v", t.ID, verifyErr)
-				return
-			}
 			if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
 				log.Printf("[planner] task %s 标记完成落库失败: %v", t.ID, err)
 				return
@@ -1090,6 +1120,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			// 任务已判完成 → 立刻取消在跑的 worker：它们手头的意图跑出来也没意义了。
 			// 下一轮 worker 循环撞终态门就不再领新意图;被取消的这批走下方"任务已完成"分支
 			// 归为 stopped(而非 blocked)。
+			e.resources.forgetWaitingTask(t.ID)
 			e.cancelExec(t.ID, agent.AbortGoalMet)
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
@@ -1097,7 +1128,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			after, progressErr := t.Store.GraphProgress()
 			active, activeErr := t.Store.HasPendingIntent()
 			if progressErr != nil || activeErr != nil {
-				nextRound = 5 * time.Second
+				nextRound, nextTimerSrc = 5*time.Second, "retry"
 				return
 			}
 			lastGraphState = after
@@ -1106,7 +1137,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				if emptyRounds >= 3 {
 					e.pauseForInput(t, "连续规划没有产生新的进展，请补充目标、证据或执行指令")
 				} else {
-					nextRound = 3 * time.Second
+					nextRound, nextTimerSrc = 3*time.Second, "empty_retry"
 				}
 			} else {
 				emptyRounds = 0
@@ -1123,14 +1154,16 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			runRound("edge") // worker 结束 / finding / kill / resume / seed 首轮
 		case <-heartbeat.C:
 			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
-			runRound("heartbeat")
+			runRound(timerSrc)
 		}
 		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
+		timerSrc = nextTimerSrc
 		resetPlannerTimer(heartbeat, nextRound)
 	}
 }
 
 func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
+	defer e.resources.forgetWaitingTask(t.ID)
 	for {
 		select {
 		case <-ctx.Done():
@@ -1218,11 +1251,17 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	if !adHoc {
 		ectx = e.clockCtx(ectx, t, false)
 	}
-	ectx, releaseBudget := e.observeRunBudget(ectx, t.ID)
-	defer releaseBudget()
+	if !adHoc {
+		var releaseBudget func()
+		ectx, releaseBudget = e.observeRunBudget(ectx, t.ID)
+		defer releaseBudget()
+	}
 	ectx = agent.WithTaskObjective(ectx, t.lifecycleSnapshot().Goal) // cancellable by Pause (or Delete for adHoc); 带任务 deadline
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		rollbackState := "open"
+		if !adHoc && hasChatMessage && e.IsPaused(t.ID) {
+			rollbackState = "paused"
+		}
 		if adHoc {
 			rollbackState = "stopped"
 		}
@@ -1248,10 +1287,10 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	if e.channelPool != nil {
 		proxyAddr := ""
 		if e.m != nil {
-			proxyAddr = e.m.ProxyAddr()
+			proxyAddr = e.m.GlobalProxy()
 		}
 		if poolKey := e.channelPool.poolKeyFor(t.ID, proxyAddr, intent); poolKey != "" {
-			capTotal, activeCount, workerBudget, releasePool := e.channelPool.acquire(poolKey, intent.ID)
+			capTotal, activeCount, workerBudget, releasePool := e.channelPool.acquire(poolKey, intent.ID, e.m.Workers())
 			defer releasePool()
 			workCtx = agent.WithExtraBashEnv(workCtx, channelBudgetEnv(capTotal, activeCount, workerBudget))
 		}
@@ -1524,6 +1563,7 @@ func (e *Engine) runIntentWithMode(ctx context.Context, t *Task, name string, wo
 	for id, version := range wrote.ConsumedEvidenceVersions {
 		inputVersions[id] = version
 	}
+	gain.Assets = wrote.Assets
 	receipt := kernel.RunReceipt{
 		TaskID:                wTaskID,
 		ExplorationID:         t.Store.ID(),
@@ -1563,13 +1603,13 @@ func (e *Engine) RunAdHocIntent(ctx context.Context, t *Task, intentID int64) er
 	if t == nil || intentID <= 0 {
 		return fmt.Errorf("invalid ad-hoc intent target")
 	}
-	if !e.beginTaskOperation(t.ID) {
+	if !e.beginTaskOperation(t.ID, true) {
 		return fmt.Errorf("task is being deleted")
 	}
 	release := true
 	defer func() {
 		if release {
-			e.decInflight(t.ID)
+			e.decAdHocInflight(t.ID)
 		}
 	}()
 	_, worker := e.snapshotFor(t)
@@ -1585,9 +1625,9 @@ func (e *Engine) RunAdHocIntent(ctx context.Context, t *Task, intentID int64) er
 	}
 	release = false
 	go func() {
-		defer e.decInflight(t.ID)
+		defer e.decAdHocInflight(t.ID)
 		base := e.adHocContextFor(ctx, t.ID)
-		admitted, err := e.awaitIntentAdmission(base, t, node, "open", "adhoc")
+		admitted, err := e.awaitIntentAdmission(base, t, node, "open", "adhoc", true)
 		if err != nil {
 			_, _ = t.Store.CompareAndSetIntentState(node.ID, "open", "paused")
 			log.Printf("[adhoc] task %s 意图 #%d 未启动: %v", t.ID, node.ID, err)
@@ -1646,7 +1686,7 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	go func() {
 		defer e.decInflight(t.ID)
 		base := e.execContextFor(ctx, t.ID)
-		admitted, err := e.awaitIntentAdmission(base, t, node, "open", "adhoc")
+		admitted, err := e.awaitIntentAdmission(base, t, node, "open", "adhoc", false)
 		if err != nil {
 			_, _ = t.Store.CompareAndSetIntentState(node.ID, "open", "paused")
 			log.Printf("[chat] task %s 意图 #%d 未启动: %v", t.ID, node.ID, err)
@@ -1697,6 +1737,7 @@ func (e *Engine) claimNextContext(ctx context.Context, t *Task, name string) *db
 		}
 		return true
 	})
+	var blockedInScan []intentResourceRequest
 	const pageSize = 32
 	priority, after := 0, int64(0)
 	for ctx.Err() == nil {
@@ -1704,23 +1745,28 @@ func (e *Engine) claimNextContext(ctx context.Context, t *Task, name string) *db
 		if err != nil || len(fr) == 0 {
 			return nil
 		}
-		var depIDs []int64
-		seen := map[int64]bool{}
-		for _, n := range fr {
-			for _, dep := range intentScheduleInfoFromNode(n).AfterIntents {
-				if dep > 0 && !seen[dep] {
-					seen[dep] = true
-					depIDs = append(depIDs, dep)
-				}
-			}
-		}
-		terminal, err := t.Store.TerminalIntentIDs(depIDs)
+		activeIntentIDs, err := t.Store.ActiveIntentIDs()
 		if err != nil {
 			return nil
 		}
 		for _, in := range fr {
-			if claimed, err := e.tryClaimIntent(ctx, t, in, "open", name, terminal); err == nil && claimed {
+			request := resourceRequest(t.ID, in, "open")
+			blocked := false
+			for _, earlier := range blockedInScan {
+				if requestsConflict(request, earlier) {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				continue
+			}
+			claimed, err := e.tryClaimIntent(ctx, t, in, "open", name, activeIntentIDs, false)
+			if err == nil && claimed {
 				return in
+			}
+			if errors.Is(err, errIntentResourcesBusy) {
+				blockedInScan = append(blockedInScan, request)
 			}
 		}
 		if len(fr) < pageSize {

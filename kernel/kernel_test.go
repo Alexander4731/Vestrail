@@ -21,13 +21,13 @@ func TestComputeBudgetPlan(t *testing.T) {
 
 	// Clamped by task deadline (remaining 300s < own 1200s) -> 60s settle reserve, 240s explore
 	clamped := ComputeBudgetPlan(1200, now.Add(300*time.Second).Unix(), now)
-	if !clamped.ClampedByTask || clamped.Total != 300*time.Second || clamped.SettleReserve != 60*time.Second || clamped.Explore != 240*time.Second {
+	if !clamped.ClampedByTask || clamped.Total != 285*time.Second || clamped.SettleReserve != 57*time.Second || clamped.Explore != 228*time.Second {
 		t.Fatalf("unexpected clamped plan: %+v", clamped)
 	}
 
 	// Own unlimited but task deadline present -> clamped
 	taskOnly := ComputeBudgetPlan(0, now.Add(100*time.Second).Unix(), now)
-	if !taskOnly.ClampedByTask || taskOnly.Total != 100*time.Second || taskOnly.SettleReserve != 20*time.Second || taskOnly.Explore != 80*time.Second {
+	if !taskOnly.ClampedByTask || taskOnly.Total != 85*time.Second || taskOnly.SettleReserve != 20*time.Second || taskOnly.Explore != 65*time.Second {
 		t.Fatalf("unexpected task-only plan: %+v", taskOnly)
 	}
 }
@@ -146,7 +146,7 @@ func TestIntentDedupAndResourceLocks(t *testing.T) {
 		t.Fatal("queued work must not hold a resource")
 	}
 	cleanup.AfterIntents = []int64{consumerOpen.ID}
-	if ok, _ := CanClaimIntent(cleanup, []IntentScheduleInfo{cleanup, consumerOpen}, nil); ok {
+	if ok, _ := CanClaimIntent(cleanup, []IntentScheduleInfo{cleanup, consumerOpen}, map[int64]bool{consumerOpen.ID: true}); ok {
 		t.Fatal("cleanup must wait for its explicit consumer dependency")
 	}
 	cleanup.AfterIntents = nil
@@ -161,5 +161,21 @@ func TestIntentDedupAndResourceLocks(t *testing.T) {
 	}
 	if got := WorkerConcurrencyBudget(2, 5); got != 1 {
 		t.Fatalf("expected concurrency floor 1, got %d", got)
+	}
+}
+
+func TestCanClaimIntentUnblockedWhenPrerequisiteDeletedOrCancelled(t *testing.T) {
+	in := IntentScheduleInfo{ID: 2, AfterIntents: []int64{1}}
+	if ok, _ := CanClaimIntent(in, nil, map[int64]bool{1: true}); ok {
+		t.Fatal("active prerequisite accepted")
+	}
+	if ok, _ := CanClaimIntent(in, nil, map[int64]bool{}); !ok {
+		t.Fatal("missing prerequisite blocked")
+	}
+}
+
+func TestResearchGainCountsAssets(t *testing.T) {
+	if !(RunReceipt{ResearchGain: &ResearchGain{Assets: 1}}).HasNetGain() {
+		t.Fatal("asset gain lost")
 	}
 }

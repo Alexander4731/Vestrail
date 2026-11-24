@@ -65,7 +65,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for {
 		pending := false
 		for _, task := range s.m.List() {
-			pending = pending || s.engine.inflightCount(task.ID) > 0
+			pending = pending || s.engine.taskOperationCount(task.ID) > 0
 		}
 		if !pending {
 			return nil

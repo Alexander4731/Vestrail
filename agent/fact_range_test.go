@@ -20,7 +20,7 @@ func TestAuditFix_FactRangeConsistencyOnWrite(t *testing.T) {
 	tools := NewToolSet(store, "test")
 	recordFact := tools.recordFact()
 
-	result, err := recordFact.Call(t.Context(), json.RawMessage(`{"summary":"22001-23000 共 2000 端口","confidence":"observed"}`), nil)
+	result, err := recordFact.Call(t.Context(), json.RawMessage(`{"summary":"22001-23000 共扫描 2000 个端口","confidence":"observed"}`), nil)
 	if err != nil || !result.IsError || !strings.Contains(result.Flatten(), "1000 个唯一对象") {
 		t.Fatalf("expected range validation error, got %q (%v)", result.Flatten(), err)
 	}

@@ -51,6 +51,10 @@ func ComputeBudgetPlan(ownSeconds int, taskDeadlineUnix int64, now time.Time) Bu
 }
 
 func ComputeBudgetPlanWithPolicy(ownSeconds int, taskDeadlineUnix int64, now time.Time, policy BudgetPolicy) BudgetPlan {
+	hard := DefaultHardBuffer
+	if policy.HardBufferSeconds != nil {
+		hard = time.Duration(max(0, *policy.HardBufferSeconds)) * time.Second
+	}
 	var own time.Duration
 	if ownSeconds > 0 {
 		own = time.Duration(ownSeconds) * time.Second
@@ -62,8 +66,12 @@ func ComputeBudgetPlanWithPolicy(ownSeconds int, taskDeadlineUnix int64, now tim
 		if rem <= 0 {
 			return BudgetPlan{TaskExpired: true, ClampedByTask: true}
 		}
-		if own <= 0 || rem <= own {
-			total = rem
+		if own <= 0 || rem <= own+hard {
+			usable := max(time.Duration(0), rem-hard)
+			if usable == 0 {
+				return BudgetPlan{TaskExpired: true, ClampedByTask: true, HardBuffer: min(hard, rem)}
+			}
+			total = usable
 			clamped = true
 		} else {
 			total = own
@@ -76,7 +84,7 @@ func ComputeBudgetPlanWithPolicy(ownSeconds int, taskDeadlineUnix int64, now tim
 		if policy.SettleSeconds > 0 {
 			reserve = time.Duration(policy.SettleSeconds) * time.Second
 		}
-		return BudgetPlan{SettleReserve: reserve}
+		return BudgetPlan{SettleReserve: reserve, HardBuffer: hard}
 	}
 	var reserve time.Duration
 	if policy.SettleSeconds > 0 {
@@ -97,10 +105,6 @@ func ComputeBudgetPlanWithPolicy(ownSeconds int, taskDeadlineUnix int64, now tim
 		if reserve > MaxSettleReserve {
 			reserve = MaxSettleReserve
 		}
-	}
-	hard := DefaultHardBuffer
-	if policy.HardBufferSeconds != nil {
-		hard = time.Duration(max(0, *policy.HardBufferSeconds)) * time.Second
 	}
 	return BudgetPlan{
 		Total:         total,

@@ -531,3 +531,22 @@ WHERE exploration_id=$1 AND kind='intent' AND id = ANY($2)
 	}
 	return out, rows.Err()
 }
+
+// ActiveIntentIDs includes queued, running and paused prerequisites.
+func (s *ExplorationStore) ActiveIntentIDs() (map[int64]bool, error) {
+	rows, err := s.db.Query(`SELECT id FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running','paused')`, s.expID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
+}

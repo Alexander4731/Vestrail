@@ -72,7 +72,7 @@ func newFetchClient(cfg WebFetchConfig) *http.Client {
 	if cfg.Proxy == "" && !cfg.InsecureTLS && cfg.CACert == "" {
 		return &http.Client{}
 	}
-	tr := &http.Transport{}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
 	if cfg.Proxy != "" {
 		if pu, err := url.Parse(cfg.Proxy); err == nil {
 			tr.Proxy = http.ProxyURL(pu)
@@ -455,7 +455,7 @@ func textOnly(b *strings.Builder, n *html.Node) {
 func oneLine(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > max {
-		return s[:max] + "…"
+		return cutHead(s, max) + "…"
 	}
 	return s
 }

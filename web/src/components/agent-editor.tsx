@@ -52,7 +52,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const [skillVisible, setSkillVisible] = React.useState<string[]>([]);
   const [preview, setPreview] = React.useState("");
   const [maxTurns, setMaxTurns] = React.useState("0");
-  const [runSecs, setRunSecs] = React.useState("600");
+  const [runSecs, setRunSecs] = React.useState("1200");
   const [settleSecs, setSettleSecs] = React.useState("0");
   const [hardBufferSecs, setHardBufferSecs] = React.useState("");
   // "" = 跟随(未绑定)；否则为 profile id 字符串
@@ -93,7 +93,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
         setMcpVisible(d.visibility?.mcp ?? []);
         setSkillVisible(d.visibility?.skill ?? []);
         setMaxTurns(String(d.agent?.max_turns ?? 0));
-        setRunSecs(String(d.agent?.run_seconds ?? 600));
+        setRunSecs(String(d.agent?.run_seconds ?? 1200));
         setSettleSecs(String(d.agent?.settle_seconds ?? 0));
         setHardBufferSecs(d.agent?.hard_buffer_seconds == null ? "" : String(d.agent.hard_buffer_seconds));
         setLlmProfileId(d.agent?.llm_profile_id != null ? String(d.agent.llm_profile_id) : "");
@@ -341,7 +341,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                 </Button>
                 {showConfig && (
                   <p className="text-muted-foreground w-full text-xs">
-                    0 表示该角色自身不限时；修改在下一次执行生效。{agentKey === "mainagent" ? "人机会话使用自身预算。" : "普通队列同时受任务总超时约束；独立投递使用新的运行预算。"}
+                    0 表示该角色自身不限时；修改在下一次执行生效。{agentKey === "worker" || agentKey === "planner" ? "普通队列同时受任务总超时约束；独立投递使用新的运行预算。" : "人机会话使用自身预算。"}
                   </p>
                 )}
                 {showBudget && (

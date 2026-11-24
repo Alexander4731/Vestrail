@@ -14,15 +14,15 @@ type IntentScheduleInfo struct {
 }
 
 // CanClaimIntent enforces prerequisite intent completion and reader-writer resource locks (F22).
-// - AfterIntents: every listed intent ID must be in terminalIntentIDs.
+// AfterIntents block only while the prerequisite remains active.
 // Resource ownership belongs to running/reserved work. Queue ordering is
 // expressed by AfterIntents, not by treating open intents as lock holders.
-func CanClaimIntent(candidate IntentScheduleInfo, active []IntentScheduleInfo, terminalIntentIDs map[int64]bool) (bool, string) {
+func CanClaimIntent(candidate IntentScheduleInfo, active []IntentScheduleInfo, activeIntentIDs map[int64]bool) (bool, string) {
 	for _, depID := range candidate.AfterIntents {
 		if depID <= 0 || depID == candidate.ID {
 			continue
 		}
-		if !terminalIntentIDs[depID] {
+		if activeIntentIDs[depID] {
 			return false, fmt.Sprintf("等待前置意图 #%d 结束", depID)
 		}
 	}

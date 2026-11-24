@@ -79,7 +79,7 @@ func isRetryableStatus(code int) bool {
 		http.StatusInternalServerError, // 500
 		http.StatusBadGateway,          // 502
 		http.StatusServiceUnavailable,  // 503
-		http.StatusGatewayTimeout:      // 504
+		http.StatusGatewayTimeout, 529: // 504
 		return true
 	}
 	return false

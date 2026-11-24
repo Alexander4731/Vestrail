@@ -27,6 +27,14 @@ const (
 
 type traceKey struct{}
 type callKey struct{}
+type rawCallInputKey struct{}
+
+// RawToolInput returns the original arguments captured before review rendering.
+func RawToolInput(ctx context.Context) []byte {
+	input, _ := ctx.Value(rawCallInputKey{}).([]byte)
+	return append([]byte(nil), input...)
+}
+
 type intentKey struct{}
 
 func WithIntent(ctx context.Context, id int64) context.Context {
@@ -125,6 +133,7 @@ func WithExecutionCall(ctx context.Context, id string) context.Context {
 // WithCall claims the event before model review starts, so subsequent tools
 // cannot change this approval's context while the judge is running.
 func WithCall(ctx context.Context, tool string, input []byte) context.Context {
+	ctx = context.WithValue(ctx, rawCallInputKey{}, append([]byte(nil), input...))
 	ctx = withSDKExecutionCall(ctx)
 	if _, claimed := ctx.Value(callKey{}).(db.InterceptAudit); claimed {
 		return ctx
@@ -221,6 +230,7 @@ func auditFor(ctx context.Context, dec Decision, input []byte, status string) *d
 	}
 	a.InitialAction, a.InitialReason = dec.Action, dec.Message
 	a.IntentID, _ = ctx.Value(intentKey{}).(int64)
+	_, a.Worker = taskInfoFromCtx(ctx)
 	a.SessionID = transcript.SessionIDFrom(ctx)
 	if t, _ := ctx.Value(traceKey{}).(*Trace); t != nil && t.store != nil && a.SessionID != "" {
 		if info, err := os.Stat(t.store.MainPath(a.SessionID)); err == nil {

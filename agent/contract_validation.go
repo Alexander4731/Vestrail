@@ -41,9 +41,6 @@ func (t *ToolSet) normalizeIntentContract(in *intentItem, assets []int64, requir
 	if in.Deliverable == "" {
 		missing = append(missing, "deliverable")
 	}
-	if in.ToolBudget == nil && in.MaxToolCalls == 0 {
-		missing = append(missing, "max_tool_calls（0 明确不限）")
-	}
 	if require && len(missing) > 0 {
 		return fmt.Errorf("执行交底缺少 %s；请一次补齐后提交", strings.Join(missing, ", "))
 	}

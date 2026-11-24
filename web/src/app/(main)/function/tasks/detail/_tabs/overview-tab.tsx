@@ -335,8 +335,8 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     try {
       await api.rerunIntent(taskId, id);
       setIntents((prev) => prev.map((i) => (i.id === id ? { ...i, state: "open" } : i)));
-    } catch {
-      // 失败忽略：下次轮询仍显示 blocked，用户可再点
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重跑失败");
     } finally {
       markRerun(id, false);
     }
@@ -346,10 +346,12 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const rerunAll = async () => {
     markRerun("__all__", true);
     try {
-      await api.rerunBlocked(taskId);
-      setIntents((prev) => prev.map((i) => (i.state === "blocked" ? { ...i, state: "open" } : i)));
-    } catch {
-      // ignore
+      const results = await Promise.allSettled(blocked.map((intent) => api.rerunIntent(taskId, intent.id)));
+      const reopened = new Set(blocked.filter((_, index) => results[index].status === "fulfilled").map((intent) => intent.id));
+      setIntents((prev) => prev.map((intent) => reopened.has(intent.id) ? { ...intent, state: "open" } : intent));
+      if (results.some((result) => result.status === "rejected")) toast.error("部分意图重跑失败，请查看仍需关注的意图");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重跑失败");
     } finally {
       markRerun("__all__", false);
     }
@@ -422,7 +424,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
 
   const running = intents.filter((i) => i.state === "running");
   const open = intents.filter((i) => i.state === "open");
-  const blocked = intents.filter((i) => i.state === "blocked");
+  const blocked = intents.filter((i) => ["blocked", "exhausted", "stopped"].includes(i.state));
   const taskFindings = findings.filter((f) => f.task_id === taskId);
   const goalsPct = task?.goals_total ? Math.round(((task.goals_met ?? 0) / task.goals_total) * 100) : 0;
   // token 合计（跨全部模型），用于卡片头部总览。
@@ -989,7 +991,10 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             {running.slice(0, 6).map((i) => (
               <div key={i.id} className="flex items-center gap-2 text-sm">
                 <StatusBadge domain="intent" value={i.state} />
-                <span className="min-w-0 flex-1 truncate">{i.payload}</span>
+                <div className="min-w-0 flex-1">
+                  <span className="block truncate">{i.payload}</span>
+                  {i.blocked_reason && <p className="break-words text-xs text-muted-foreground">{i.blocked_reason}</p>}
+                </div>
               </div>
             ))}
             {running.length === 0 && <p className="text-sm text-muted-foreground">暂无进行中意图</p>}
@@ -1046,7 +1051,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         <Card className="border-red-500/30">
           <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
             <CardTitle className="flex items-center gap-2 text-sm">
-              <AlertTriangleIcon className="size-4 text-red-500" /> 被拦/出错意图
+              <AlertTriangleIcon className="size-4 text-red-500" /> 需要关注
               <span className="text-xs font-normal text-muted-foreground">（共 {blocked.length} 条，可重跑）</span>
             </CardTitle>
             <Button size="sm" variant="outline" disabled={rerunning.has("__all__")} onClick={() => void rerunAll()}>
@@ -1058,7 +1063,10 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             {blocked.slice(0, 20).map((i) => (
               <div key={i.id} className="flex items-center gap-2 text-sm">
                 <StatusBadge domain="intent" value={i.state} />
-                <span className="min-w-0 flex-1 truncate">{i.payload}</span>
+                <div className="min-w-0 flex-1">
+                  <span className="block truncate">{i.payload}</span>
+                  {i.blocked_reason && <p className="break-words text-xs text-muted-foreground">{i.blocked_reason}</p>}
+                </div>
                 <Button
                   size="sm"
                   variant="ghost"

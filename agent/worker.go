@@ -156,7 +156,7 @@ func (w *Worker) SetBudgetPolicy(p kernel.BudgetPolicy) { w.budgetPolicy = p }
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).
-const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
+const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) 必须调用 finish_work(delivery_status, summary, evidence_ids, checkpoint) 提交最终交付状态、总结和断点，这是唯一显式结束动作。"
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
@@ -245,7 +245,7 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 - **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
 
 
-完成本意图后用一句话总结你做了什么、写回了哪些事实。`
+所有正常完成、阶段中断和超预算收尾均必须调用 finish_work(delivery_status, summary, evidence_ids, checkpoint)，这是本意图唯一显式结束动作。中间事实写 record_fact，最终交付状态和断点交接统一提交 finish_work。`
 
 // workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
@@ -612,6 +612,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if lane.Note != "" {
 		input += "\n" + lane.Note
 	}
+	handoffSuffix := ""
 	if handoff := readIntentLane(intent); handoff.Continue > 0 || handoff.Handoff > 0 {
 		sourceID := handoff.Continue
 		if sourceID == 0 {
@@ -619,21 +620,21 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		}
 		if lane.Source == "" && w.tx != nil {
 			if state, e := readWorkerContext(w.tx.MainPath(WorkerSessionID(ts.ID(), sourceID)) + ".lane.json"); e == nil && state.TaskID == taskID && contextDirectory(w.workDir, taskID, state.Directory) {
-				input += "\n上游脚本目录（只作交接参考，复制到当前目录后使用）：" + state.Directory + "\n当前执行仍使用本意图目录：" + runDir
+				handoffSuffix += "\n上游脚本目录（只作交接参考，复制到当前目录后使用）：" + state.Directory + "\n当前执行仍使用本意图目录：" + runDir
 			}
 		}
 		// Auto-Handoff (F07/F08): inject structured upstream checkpoint & valid artifacts directly
 		// so the successor worker skips directory scanning and working-set reconstruction.
 		if rec, e := ts.LatestIntentReceipt(ctx, sourceID); e == nil && rec != nil {
 			if block := renderUpstreamReceiptHandoff(sourceID, rec); block != "" {
-				input += "\n\n" + block
+				handoffSuffix += "\n\n" + block
 			}
 		}
 	}
 	if extraEnv := extraBashEnvFrom(ctx); len(extraEnv) > 0 {
 		for _, kv := range extraEnv {
 			if strings.HasPrefix(kv, "VESTRAIL_WORKER_CONCURRENCY_BUDGET=") {
-				input += "\n\n【共享通道并发配额】" + kv + "（脚本内部并发请勿超过此值；若遇批量异常先降并发并做串行对照，无效批次标 valid=false）。"
+				handoffSuffix += "\n\n【共享通道并发配额】" + kv + "（脚本内部并发请勿超过此值；若遇批量异常先降并发并做串行对照，无效批次标 valid=false）。"
 			}
 		}
 	}
@@ -718,6 +719,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			emitWrap(db.Activity{Kind: "text", Summary: "独立执行线元数据保存失败", Detail: e.Error()})
 		}
 	}
+	input += handoffSuffix
 	outcome := captureRunSessionOutcome(ctx, s, opts.Transcript, input, emitWrap)
 	if w.tx != nil && laneMode {
 		root, depth := intent.ID, 1

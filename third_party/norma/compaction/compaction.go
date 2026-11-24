@@ -138,6 +138,9 @@ func (c *Compactor) effectiveWindow() int {
 
 // buffer tiers off the EFFECTIVE window (== claude-code getAutocompactBufferTokens).
 func (c *Compactor) buffer() int {
+	if c.cfg.ContextWindow < 64000 {
+		return min(13000, max(1, c.effectiveWindow()/6))
+	}
 	switch ew := c.effectiveWindow(); {
 	case ew >= 800000:
 		return 50000
@@ -151,7 +154,13 @@ func (c *Compactor) autoThreshold() int  { return c.effectiveWindow() - c.buffer
 func (c *Compactor) microThreshold() int { return c.effectiveWindow() * 6 / 10 }
 
 // maxTurnGrowth == claude-code estimateMaxTurnGrowth: min(maxOutput,20000)+15000.
-func (c *Compactor) maxTurnGrowth() int { return c.reservedForSummary() + toolResultGrowthGuess }
+func (c *Compactor) maxTurnGrowth() int {
+	growth := toolResultGrowthGuess
+	if c.cfg.ContextWindow < 64000 {
+		growth = min(growth, max(1, c.effectiveWindow()/5))
+	}
+	return c.reservedForSummary() + growth
+}
 func (c *Compactor) hardEffectiveWindow() int {
 	return c.cfg.ContextWindow - c.reservedForSummary()
 }
@@ -257,6 +266,7 @@ func (c *Compactor) Pre(ctx context.Context, msgs []llm.Message, lastInputTokens
 func (c *Compactor) Reactive(ctx context.Context, msgs []llm.Message) ([]llm.Message, bool) {
 	before := c.count(msgs, 0)
 	if out, ok := c.autoCompact(ctx, msgs, before, "reactive"); ok {
+		c.lastMicroTokens = 0
 		return out, c.count(out, 0) < before
 	}
 	return msgs, false
@@ -314,7 +324,8 @@ func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
 	}
 	// Collect compactable tool_use ids in encounter order.
 	var ids []string
-	for _, m := range msgs {
+	start := llm.LastBoundaryIndex(msgs) + 1
+	for _, m := range msgs[start:] {
 		for _, b := range m.Content {
 			if b.Type == llm.BlockToolUse && c.isCompactableTool(b.Name) {
 				ids = append(ids, b.ID)
@@ -330,7 +341,7 @@ func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
 	}
 	changed := false
 	out := append([]llm.Message(nil), msgs...)
-	for i := range out {
+	for i := start; i < len(out); i++ {
 		var nc []llm.ContentBlock
 		for j, b := range out[i].Content {
 			if b.Type == llm.BlockToolResult && clearSet[b.ToolUseID] && !isCleared(b.Content) {

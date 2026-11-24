@@ -5,6 +5,9 @@ go 1.26.3
 // Pinned norma v0.4.3 with durable execution instrumentation and selected v0.4.4 protocol/output improvements.
 replace github.com/Autumn-27/norma => ./third_party/norma
 
+// Local transport timeouts and CONNECT admission support.
+replace github.com/lqqyt2423/go-mitmproxy => ./third_party/go-mitmproxy
+
 require (
 	github.com/Autumn-27/norma v0.4.3
 	github.com/golang-jwt/jwt/v5 v5.3.1

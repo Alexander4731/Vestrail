@@ -9,6 +9,7 @@ import (
 	"github.com/Alexander4731/Vestrail/db"
 	"github.com/Alexander4731/Vestrail/guard"
 	"github.com/Alexander4731/Vestrail/intercept"
+	"github.com/Alexander4731/Vestrail/kernel"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -101,7 +102,7 @@ type chatVars struct{ DataDir, Now string }
 // but each agent decides on/off). emit receives each execution step (thinking /
 // tool_use / tool_result / text / result), tagged with the agent key as the
 // worker lane.
-func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message string, maxTurns int, maxDuration time.Duration, webSearch bool, emit func(db.Activity)) (string, error) {
+func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message string, maxTurns int, maxDuration time.Duration, webSearch bool, emit func(db.Activity), policies ...kernel.BudgetPolicy) (string, error) {
 	// gate the global web-search opts by this agent's own flag.
 	ws := c.webSearch
 	if !webSearch {
@@ -113,7 +114,12 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	sessionWorkDir := filepath.Join(c.workDir, "sessions", sessionID)
 	_ = os.MkdirAll(sessionWorkDir, 0o755)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, sessionWorkDir)
-	ctx, cancelRun := runDeadline(ctx, maxDuration)
+	var policy kernel.BudgetPolicy
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
+	plan := resolveBudgetPlanWithPolicy(maxDuration, taskClockFrom(ctx), policy)
+	ctx, cancelRun := runBudgetDeadline(ctx, plan)
 	defer cancelRun()
 
 	// Pure assistant: DefaultTools as the base; AugmentTools layers in the key's
@@ -149,7 +155,8 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		BashEnv:               proxyEnv(c.proxyAddr, c.proxyCACert), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:            sessionWorkDir,
 		MaxTurns:              maxTurns,
-		MaxDuration:           maxDuration,
+		MaxDuration:           plan.Explore,
+		SettleDuration:        plan.SettleReserve,
 		Compaction:            compactionConfig(c.window),
 		Todos:                 actool.NewTodoStore(),
 		// large tool output spills to cmd-output/ under the session dir with a compact

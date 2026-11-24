@@ -45,15 +45,20 @@ type ResearchGain struct {
 	Evidence  int   `json:"evidence"`
 	Coverage  int64 `json:"coverage"`
 	Artifacts int   `json:"artifacts"`
+	Assets    int   `json:"assets,omitempty"`
+}
+
+func (g ResearchGain) HasNetGain() bool {
+	return g.Evidence > 0 || g.Coverage > 0 || g.Artifacts > 0 || g.Assets > 0
 }
 
 // HasNetGain reports whether the run produced verified research value regardless
 // of whether it settled as done or exhausted (F20).
 func (r RunReceipt) HasNetGain() bool {
 	if r.ResearchGain != nil {
-		return r.ResearchGain.Evidence > 0 || r.ResearchGain.Coverage > 0 || r.ResearchGain.Artifacts > 0
+		return r.ResearchGain.HasNetGain()
 	}
-	if r.FindingsWritten > 0 || r.FactsWritten > 0 {
+	if r.FindingsWritten > 0 || r.FactsWritten > 0 || r.AssetsWritten > 0 {
 		return true
 	}
 	for _, b := range r.ValidBatches {

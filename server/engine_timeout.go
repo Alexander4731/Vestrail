@@ -10,7 +10,6 @@ import (
 
 	"github.com/Alexander4731/Vestrail/agent"
 	"github.com/Alexander4731/Vestrail/db"
-	"github.com/Alexander4731/Vestrail/kernel"
 )
 
 // 任务级超时协调器(见 docs/任务级超时与收尾设计.md §4/§8.5)。
@@ -70,14 +69,33 @@ func (e *Engine) inflightCounter(taskID string) *int64 {
 // beginTaskOperation atomically registers a task-owned operation unless deletion
 // has already installed its barrier. The delete handler can therefore wait for
 // inflight==0 without a check-then-start race recreating files after cleanup.
-func (e *Engine) beginTaskOperation(taskID string) bool {
+func (e *Engine) beginTaskOperation(taskID string, adHoc ...bool) bool {
 	e.deleteMu.RLock()
 	defer e.deleteMu.RUnlock()
 	if e.stopping || e.IsDeleting(taskID) {
 		return false
 	}
-	atomic.AddInt64(e.inflightCounter(taskID), 1)
+	if len(adHoc) > 0 && adHoc[0] {
+		value, _ := e.adHocInflight.LoadOrStore(taskID, new(int64))
+		atomic.AddInt64(value.(*int64), 1)
+	} else {
+		atomic.AddInt64(e.inflightCounter(taskID), 1)
+	}
 	return true
+}
+
+func (e *Engine) decAdHocInflight(taskID string) {
+	if value, ok := e.adHocInflight.Load(taskID); ok {
+		atomic.AddInt64(value.(*int64), -1)
+	}
+}
+
+func (e *Engine) taskOperationCount(taskID string) int64 {
+	count := e.inflightCount(taskID)
+	if value, ok := e.adHocInflight.Load(taskID); ok {
+		count += atomic.LoadInt64(value.(*int64))
+	}
+	return count
 }
 
 func (e *Engine) decInflight(taskID string) { atomic.AddInt64(e.inflightCounter(taskID), -1) }
@@ -209,6 +227,7 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	if !e.markSettling(t.ID) {
 		return
 	}
+	e.resources.forgetWaitingTask(t.ID)
 	log.Printf("[deadline] task %s 到达超时上限,进入收尾时序", t.ID)
 
 	// ④ 等在跑 worker/planner drain(在跑 run 因夹逼的 MaxDuration 自行进收尾);
@@ -236,7 +255,7 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 			if hard := plan.HardDuration(); hard > 0 {
 				finalBudget = hard
 			} else {
-				finalBudget = plan.SettleReserve + kernel.DefaultHardBuffer
+				finalBudget = max(settleDrainGrace, plan.SettleReserve+plan.HardBuffer)
 			}
 		}
 		finalCtx, cancel := context.WithTimeout(ctx, finalBudget)

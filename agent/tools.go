@@ -1578,10 +1578,10 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 		"brief":              str("完整执行交底：背景线索、凭据/路径、验证信号及止损边界；建议不超过 3000 字。"),
 		"continue_intent_id": intp("可选：本任务已 done/exhausted 的上游意图 id，沿同一执行线复用上下文、脚本目录与结构化断点。"),
 		"hypothesis":         str("可选：本轮要证实或排除的具体假设"),
-		"scope":              str("可选：明确执行范围边界（如目标地址、端口段 22001-23000、候选集），用于起跑自检防漂移"),
+		"scope":              str("必填：明确执行范围边界（如目标地址、端口段 22001-23000、候选集），用于起跑自检防漂移"),
 		"preconditions":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：必须先核验的前置条件"},
 		"inputs":             map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "可选：可直接复用的上游产物 [{path, provenance, valid, note}]"},
-		"deliverable":        str("可选：本轮最小交付（含有效阴性结论）"),
+		"deliverable":        str("必填：本轮最小交付（含有效阴性结论）"),
 		"stop_conditions":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：满足即停止并交回的条件"},
 		"max_tool_calls":     intp("可选：执行层硬探测工具调用上限（写回工具不计入）"),
 		"after_intents":      map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：必须全部结束后才可领取的前置意图 id 列表"},
@@ -1600,7 +1600,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 		"intents": map[string]any{
 			"type":        "array",
 			"description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素支持 summary/brief/continue_intent_id/scope/hypothesis/max_tool_calls/after_intents/resource_locks/asset_ids/parent_ids/priority。返回 ids 与数组等长、同序。",
-			"items":       obj(intentProps, "summary", "scope", "deliverable", "max_tool_calls"),
+			"items":       obj(intentProps, "summary", "scope", "deliverable"),
 		},
 		"resolved_hint_ids": map[string]any{
 			"type":        "array",
@@ -2019,7 +2019,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"  · evidence=支撑本结论的【一行】关键证据（命令+关键输出），不要粘大段原文。\n"+
 		"  · confidence=observed（直接看到且已核实）| inferred（据现象推断/尚未做排除性对照）。局部正常观测不能直接写为排除性根因 observed。\n"+
 		"  · 闭区间与唯一覆盖数须严格一致（闭区间 A–B 共 B-A+1 个对象；区分请求数与唯一端口数），无效批次不得核销覆盖。\n"+
-		"  · 若预算不足或前提阻塞交回，建议填写 checkpoint（已完成/剩余范围、有效产物、下一步）与 delivery_status（complete|partial_checkpoint|precondition_blocked|handed_back）。",
+		"  · 中间事实写 record_fact；最终交付状态与断点交接统一提交 finish_work(delivery_status, summary, evidence_ids, checkpoint)。",
 		obj(map[string]any{
 			"facts":                  map[string]any{"type": "array", "description": "【有多条彼此独立结论时用】事实数组，元素字段同下方顶层字段；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"summary":                str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),

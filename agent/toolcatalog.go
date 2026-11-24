@@ -130,8 +130,37 @@ type overriddenTool struct {
 	schema map[string]any
 }
 
-func (o *overriddenTool) Description() string         { return o.desc }
-func (o *overriddenTool) InputSchema() map[string]any { return o.schema }
+func (o *overriddenTool) Description() string { return o.desc }
+func (o *overriddenTool) InputSchema() map[string]any {
+	schema := make(map[string]any, len(o.schema))
+	for key, value := range o.schema {
+		schema[key] = value
+	}
+	defaults := scalarDefaults(o.schema)
+	var required []string
+	switch values := o.schema["required"].(type) {
+	case []string:
+		required = values
+	case []any:
+		for _, value := range values {
+			if name, ok := value.(string); ok {
+				required = append(required, name)
+			}
+		}
+	}
+	filtered := make([]string, 0, len(required))
+	for _, name := range required {
+		if value, ok := defaults[name]; !ok || isEmptyJSON(value) {
+			filtered = append(filtered, name)
+		}
+	}
+	if len(filtered) > 0 {
+		schema["required"] = filtered
+	} else {
+		delete(schema, "required")
+	}
+	return schema
+}
 
 func (o *overriddenTool) ReviewInput(in json.RawMessage) (json.RawMessage, bool, error) {
 	return guard.DescribeInput(o.CoreTool, injectDefaults(in, o.schema))

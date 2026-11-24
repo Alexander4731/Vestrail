@@ -166,7 +166,7 @@ func NewGrep() CoreTool {
 	})
 }
 
-func runGrep(_ context.Context, input json.RawMessage, tc *ToolContext) (Result, error) {
+func runGrep(ctx context.Context, input json.RawMessage, tc *ToolContext) (Result, error) {
 	var in struct {
 		Pattern    string `json:"pattern"`
 		Path       string `json:"path"`
@@ -223,7 +223,7 @@ func runGrep(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 
 	// Prefer the ripgrep binary when available; fall back to the Go walk below.
 	if rg := RipgrepPath(); rg != "" {
-		if res, ok := runWithRipgrep(rg, ripgrepReq{
+		if res, ok := runWithRipgrep(ctx, rg, ripgrepReq{
 			pattern: in.Pattern, glob: in.Glob, typ: in.Type, mode: mode,
 			ignoreCase: in.IgnoreCase, multiline: in.Multiline, showLines: showLines,
 			before: before, after: after, root: root, headLimit: in.HeadLimit, offset: in.Offset,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,7 +35,7 @@ func NewRead() CoreTool {
 
 const maxLineLen = 2000
 
-func runRead(_ context.Context, input json.RawMessage, tc *ToolContext) (Result, error) {
+func runRead(ctx context.Context, input json.RawMessage, tc *ToolContext) (Result, error) {
 	var in struct {
 		FilePath string `json:"file_path"`
 		Offset   int    `json:"offset"`
@@ -51,7 +52,22 @@ func runRead(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 	if info.IsDir() {
 		return Errorf(fmt.Sprintf("Error: %s is a directory, not a file. Use LS or Glob to list its contents.", in.FilePath)), nil
 	}
-	data, err := os.ReadFile(path)
+	const maxReadBytes = 64 * 1024 * 1024
+	if info.Size() > maxReadBytes {
+		return Errorf("文件超过 Read 的 64 MiB 上限，请用 Grep 或按块读取"), nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return Errorf(fmt.Sprintf("Error reading %s: %v", in.FilePath, err)), nil
+	}
+	defer file.Close()
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxReadBytes+1))
+	if len(data) > maxReadBytes {
+		return Errorf("文件超过 Read 的 64 MiB 上限，请用 Grep 或按块读取"), nil
+	}
 	if err != nil {
 		return Errorf(fmt.Sprintf("Error reading %s: %v", in.FilePath, err)), nil
 	}
@@ -78,7 +94,7 @@ func runRead(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 	for i := start; i < end; i++ {
 		line := lines[i]
 		if len(line) > maxLineLen {
-			line = line[:maxLineLen] + "… [line truncated]"
+			line = cutHead(line, maxLineLen) + "… [line truncated]"
 		}
 		fmt.Fprintf(&b, "%6d\t%s\n", i+1, line)
 	}
@@ -121,7 +137,7 @@ func headWithinBudget(s string, max int) (string, int) {
 	}
 	cut := strings.LastIndexByte(s[:max], '\n')
 	if cut < 0 {
-		return s[:max], 0
+		return cutHead(s, max), 0
 	}
 	head := s[:cut+1]
 	return head, strings.Count(head, "\n")

@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.3.30] - 2026-11-24
+
+- 修复流式协议与 KV 缓存保真：`completeToolTurn` 按 `ToolIndex` 支持 OpenAI 兼容并行交错工具调用并保留失败累计用量；OpenAI Responses API 流补发 `SEMessageStop`、解析 `response.error.message` 与并行 `output_index`；收尾阶段保持 `req.Tools` 不可变并在执行入口拦截禁用工具；修复 `OpenAI` `Thinking="disabled"` 误发字段与兼容回退缓存；修复压缩后过期 `lastInputTokens`、`microCompact` 越界扫描、32K 窗口抖动、断流派发 `{}` 工具与 goroutine 泄漏、多片 `SEThinkingSignature` 覆盖、NOA 窗口与缓存边界及 `tool.ValidateInput` 校验边界。
+- 修复任务调度与并发隔离：`plannerLoop` 拆分定时器来源防止空闲心跳门吞掉重试与退避；`intentResourceTracker` 按任务隔离非共享锁并消除幽灵等待者；`CompareAndSetIntentState`/`ReopenBlockedIntents`/`ResetRunningIntents` 修复 `owner='adhoc'` 滞留与误暂停；`AfterIntents` 对已删除/取消前置不再死锁；恢复 Worker 瞬时流错误重试循环；修复 `settleTask` 排空干扰、`archiveTask` 顺序与并发调度触发。
+- 修复交付、证据与规划闭环：统一 Worker 全链路提示词调用 `finish_work` 并防丢 Checkpoint 与 `ForkFrom` 交接块；重构 `ObservedEvidenceKey` 去白名单/防措辞伪造并补资产净增量；修复 `CompleteScopeCovered`/`ValidateScopeBatches`/`CoverageTracker`/`VerifyArtifact` 对常规扫描、多区间与多方法覆盖的误拒；修复 `planner_epoch` 回灌己方变更、`add_intent` 契约对齐、`exhausted` 换范围接力、`FreshParentEvidence` 并发证据与 `insert_assets` 端点 IP 关联。
+- 统一时间预算、流量分桶、数据库完整性与前后端闭环：`kernel/budget.go` 与 `ChatAgent`/`runFinalPlannerRound` 对齐硬宽限与不限时收尾；代理流量按上游代理/目标主机分桶并隔离 Passthrough CONNECT 隧道；`intent_run_receipts` 补齐外键级联、唯一约束、行锁、归档恢复与清理，`SettleIntent` 加固幂等校验，`RecordFactLinked` 修复 NULL 去重与热点行锁并补部分索引；修复 `report/` 中文文件名截断与 `"info"` 排序；前端任务总览与会话页暴露 `blocked_reason`、最新回执状态及 `exhausted`/`stopped` 重跑入口。
+
 ## [0.3.29] - 2026-11-24
 
 - 收尾预留和硬宽限可配置，阶段压缩遵守实际截止时间，任务总控采用在跑执行的硬截止时间。

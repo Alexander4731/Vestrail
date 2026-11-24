@@ -472,6 +472,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	system, boundary := deferredSystem(sysBody, def)
 	// run_seconds=0 表示真正不限时（不再静默回落 5 分钟），两阶段预算预留收尾窗 (F01/F02/F03)。
 	plan := resolveBudgetPlanWithPolicy(p.runTimeout, tc, p.budgetPolicy)
+	if tc.Final && plan.Total == 0 {
+		finalBudget := plan.SettleReserve + plan.HardBuffer + 30*time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			finalBudget = time.Until(deadline)
+		}
+		plan.Explore = max(30*time.Second, finalBudget-plan.SettleReserve-plan.HardBuffer)
+		plan.Total = plan.Explore + plan.SettleReserve
+	}
 	ctx, cancelRun := runBudgetDeadline(ctx, plan)
 	defer cancelRun()
 	settle := wrapupSettlement("planner", nil)
