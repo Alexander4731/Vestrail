@@ -108,11 +108,15 @@ func (e *streamExec) processQueue() {
 	}
 }
 
-func (e *streamExec) abortAndWait() {
+func (e *streamExec) abort() {
 	e.mu.Lock()
 	e.aborted = true
 	e.cancel()
 	e.mu.Unlock()
+}
+
+func (e *streamExec) abortAndWait() {
+	e.abort()
 	e.wg.Wait()
 }
 

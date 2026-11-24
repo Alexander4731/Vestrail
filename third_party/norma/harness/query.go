@@ -938,7 +938,12 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 	}
 	exec = newStreamExec(l)
 	defer func() {
-		if err != nil || consumerStopped || aborted {
+		if aborted {
+			// finish() already synthesized interrupted results for unresponsive
+			// tools; stop queued work and cancel toolCtx without blocking exit on
+			// a late-returning tool whose receipt will be persisted asynchronously.
+			exec.abort()
+		} else if err != nil || consumerStopped {
 			exec.abortAndWait()
 		} else {
 			exec.cancel()
@@ -1050,7 +1055,12 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	exec = newStreamExec(l)
 	defer func() {
-		if err != nil || consumerStopped || aborted {
+		if aborted {
+			// finish() already synthesized interrupted results for unresponsive
+			// tools; stop queued work and cancel toolCtx without blocking exit on
+			// a late-returning tool whose receipt will be persisted asynchronously.
+			exec.abort()
+		} else if err != nil || consumerStopped {
 			exec.abortAndWait()
 		} else {
 			exec.cancel()

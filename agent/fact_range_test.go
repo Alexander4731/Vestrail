@@ -29,7 +29,7 @@ func TestAuditFix_FactRangeConsistencyOnWrite(t *testing.T) {
 	}
 
 	result, err = recordFact.Call(t.Context(), json.RawMessage(`{"facts":[
-		{"summary":"invalid fixture", "detail":"22,001–23,000，共 2,000 个端口"},
+		{"summary":"invalid fixture", "detail":"22,001–23,000，共扫描 2,000 个端口"},
 		{"summary":"22,001–23,000，共 1,000 个端口","confidence":"observed"},
 		{"summary":"22001–23000，共 12 个端口开放"}
 	]}`), nil)
