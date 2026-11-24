@@ -249,7 +249,7 @@ type loop struct {
 	startTime       time.Time // loop start, for MaxDuration (wall-clock budget)
 
 	// settlement (wrap-up) phase state, entered when a budget is hit
-	disabledTools map[string]bool
+	disabledTools atomic.Pointer[map[string]bool]
 	settling      bool
 	settleReason  TerminalReason // the budget reason to finish with after wrap-up
 	settleTurn    int
@@ -744,10 +744,11 @@ func (l *loop) beginSettlement(reason TerminalReason, schemas *[]llm.ToolSchema)
 	l.settling = true
 	l.settleReason = reason
 	l.settleTurn = 0
-	l.disabledTools = make(map[string]bool, len(s.DisabledTools))
+	disabled := make(map[string]bool, len(s.DisabledTools))
 	for _, name := range s.DisabledTools {
-		l.disabledTools[name] = true
+		disabled[name] = true
 	}
+	l.disabledTools.Store(&disabled)
 	return true
 }
 
