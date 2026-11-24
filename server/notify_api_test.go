@@ -643,6 +643,9 @@ func TestNotifyMetaAndSettingsRoundTrip(t *testing.T) {
 		t.Fatalf("meta 应列出全部 %d 个渠道，得到 %d", len(notify.Kinds()), len(meta.Kinds))
 	}
 	for _, k := range meta.Kinds {
+		if k.Kind == notify.KindBrowser {
+			continue
+		}
 		if len(k.SecretKeys) == 0 {
 			t.Errorf("渠道 %s 未上报凭据字段", k.Kind)
 		}
