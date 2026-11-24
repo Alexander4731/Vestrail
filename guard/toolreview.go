@@ -57,6 +57,9 @@ func (h *reviewHooks) PreToolUse(ctx context.Context, name string, input []byte)
 	if err != nil {
 		return true, "无法生成执行描述: " + err.Error(), nil
 	}
+	if name == "Bash" {
+		description = enrichBashDescriptionWithScripts(intercept.WorkingDirFromContext(ctx), description)
+	}
 	ctx = context.WithValue(ctx, externalReviewKey{}, external)
 	blocked, message, updated := h.HookRunner.PreToolUse(ctx, name, description)
 	if len(updated) != 0 {

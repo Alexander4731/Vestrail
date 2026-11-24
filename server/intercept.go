@@ -456,6 +456,18 @@ func (s *Server) interceptSetJudgeConfig(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, "ask_timeout_action 必须是 allow 或 deny")
 		return
 	}
+	switch req.Mode {
+	case "", "off", "risk_only", "all":
+	default:
+		writeErr(w, 400, "mode 必须是 off、risk_only 或 all")
+		return
+	}
+	switch req.RiskPreset {
+	case "", "strict", "balanced", "relaxed":
+	default:
+		writeErr(w, 400, "risk_preset 必须是 strict、balanced 或 relaxed")
+		return
+	}
 	if err := s.m.interceptor.SetJudgeConfig(req); err != nil {
 		writeErr(w, 500, err.Error())
 		return

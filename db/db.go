@@ -282,6 +282,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV4(); err != nil {
 		return fmt.Errorf("seed intercept rules v4: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV5(); err != nil {
+		return fmt.Errorf("seed intercept rules v5: %w", err)
+	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
@@ -700,4 +703,114 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		}
 	}
 	return d.SetSetting("intercept_default_rules_v4", "done")
+}
+
+// Exported V5 high-risk rule patterns for unit testing without a live DB.
+const (
+	// R1: hard deny — container/cluster/IaC destruction beyond terraform destroy.
+	infraDestroyV5Pattern = `(?i)\bpulumi\s+destroy\b|\bkubectl\s+delete\s+(?:ns|namespace|all|cluster|node|pv|pvc)\b|\bdocker\s+(?:system\s+prune|volume\s+(?:prune|rm))\b`
+	// R2: approval required — factory reset, default restore, system/config reinit, full wipe (camelCase + snake/kebab).
+	factoryResetV5Pattern = `(?i)(?:/|\b)(?:restore[-_]?factory[\w-]*|factory[-_]?reset[\w-]*|reset[-_]?factory[\w-]*|factory[-_]?restore[\w-]*|restore[-_]?default[\w-]*|reset[-_]?to[-_]?default[\w-]*|reset[-_]?default[\w-]*|reset[-_]?all[\w-]*|reset[-_]?system[\w-]*|sys[-_]?reset[\w-]*|reset[-_]?config[\w-]*|reinit(?:ialize)?[\w-]*|init[-_]?system[\w-]*|clear[-_]?all[\w-]*|wipe[-_]?all[\w-]*|purge[-_]?all[\w-]*)(?:[/?#"'\s(,;]|$)`
+	// R3: approval required — HTTP/API service restart/stop/reboot/shutdown + OS service disruption.
+	serviceDisruptV5Pattern = `(?i)/(?:restart|reboot|shutdown|poweroff|halt|stop[-_]?service|batch[-_]?stop|kill[-_]?service|disable[-_]?service)[\w-]*(?:[/?#"'\s(,;]|$)|\b(?:systemctl\s+(?:stop|disable|mask|reboot|poweroff|halt)|service\s+\S+\s+stop|Stop-Service|Restart-Computer|Stop-Computer)\b`
+	// R4a: approval required — software/plugin/agent uninstall & package purge.
+	uninstallV5Pattern = `(?i)/(?:uninstall|deinstall|remove[-_]?(?:plugin|module|agent|app|package|service|node))[\w-]*(?:[/?#"'\s(,;]|$)|\b(?:apt(?:-get)?|yum|dnf|apk|pacman|brew|choco|winget)\s+(?:remove|purge|uninstall|erase|autoremove)\b|\brpm\s+-e\b|\bmsiexec\b[^|\n"]{0,120}\s/x\b|\b(?:Uninstall-Package|Remove-WindowsFeature|helm\s+uninstall)\b`
+	// R4b: approval required — firmware flash, cluster patch install, backup/config overwrite & rollback.
+	firmwarePatchRestoreV5Pattern = `(?i)/(?:install(?:ForClusterNode|Patch|Firmware|Agent|Update)|flash(?:Firmware|Image)|upgrade(?:System|Firmware|Cluster)|restore(?:Config|Configuration|Backup|Snapshot|Database|Db)|rollback|deployNode)[\w-]*(?:[/?#"'\s(,;]|$)`
+	// R5: approval required — password reset, account lock/ban/delete, bulk permission revoke.
+	accountTamperV5Pattern = `(?i)/(?:reset(?:User|Admin)?(?:Pwd|Pass|Password)|changeAdminP(?:wd|ass)|disable(?:User|Admin|Account)|lock(?:User|Account)|ban(?:User|Account)|delete(?:User|Admin|Account|Role)|revokeAll)[\w-]*(?:[/?#"'\s(,;]|$)|(?:^|[;&|\s"'])(?:passwd|chpasswd|userdel|deluser)\s+\S|\bnet\s+user\s+\S+[^|\n"]{0,60}/delete\b`
+)
+
+// seedDefaultInterceptRulesV5 closes the camelCase HTTP/API and enterprise ops
+// blind spots (factory reset, service restart/stop, uninstall, firmware/patch
+// flash, backup overwrite, account tampering, and k8s/docker/pulumi destruction).
+// Policy Option A: R1 irreversible infra destruction is hard-denied; R2–R5
+// high-risk operational actions default to human approval (ask, 300s timeout → deny).
+func (d *DB) seedDefaultInterceptRulesV5() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v5"); v == "done" {
+		return nil
+	}
+	type rule struct {
+		name           string
+		pattern        string
+		action         string
+		message        string
+		priority       int
+		timeoutEnabled bool
+		timeoutSeconds int
+		timeoutAction  string
+	}
+	rules := []rule{
+		{
+			name:           "[内置] 基础设施与容器销毁（K8s / Docker / Pulumi）",
+			pattern:        infraDestroyV5Pattern,
+			action:         "deny",
+			message:        "[R1 毁灭性操作] 禁止执行基础设施/容器集群销毁命令（pulumi destroy / kubectl delete ns|cluster|all / docker system|volume prune）",
+			priority:       95,
+			timeoutEnabled: false,
+			timeoutSeconds: 60,
+			timeoutAction:  "deny",
+		},
+		{
+			name:           "[内置] 恢复出厂 / 全量重置接口（需审批）",
+			pattern:        factoryResetV5Pattern,
+			action:         "ask",
+			message:        "[R2 恢复出厂与重置] 检测到恢复出厂设置、重置默认配置或全量清空接口（如 restoreFactorySettings / factoryReset / resetDefault / resetAll），需人工审批后方可执行",
+			priority:       90,
+			timeoutEnabled: true,
+			timeoutSeconds: 300,
+			timeoutAction:  "deny",
+		},
+		{
+			name:           "[内置] 服务重启 / 停服 / 关机接口（需审批）",
+			pattern:        serviceDisruptV5Pattern,
+			action:         "ask",
+			message:        "[R3 服务中断] 检测到重启或停止服务/集群/主机操作（如 restartTomcat / restartCluster / batchStopService / systemctl stop），需人工审批后方可执行",
+			priority:       85,
+			timeoutEnabled: true,
+			timeoutSeconds: 300,
+			timeoutAction:  "deny",
+		},
+		{
+			name:           "[内置] 卸载 / 移除组件与软件包（需审批）",
+			pattern:        uninstallV5Pattern,
+			action:         "ask",
+			message:        "[R4 卸载与移除] 检测到卸载软件、插件、Agent 或软件包操作（如 /uninstall / apt purge / rpm -e / helm uninstall），需人工审批后方可执行",
+			priority:       85,
+			timeoutEnabled: true,
+			timeoutSeconds: 300,
+			timeoutAction:  "deny",
+		},
+		{
+			name:           "[内置] 刷机 / 补丁安装 / 备份配置恢复（需审批）",
+			pattern:        firmwarePatchRestoreV5Pattern,
+			action:         "ask",
+			message:        "[R4 变更与覆盖] 检测到固件刷写、集群补丁安装、节点部署或配置/备份覆盖恢复操作（如 installForClusterNode / restoreConfiguration / flashFirmware），需人工审批后方可执行",
+			priority:       80,
+			timeoutEnabled: true,
+			timeoutSeconds: 300,
+			timeoutAction:  "deny",
+		},
+		{
+			name:           "[内置] 账号口令重置 / 封禁 / 删除用户（需审批）",
+			pattern:        accountTamperV5Pattern,
+			action:         "ask",
+			message:        "[R5 账号与权限篡改] 检测到修改/重置口令、禁用/封禁或删除账号操作（如 resetPassword / disableUser / passwd / userdel），需人工审批后方可执行",
+			priority:       85,
+			timeoutEnabled: true,
+			timeoutSeconds: 300,
+			timeoutAction:  "deny",
+		},
+	}
+	for _, r := range rules {
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+SELECT $1, true, $2, 'tool_input', 'regex', $3, $4, $5, $6, $7, $8
+WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
+			r.name, r.priority, r.pattern, r.action, r.message, r.timeoutEnabled, r.timeoutSeconds, r.timeoutAction,
+		); err != nil {
+			return fmt.Errorf("rule %q: %w", r.name, err)
+		}
+	}
+	return d.SetSetting("intercept_default_rules_v5", "done")
 }

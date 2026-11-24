@@ -1506,6 +1506,9 @@ func (t *ToolSet) addOneIntentMode(it intentItem, requireContract ...bool) (int6
 		}
 	}
 	payload := map[string]any{"summary": it.Summary}
+	if err := checkIntentDestructiveRisk(&it); err != nil {
+		return 0, false, err
+	}
 	if brief := strings.TrimSpace(it.Brief); brief != "" {
 		payload["brief"] = truncRuneSummary(brief, 3000)
 		if payload["brief"] != brief {

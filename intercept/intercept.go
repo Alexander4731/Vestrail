@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -316,41 +317,52 @@ type Decision struct {
 // Judge settings keys (stored in the settings KV table). See docs §3.
 const (
 	settingJudgeEnabled          = "llm_judge_enabled"
+	settingJudgeMode             = "llm_judge_mode"
 	settingJudgeProfileID        = "llm_judge_profile_id"
 	settingJudgePrompt           = "llm_judge_prompt"
 	settingJudgeTimeoutSecs      = "llm_judge_timeout_seconds"
 	settingJudgeFailAction       = "llm_judge_fail_action"
 	settingJudgeAskTimeoutSecs   = "llm_judge_ask_timeout_seconds"
 	settingJudgeAskTimeoutAction = "llm_judge_ask_timeout_action"
+	settingHTTPGateEnabled       = "intercept_http_gate_enabled"
+	settingRiskPreset            = "intercept_risk_preset"
 )
 
 // Judge default values.
 const (
+	defaultJudgeMode             = "risk_only"
 	defaultJudgeTimeoutSecs      = 15
 	defaultJudgeFailAction       = "ask"
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
+	defaultRiskPreset            = "balanced"
 )
 
-// JudgeConfig is the resolved LLM-fallback-judge configuration. Prompt is always
-// non-empty (falls back to DefaultJudgePrompt).
+// JudgeConfig is the resolved LLM-fallback-judge & risk-governance configuration.
+// Prompt is always non-empty (falls back to DefaultJudgePrompt).
 type JudgeConfig struct {
 	Enabled           bool   `json:"enabled"`
+	Mode              string `json:"mode"` // "off" | "risk_only" | "all"
 	ProfileID         int64  `json:"profile_id"` // 0 = follow active/default
 	Prompt            string `json:"prompt"`
 	TimeoutSeconds    int    `json:"timeout_seconds"`
 	FailAction        string `json:"fail_action"` // allow|ask|deny
 	AskTimeoutSeconds int    `json:"ask_timeout_seconds"`
 	AskTimeoutAction  string `json:"ask_timeout_action"` // allow|deny
+	HTTPGateEnabled   bool   `json:"http_gate_enabled"`
+	RiskPreset        string `json:"risk_preset"` // "strict" | "balanced" | "relaxed"
+
+	explicitEnabled bool // true when llm_judge_enabled or llm_judge_mode was explicitly persisted
 }
 
 // judgeConfig reads the judge configuration from settings, applying defaults for
 // missing/invalid keys. Read fresh on each fallback judgement — the LLM call that
 // follows dwarfs a few KV reads, and freshness avoids a cache-invalidation path.
 func (i *Interceptor) LoadJudgeConfig() (JudgeConfig, error) {
-	values, err := i.db.GetSettings([]string{settingJudgeEnabled, settingJudgeProfileID,
+	values, err := i.db.GetSettings([]string{settingJudgeEnabled, settingJudgeMode, settingJudgeProfileID,
 		settingJudgePrompt, settingJudgeTimeoutSecs, settingJudgeFailAction,
-		settingJudgeAskTimeoutSecs, settingJudgeAskTimeoutAction})
+		settingJudgeAskTimeoutSecs, settingJudgeAskTimeoutAction,
+		settingHTTPGateEnabled, settingRiskPreset})
 	if err != nil {
 		return JudgeConfig{}, err
 	}
@@ -378,14 +390,36 @@ func (i *Interceptor) LoadJudgeConfig() (JudgeConfig, error) {
 		err = fmt.Errorf("invalid %s", key)
 		return def
 	}
-	enabled := choice(settingJudgeEnabled, "false", "true", "false", "1", "0")
+	_, hasEnabled := values[settingJudgeEnabled]
+	_, hasMode := values[settingJudgeMode]
+	enabledStr := choice(settingJudgeEnabled, "true", "true", "false", "1", "0")
+	enabled := enabledStr == "true" || enabledStr == "1"
+	mode := choice(settingJudgeMode, "", "off", "risk_only", "all")
+	switch {
+	case !hasEnabled && !hasMode:
+		// Default ON in selective risk_only mode (zero cost for pure read-only recon).
+		enabled = true
+		mode = defaultJudgeMode
+	case hasMode && mode != "":
+		enabled = mode != "off"
+	case hasEnabled && enabled:
+		// Legacy explicit opt-in without llm_judge_mode preserved as "all".
+		mode = "all"
+	default:
+		mode = "off"
+	}
+	httpGateStr := choice(settingHTTPGateEnabled, "true", "true", "false", "1", "0")
 	c := JudgeConfig{
-		Enabled:           enabled == "true" || enabled == "1",
+		Enabled:           enabled,
+		Mode:              mode,
 		ProfileID:         int64(integer(settingJudgeProfileID, 0)),
 		TimeoutSeconds:    integer(settingJudgeTimeoutSecs, defaultJudgeTimeoutSecs),
 		FailAction:        choice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny"),
 		AskTimeoutSeconds: integer(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
 		AskTimeoutAction:  choice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
+		HTTPGateEnabled:   httpGateStr == "true" || httpGateStr == "1",
+		RiskPreset:        choice(settingRiskPreset, defaultRiskPreset, "strict", "balanced", "relaxed"),
+		explicitEnabled:   hasEnabled || hasMode,
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v := values[settingJudgePrompt]; strings.TrimSpace(v) != "" {
@@ -430,6 +464,28 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	if c.AskTimeoutAction != "allow" && c.AskTimeoutAction != "deny" {
 		return fmt.Errorf("invalid ask_timeout_action")
 	}
+	mode := strings.TrimSpace(c.Mode)
+	switch mode {
+	case "":
+		if c.Enabled {
+			mode = "all"
+		} else {
+			mode = "off"
+		}
+	case "off":
+		c.Enabled = false
+	case "risk_only", "all":
+		c.Enabled = true
+	default:
+		return fmt.Errorf("invalid mode")
+	}
+	preset := strings.TrimSpace(c.RiskPreset)
+	if preset == "" {
+		preset = defaultRiskPreset
+	}
+	if preset != "strict" && preset != "balanced" && preset != "relaxed" {
+		return fmt.Errorf("invalid risk_preset")
+	}
 	// Store the prompt only when it differs from the built-in template, so version
 	// updates to DefaultJudgePrompt flow through for users who never customized it.
 	promptToStore := ""
@@ -438,12 +494,15 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	}
 	return i.db.SetSettings(map[string]string{
 		settingJudgeEnabled:          strconv.FormatBool(c.Enabled),
+		settingJudgeMode:             mode,
 		settingJudgeProfileID:        strconv.FormatInt(c.ProfileID, 10),
 		settingJudgePrompt:           promptToStore,
 		settingJudgeTimeoutSecs:      strconv.Itoa(c.TimeoutSeconds),
 		settingJudgeFailAction:       c.FailAction,
 		settingJudgeAskTimeoutSecs:   strconv.Itoa(c.AskTimeoutSeconds),
 		settingJudgeAskTimeoutAction: c.AskTimeoutAction,
+		settingHTTPGateEnabled:       strconv.FormatBool(c.HTTPGateEnabled),
+		settingRiskPreset:            preset,
 	})
 }
 
@@ -461,10 +520,22 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	i.mu.RLock()
 	rv := i.reviewer
 	i.mu.RUnlock()
-	if !cfg.Enabled {
+	if !cfg.Enabled || cfg.Mode == "off" {
 		return Decision{}, false
 	}
+	if cfg.Mode == "risk_only" {
+		risk := ClassifyRisk(tool, arguments)
+		if !risk.NeedsJudge {
+			return Decision{}, false
+		}
+		if cfg.RiskPreset == "relaxed" && risk.Level != "critical" {
+			return Decision{}, false
+		}
+	}
 	if rv == nil {
+		if !cfg.explicitEnabled {
+			return Decision{}, false
+		}
 		return Decision{Action: "deny", Message: "模型审批尚未就绪"}, true
 	}
 
@@ -546,8 +617,15 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	if len(rules) == 0 {
 		return Decision{}, false
 	}
+	skipInput := IsBenignDocWrite(toolName, input)
+	sanitized := ""
+	normalized := ""
+	if !skipInput {
+		sanitized = SanitizeWriteInputForMatch(toolName, input)
+		normalized = NormalizeForMatch(sanitized)
+	}
 	for _, r := range rules {
-		if ruleMatches(r, toolName, input) {
+		if ruleMatchesNormalized(r, toolName, sanitized, normalized, skipInput) {
 			msg := r.Message
 			if msg == "" {
 				msg = defaultMessage(r.Action, r.Name)
@@ -567,20 +645,100 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	return Decision{}, false
 }
 
-func ruleMatches(r compiledRule, toolName string, input []byte) bool {
-	var subject string
+func ruleMatchesNormalized(r compiledRule, toolName, sanitized, normalized string, skipInput bool) bool {
 	switch r.MatchTarget {
 	case "tool_name":
-		subject = toolName
+		if r.MatchType == "regex" {
+			return r.re != nil && r.re.MatchString(toolName)
+		}
+		return strings.Contains(toolName, r.Pattern)
 	case "tool_input":
-		subject = string(input)
+		if skipInput {
+			return false
+		}
+		if r.MatchType == "regex" {
+			if r.re == nil {
+				return false
+			}
+			return r.re.MatchString(sanitized) || (normalized != sanitized && r.re.MatchString(normalized))
+		}
+		return strings.Contains(sanitized, r.Pattern) || (normalized != sanitized && strings.Contains(normalized, r.Pattern))
 	default:
 		return false
 	}
-	if r.MatchType == "regex" {
-		return r.re != nil && r.re.MatchString(subject)
+}
+
+// EvaluateHTTPRequest enforces the outbound HTTP proxy risk gate (Layer 4).
+// It inspects live HTTP requests before they leave the proxy so dynamically
+// constructed URLs or scripts that read endpoints from files cannot bypass
+// static tool-input checks.
+func (i *Interceptor) EvaluateHTTPRequest(ctx context.Context, method, rawURL string) (allowed bool, statusCode int, reason string) {
+	cfg, cfgErr := i.LoadJudgeConfig()
+	if cfgErr == nil && !cfg.HTTPGateEnabled {
+		return true, 0, ""
 	}
-	return strings.Contains(subject, r.Pattern)
+	method = strings.ToUpper(strings.TrimSpace(method))
+	path := rawURL
+	if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
+		path = u.Path
+		if u.RawQuery != "" {
+			path += "?" + u.RawQuery
+		}
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"method": method,
+		"url":    rawURL,
+		"path":   path,
+	})
+	isSafeMethod := method == "GET" || method == "HEAD" || method == "OPTIONS"
+
+	dec, matched := i.Match("http_proxy", payload)
+	if matched {
+		switch dec.Action {
+		case "allow":
+			return true, 0, ""
+		case "deny":
+			i.Log(ctx, 0, dec, "http_proxy", payload, "denied")
+			return false, 403, dec.Message
+		case "ask":
+			if cfg.RiskPreset == "relaxed" {
+				return true, 0, ""
+			}
+			if !i.HandleAsk(ctx, 0, dec, "http_proxy", payload) {
+				return false, 403, "人工审批未通过（" + dec.Message + "）"
+			}
+			return true, 0, ""
+		}
+	}
+
+	risk := ClassifyRisk("http_proxy", payload)
+	if isSafeMethod && risk.Level != "critical" && risk.Level != "high" {
+		return true, 0, ""
+	}
+	if risk.Domain == "R1" {
+		dec := Decision{
+			Action:   "deny",
+			RuleName: risk.DomainLabel,
+			Message:  "[HTTP代理风险闸门] " + risk.DomainLabel + "：" + method + " " + path,
+		}
+		i.Log(ctx, 0, dec, "http_proxy", payload, "denied")
+		return false, 403, dec.Message
+	}
+	if cfg.RiskPreset != "relaxed" && (risk.Domain == "R2" || risk.Domain == "R3" || risk.Domain == "R4" || risk.Domain == "R5") {
+		dec := Decision{
+			Action:         "ask",
+			RuleName:       risk.DomainLabel,
+			Message:        "[HTTP代理风险闸门] 检测到高危目标请求（" + risk.DomainLabel + "）：" + method + " " + path,
+			TimeoutEnabled: true,
+			TimeoutSeconds: cfg.AskTimeoutSeconds,
+			TimeoutAction:  cfg.AskTimeoutAction,
+		}
+		if !i.HandleAsk(ctx, 0, dec, "http_proxy", payload) {
+			return false, 403, "人工审批未通过（" + dec.Message + "）"
+		}
+		return true, 0, ""
+	}
+	return true, 0, ""
 }
 
 func defaultMessage(action, name string) string {

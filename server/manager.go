@@ -385,6 +385,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[traffic] disabled: %v", err)
 		}
 		if tr != nil {
+			tr.SetHTTPGate(m.interceptor.EvaluateHTTPRequest)
 			m.traffic = tr
 			go func() {
 				log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())

@@ -113,7 +113,8 @@ function sdkTool(key: string, description: string): Tool {
 }
 
 const SDK_EXEC: Tool[] = [
-  sdkTool("Bash",        "在 shell 中执行命令"),
+  sdkTool("Bash",        "在 shell 中执行命令（自动解引用本地脚本送审）"),
+  sdkTool("RunScript",   "在工作目录写入脚本并前台执行"),
   sdkTool("WebFetch",    "发起 HTTP/HTTPS 请求（含代理支持）"),
   sdkTool("web_search",  "网络搜索"),
   sdkTool("shell_open",  "开启持久 PTY 交互会话"),
@@ -200,13 +201,16 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 const FOLLOW_ACTIVE = "0"; // profile_id 0 = 跟随激活/默认配置
 
 const defaultJudge = (): JudgeConfig => ({
-  enabled: false,
+  enabled: true,
+  mode: "risk_only",
   profile_id: 0,
   prompt: "",
   timeout_seconds: 15,
-  fail_action: "allow",
+  fail_action: "ask",
   ask_timeout_seconds: 300,
   ask_timeout_action: "deny",
+  http_gate_enabled: true,
+  risk_preset: "balanced",
 });
 
 function JudgeCard() {
@@ -297,10 +301,59 @@ function JudgeCard() {
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="text-xs text-muted-foreground">{cfg.enabled ? "已启用" : "未启用"}</span>
-          <Switch checked={cfg.enabled} disabled={loading} onCheckedChange={(v) => patch({ enabled: v })} />
+          <span className="text-xs text-muted-foreground">{cfg.enabled ? (cfg.mode === "all" ? "全量审查" : "按需审查") : "未启用"}</span>
+          <Switch
+            checked={cfg.enabled}
+            disabled={loading}
+            onCheckedChange={(v) => patch({ enabled: v, mode: v ? (cfg.mode && cfg.mode !== "off" ? cfg.mode : "risk_only") : "off" })}
+          />
         </div>
       </div>
+
+      {/* 全局风险管控模式 + 出站 HTTP 代理实时闸门 */}
+      <Card>
+        <CardContent className="grid gap-4 p-4 sm:grid-cols-3">
+          <Field label="风险管控预设">
+            <Select
+              value={cfg.risk_preset || "balanced"}
+              onValueChange={(v) => patch({ risk_preset: v as JudgeConfig["risk_preset"] })}
+            >
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="strict">严格模式（生产/高敏目标）</SelectItem>
+                <SelectItem value="balanced">均衡模式（默认 · R1禁 / R2–R5审批）</SelectItem>
+                <SelectItem value="relaxed">宽松模式（靶场 / CTF）</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label="模型裁判触发策略">
+            <Select
+              value={cfg.enabled ? (cfg.mode || "risk_only") : "off"}
+              onValueChange={(v) => patch({ mode: v as JudgeConfig["mode"], enabled: v !== "off" })}
+            >
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="risk_only">仅高危与写操作按需审查（推荐）</SelectItem>
+                <SelectItem value="all">全部未命中规则调用</SelectItem>
+                <SelectItem value="off">关闭模型裁判</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <div className="flex items-center justify-between gap-2 rounded-lg border bg-muted/20 px-3 py-2">
+            <div className="min-w-0">
+              <p className="text-xs font-medium leading-tight">出站 HTTP 代理高危闸门</p>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">
+                在请求离网前实时拦截/审批恢复出厂、重启、卸载、删除等接口
+              </p>
+            </div>
+            <Switch
+              checked={cfg.http_gate_enabled ?? true}
+              disabled={loading}
+              onCheckedChange={(v) => patch({ http_gate_enabled: v })}
+            />
+          </div>
+        </CardContent>
+      </Card>
 
       {/* 审批 Token 用量统计(全局累计,独立于各模型配置) */}
       {cfg.enabled && usage && (

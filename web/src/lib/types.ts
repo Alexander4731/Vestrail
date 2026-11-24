@@ -1473,12 +1473,15 @@ export interface InterceptPending {
 // JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
 export interface JudgeConfig {
   enabled: boolean;
+  mode?: "off" | "risk_only" | "all"; // 触发模式: off=关闭, risk_only=仅高危与写操作按需审查(默认), all=全量
   profile_id: number; // 0 = 跟随激活/默认配置
   prompt: string; // 判定提示词;GET 未设置时后端回填内置模板全文
   timeout_seconds: number; // 模型调用超时
   fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
   ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
+  http_gate_enabled?: boolean; // 出站 HTTP 代理实时高危闸门(默认开启)
+  risk_preset?: "strict" | "balanced" | "relaxed"; // 风险管控模式预设
 }
 
 // JudgeUsage: 模型兜底审批(judge 通道)的累计 token 用量 + 近 N 天每日序列。

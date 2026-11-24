@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [0.3.31] - 2026-11-24
+
+- 新增全链路高危操作风险管控（R1–R6 五层纵深防御）：新增内置规则 V5 迁移（R1 容器/K8s/Pulumi 销毁默认硬拒绝，R2 恢复出厂/全量重置、R3 服务重启/停服、R4 卸载/刷机/补丁/配置恢复覆盖、R5 口令重置/封禁/删除用户默认人工审批且 300s 超时安全拒绝）。
+- 升级输入归一化与反误杀机制：支持驼峰拆词、JSON 斜杠反转义与 URL 解码以封堵驼峰接口漏网；自动豁免纯文档（`.md`/`.txt`/`.log`）写入与脚本内安全过滤黑名单正则，避免误杀诱导绕过。
+- 新增 `Bash` 本地脚本解引用审查：执行工作目录内 `.py`/`.js`/`.ps1`/`.sh` 等脚本时自动展开脚本正文送审并严格防护路径穿越。
+- 新增按需语义裁判（`llm_judge_mode = risk_only` 默认开启）与风险管控预设（`strict`/`balanced`/`relaxed`）：纯只读侦察零消耗快速放行，仅对状态变更、无 `WHERE` SQL 写操作、高权凭据写接口及高危动词调用触发轻量模型裁判。
+- 新增出站 HTTP 代理实时硬闸门（`traffic.SetHTTPGate` 默认开启）：在 `go-mitmproxy` 转发目标请求前实时执行规则与 R1–R5 风险检查（支持 `403` 直接阻断或挂起人工审批，不拨号目标且不触发透传降级）。
+- 固化 Planner/Worker 代码级反破坏红线与 `add_intent` 高危意图预检，并在前端拦截策略与审批记录页补充风险预设、触发策略、HTTP 代理闸门开关及 `R1–R6` / `HTTP 代理闸门` 风险标签。
+
 ## [0.3.30] - 2026-11-24
 
 - 修复流式协议与 KV 缓存保真：`completeToolTurn` 按 `ToolIndex` 支持 OpenAI 兼容并行交错工具调用并保留失败累计用量；OpenAI Responses API 流补发 `SEMessageStop`、解析 `response.error.message` 与并行 `output_index`；收尾阶段保持 `req.Tools` 不可变并在执行入口拦截禁用工具；修复 `OpenAI` `Thinking="disabled"` 误发字段与兼容回退缓存；修复压缩后过期 `lastInputTokens`、`microCompact` 越界扫描、32K 窗口抖动、断流派发 `{}` 工具与 goroutine 泄漏、多片 `SEThinkingSignature` 覆盖、NOA 窗口与缓存边界及 `tool.ValidateInput` 校验边界。

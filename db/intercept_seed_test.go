@@ -44,3 +44,119 @@ func TestDeleteEndpointPathPattern(t *testing.T) {
 		}
 	}
 }
+
+func TestV5HighRiskPatterns(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		hits    []string
+		misses  []string
+	}{
+		{
+			name:    "infraDestroyV5",
+			pattern: infraDestroyV5Pattern,
+			hits: []string{
+				`{"command":"pulumi destroy --yes"}`,
+				`{"command":"kubectl delete ns prod"}`,
+				`{"command":"kubectl delete namespace staging"}`,
+				`{"command":"docker system prune -af"}`,
+				`{"command":"docker volume rm pgdata"}`,
+			},
+			misses: []string{
+				`{"command":"kubectl get pods -n prod"}`,
+				`{"command":"docker ps -a"}`,
+			},
+		},
+		{
+			name:    "factoryResetV5",
+			pattern: factoryResetV5Pattern,
+			hits: []string{
+				`{"content":"('POST','api/cluster/restoreFactorySettings','{}')"}`,
+				`{"url":"https://t/api/sys/factoryReset"}`,
+				`{"url":"https://t/api/device/resetFactory"}`,
+				`{"url":"https://t/api/config/restoreDefault"}`,
+				`{"url":"https://t/api/sys/resetToDefault"}`,
+				`{"url":"https://t/api/cluster/resetAll"}`,
+				`{"url":"https://t/api/sys/reinit"}`,
+			},
+			misses: []string{
+				`{"command":"curl https://t/api/user/list"}`,
+				`{"command":"curl https://t/api/sys/getDefaultLang"}`,
+			},
+		},
+		{
+			name:    "serviceDisruptV5",
+			pattern: serviceDisruptV5Pattern,
+			hits: []string{
+				`{"content":"('POST','api/sysParam/restartTomcat','{}')"}`,
+				`{"content":"('POST','api/cluster/restartCluster','{}')"}`,
+				`{"content":"('POST','api/devAgent/batchStopService','{}')"}`,
+				`{"command":"systemctl stop nginx"}`,
+				`{"command":"Stop-Service Spooler"}`,
+			},
+			misses: []string{
+				`{"command":"systemctl status nginx"}`,
+				`{"command":"curl https://t/api/sysParam/getTime"}`,
+			},
+		},
+		{
+			name:    "uninstallV5",
+			pattern: uninstallV5Pattern,
+			hits: []string{
+				`{"url":"https://t/api/plugin/uninstallAll"}`,
+				`{"url":"https://t/api/agent/removeAgent"}`,
+				`{"command":"apt-get purge -y nginx"}`,
+				`{"command":"rpm -e openssh-server"}`,
+				`{"command":"helm uninstall prod-app"}`,
+				`{"command":"msiexec /x {1234} /qn"}`,
+			},
+			misses: []string{
+				`{"command":"apt-cache policy nginx"}`,
+				`{"command":"helm list"}`,
+			},
+		},
+		{
+			name:    "firmwarePatchRestoreV5",
+			pattern: firmwarePatchRestoreV5Pattern,
+			hits: []string{
+				`{"content":"('POST','api/patch/installForClusterNode','{}')"}`,
+				`{"url":"https://t/api/sysParam/restoreConfiguration"}`,
+				`{"url":"https://t/api/device/flashFirmware"}`,
+				`{"url":"https://t/api/cluster/deployNode"}`,
+			},
+			misses: []string{
+				`{"url":"https://t/api/sysParam/getConfigurationBackupList"}`,
+			},
+		},
+		{
+			name:    "accountTamperV5",
+			pattern: accountTamperV5Pattern,
+			hits: []string{
+				`{"url":"https://t/api/user/resetAdminPassword"}`,
+				`{"url":"https://t/api/user/disableUser/1"}`,
+				`{"command":"passwd root"}`,
+				`{"command":"userdel -r admin"}`,
+				`{"command":"net user bob /delete"}`,
+			},
+			misses: []string{
+				`{"url":"https://t/api/user/current"}`,
+				`{"command":"cat /etc/passwd"}`,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			re := regexp.MustCompile(tc.pattern)
+			for _, h := range tc.hits {
+				if !re.MatchString(h) {
+					t.Errorf("%s should match %s", tc.name, h)
+				}
+			}
+			for _, m := range tc.misses {
+				if re.MatchString(m) {
+					t.Errorf("%s false-positived on %s", tc.name, m)
+				}
+			}
+		})
+	}
+}

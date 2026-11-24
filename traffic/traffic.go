@@ -174,6 +174,9 @@ type Traffic struct {
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
 	upstream atomic.Pointer[url.URL]
+	// httpGate is an optional real-time outbound risk gate checked in
+	// Requestheaders before forwarding requests to the target server.
+	httpGate atomic.Pointer[HTTPGate]
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -414,6 +417,9 @@ func (s *sink) Requestheaders(f *mproxy.Flow) {
 		return
 	}
 	if f.Request.Method == http.MethodConnect && f.ConnContext != nil && f.ConnContext.Intercept {
+		return
+	}
+	if !s.t.checkHTTPGate(f) {
 		return
 	}
 	key := ""

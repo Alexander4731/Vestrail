@@ -111,16 +111,29 @@ function StatusBadge({ status, executionStatus }: { status: string; executionSta
 
 function MatchCell({ row, showReason = true }: { row: InterceptApprovalRow; showReason?: boolean }) {
   const reason = row.reason?.replace(/^\[模型\]\s*/, "");
+  const riskTag = reason?.match(/^\[(R[1-6][^\]]*|HTTP代理风险闸门)\]/)?.[1];
   return (
     <div className="flex min-w-0 flex-col gap-1">
-      {source(row) === "model" ? (
-        <Badge variant="outline">
-          <BotIcon />
-          模型判定
-        </Badge>
-      ) : (
-        <span className="truncate">{row.rule_name || "规则未记录或已删除"}</span>
-      )}
+      <div className="flex flex-wrap items-center gap-1.5">
+        {row.tool_name === "http_proxy" ? (
+          <Badge variant="outline" className="border-red-400/70 text-red-600 dark:text-red-400">
+            HTTP 代理闸门
+          </Badge>
+        ) : null}
+        {riskTag && riskTag !== "HTTP代理风险闸门" ? (
+          <Badge variant="outline" className="border-amber-400/70 text-amber-700 dark:text-amber-400">
+            {riskTag}
+          </Badge>
+        ) : null}
+        {source(row) === "model" ? (
+          <Badge variant="outline">
+            <BotIcon />
+            模型判定
+          </Badge>
+        ) : (
+          <span className="truncate">{row.rule_name || "规则未记录或已删除"}</span>
+        )}
+      </div>
       {showReason ? (
         <p className="truncate text-muted-foreground text-xs" title={reason}>
           {reason || "未记录理由"}
